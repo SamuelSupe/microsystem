@@ -1,0 +1,237 @@
+--!mica 1
+--!allow gui.window
+--!allow fs.read:/data
+--!allow fs.write:/data
+
+local gui = require("gui")
+local fs = require("fs")
+local bytes = require("bytes")
+local string = require("string")
+local table = require("table")
+local args = require("args")
+
+local MAX_FILE_BYTES = 32512
+local MAX_LINES = 32
+local DEFAULT_PATH = "/data/note.txt"
+
+local path_input = gui.text_input {text = args.get(1) or DEFAULT_PATH, grow = 1}
+local open_button = gui.button {text = "Open", width = 58}
+local save_as_button = gui.button {text = "Save As", width = 72}
+local document = gui.list {items = {"(empty document)"}, grow = 1}
+local line_input = gui.text_input {placeholder = "Selected line", grow = 1}
+local apply_button = gui.button {text = "Apply", width = 62}
+local insert_button = gui.button {text = "Insert after", width = 92}
+local delete_button = gui.button {text = "Delete", width = 62}
+local reload_button = gui.button {text = "Reload", width = 66}
+local save_button = gui.button {text = "Save", width = 58}
+local status = gui.label {text = "Ready", height = 24}
+
+local app, window_error = gui.window {title = "Mica Editor", width = 760, height = 620}
+if not app then error(window_error.message) end
+
+app:set_root(gui.column {
+    padding = 10,
+    gap = 8,
+    children = {
+        gui.row {height = 38, gap = 6, children = {path_input, open_button, save_as_button}},
+        document,
+        line_input,
+        gui.row {height = 38, gap = 6, children = {
+            apply_button, insert_button, delete_button, reload_button, save_button,
+        }},
+        status,
+    },
+})
+
+local valid_path = function(path)
+    path = string.trim(path)
+    if string.len(path) > 240 or not string.starts_with(path, "/data/") or string.find(path, "..") or string.find(path, "*") then
+        return nil, "path must be a file below /data"
+    end
+    return path, nil
+end
+
+local split_lines = function(text)
+    text = string.replace(text, "\r\n", "\n")
+    text = string.replace(text, "\r", "\n")
+    local lines = {}
+    local cursor = 1
+    local complete = false
+    while table.len(lines) < MAX_LINES do
+        local newline = string.find(text, "\n", cursor)
+        if not newline then
+            lines = table.insert(lines, string.sub(text, cursor))
+            complete = true
+            break
+        end
+        lines = table.insert(lines, string.sub(text, cursor, newline - 1))
+        cursor = newline + 1
+        if cursor > string.len(text) + 1 then break end
+    end
+    if table.len(lines) == 0 then lines = {""} end
+    return lines, not complete
+end
+
+local join_lines = function(lines)
+    local output = ""
+    for index = 1, table.len(lines) do
+        if index > 1 then output = output + "\n" end
+        output = output + lines[index]
+    end
+    return output
+end
+
+local refresh = function(lines, selected, path_value, path, dirty, message)
+    document:set_items(lines)
+    if selected < 1 then selected = 1 end
+    if selected > table.len(lines) then selected = table.len(lines) end
+    local edit_value = lines[selected] or ""
+    line_input:set_text(edit_value)
+    path_input:set_text(path_value)
+    status:set_text(message)
+    app:set_title((dirty and "* " or "") + "Mica Editor — " + path)
+    app:invalidate()
+    return selected, edit_value
+end
+
+local make_controller = function()
+    local path = args.get(1) or DEFAULT_PATH
+    local path_value = path
+    local lines = {""}
+    local selected = 1
+    local edit_value = ""
+    local dirty = false
+
+    return function(action, value)
+        if action == "path" then
+            path_value = value
+        elseif action == "edit" then
+            edit_value = value
+        elseif action == "select" then
+            selected = value
+            edit_value = lines[selected] or ""
+            line_input:set_text(edit_value)
+            status:set_text("Line " + tostring(selected) + " selected")
+            app:invalidate()
+        elseif action == "apply" then
+            local next_lines = table.remove(lines, selected)
+            local rebuilt = {}
+            for index = 1, table.len(next_lines) + 1 do
+                if index == selected then rebuilt = table.insert(rebuilt, edit_value) end
+                if index <= table.len(next_lines) then rebuilt = table.insert(rebuilt, next_lines[index]) end
+            end
+            lines = rebuilt
+            dirty = true
+            selected, edit_value = refresh(lines, selected, path_value, path, dirty, "Line " + tostring(selected) + " applied")
+        elseif action == "insert" then
+            if table.len(lines) >= MAX_LINES then
+                status:set_text("Insert failed: document already has 32 lines")
+                app:invalidate()
+                return
+            end
+            local rebuilt = {}
+            for index = 1, table.len(lines) do
+                rebuilt = table.insert(rebuilt, lines[index])
+                if index == selected then rebuilt = table.insert(rebuilt, edit_value) end
+            end
+            lines = rebuilt
+            selected = selected + 1
+            dirty = true
+            selected, edit_value = refresh(lines, selected, path_value, path, dirty, "Line inserted")
+        elseif action == "delete" then
+            lines = table.remove(lines, selected)
+            if table.len(lines) == 0 then lines = {""} end
+            dirty = true
+            selected, edit_value = refresh(lines, selected, path_value, path, dirty, "Line deleted")
+        elseif action == "open" or action == "reload" then
+            local next_path = path_value
+            if action == "reload" then next_path = path end
+            local normalized, path_error = valid_path(next_path)
+            if not normalized then
+                status:set_text(path_error)
+                app:invalidate()
+                return
+            end
+            local data, read_error = fs.read_file(normalized, MAX_FILE_BYTES)
+            if not data then
+                if read_error.kind == "not_found" then
+                    path = normalized
+                    path_value = normalized
+                    lines = {""}
+                    selected = 1
+                    dirty = false
+                    selected, edit_value = refresh(lines, selected, path_value, path, dirty, "New file " + path)
+                    print("mica-editor new path=" + path)
+                    return
+                end
+                status:set_text("Open failed: " + read_error.message)
+                app:invalidate()
+                return
+            end
+            local text, utf8_error = bytes.to_string(data)
+            if not text then
+                status:set_text("Open failed: " + utf8_error.message)
+                app:invalidate()
+                return
+            end
+            local next_lines, too_many_lines = split_lines(text)
+            if too_many_lines then
+                status:set_text("Open failed: document exceeds 32 lines")
+                app:invalidate()
+                return
+            end
+            path = normalized
+            path_value = normalized
+            lines = next_lines
+            if selected < 1 then selected = 1 end
+            if selected > table.len(lines) then selected = table.len(lines) end
+            dirty = false
+            selected, edit_value = refresh(lines, selected, path_value, path, dirty, "Loaded " + path + " — " + tostring(table.len(lines)) + " lines")
+            print("mica-editor loaded path=" + path + " lines=" + tostring(table.len(lines)))
+        elseif action == "save" or action == "save_as" then
+            local next_path = path
+            if action == "save_as" then next_path = path_value end
+            local normalized, path_error = valid_path(next_path)
+            if not normalized then
+                status:set_text(path_error)
+                app:invalidate()
+                return
+            end
+            local data = bytes.from_string(join_lines(lines))
+            if bytes.len(data) > MAX_FILE_BYTES then
+                status:set_text("Save failed: document exceeds 31.75 KiB")
+                app:invalidate()
+                return
+            end
+            local saved, save_error = fs.write_file(normalized, data, {atomic = true, fsync = true})
+            if not saved then
+                status:set_text("Save failed: " + save_error.message)
+                app:invalidate()
+                return
+            end
+            path = normalized
+            path_value = normalized
+            dirty = false
+            selected, edit_value = refresh(lines, selected, path_value, path, dirty, "Saved " + path + " atomically")
+            print("mica-editor saved path=" + path + " bytes=" + tostring(bytes.len(data)) + " atomic=true fsync=true")
+        end
+    end
+end
+
+local controller = make_controller()
+
+path_input:set_callback("change", function(text) controller("path", text) end)
+path_input:set_callback("submit", function(text) controller("open", text) end)
+open_button:set_callback("click", function() controller("open", "") end)
+save_as_button:set_callback("click", function() controller("save_as", "") end)
+document:set_callback("select", function(index) controller("select", index) end)
+line_input:set_callback("change", function(text) controller("edit", text) end)
+line_input:set_callback("submit", function(text) controller("apply", text) end)
+apply_button:set_callback("click", function() controller("apply", "") end)
+insert_button:set_callback("click", function() controller("insert", "") end)
+delete_button:set_callback("click", function() controller("delete", "") end)
+reload_button:set_callback("click", function() controller("reload", "") end)
+save_button:set_callback("click", function() controller("save", "") end)
+
+controller("open", "")
+app:run()

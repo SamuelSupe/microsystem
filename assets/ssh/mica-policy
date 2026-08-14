@@ -1,0 +1,7 @@
+fs.read:/data
+fs.write:/data
+proc.list
+proc.spawn:counter
+sys.stats
+random
+gui.window

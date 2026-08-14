@@ -1,0 +1,33 @@
+--!mica 1
+--!allow gui.window
+
+local gui = require("gui")
+local count = 0
+local label = gui.label {text = "Count: 0"}
+local app, err = gui.window {title = "Mica Counter", width = 420, height = 260}
+if not app then error(err.message) end
+
+app:set_root(gui.column {
+    padding = 16,
+    gap = 12,
+    children = {
+        label,
+        gui.button {
+            text = "Increment",
+            on_click = function()
+                count = count + 1
+                label:set_text("Count: " + tostring(count))
+                app:invalidate()
+            end,
+        },
+        gui.text_input {
+            placeholder = "Type here",
+            on_submit = function(text)
+                label:set_text(text)
+                app:invalidate()
+            end,
+        },
+    },
+})
+
+app:run()

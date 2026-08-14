@@ -1,0 +1,14 @@
+--!mica 1
+--!allow net.connect:10.0.2.2:8080
+
+local http = require("http")
+local response, err = http.get("http://10.0.2.2:8080/status")
+if not response then
+    error(err.message)
+end
+
+local body, read_err = response:read_all(1048576)
+if not body then
+    error(read_err.message)
+end
+print(response.status, body)

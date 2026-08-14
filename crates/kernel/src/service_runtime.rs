@@ -1,0 +1,4134 @@
+use core::cell::UnsafeCell;
+use core::mem;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use crate::arch::aarch64;
+use crate::arch::aarch64::preempt::{self, Context, ExceptionFrame};
+use crate::bootfs::Archive;
+use crate::device_control;
+use crate::kernel_heap;
+use crate::pci::UserTransportGrant;
+use crate::physical_memory;
+use crate::smmu;
+use microsystem_abi::{
+    ABI_VERSION, CapHandle, MESSAGE_CAP_MOVE_MASK, MESSAGE_CAPS, Message, ObjectType, Rights,
+    Status, ThreadLaunchV1, ThreadLaunchV2, message_cap_move,
+};
+use microsystem_kernel::capability::{Capability, CapabilityTable, MAX_CAPABILITIES};
+use microsystem_kernel::elf::{ElfImage, USER_MIN};
+
+pub const SERVICE_COUNT: usize = 12;
+pub const SERVICE_NAMES: [&str; SERVICE_COUNT] = [
+    "init", "console", "block", "mfs", "shell", "devmgr", "windowd", "terminal", "files",
+    "monitor", "sshd", "netd",
+];
+const APPLICATION_START: usize = SERVICE_COUNT;
+const APPLICATION_COUNT: usize = microsystem_abi::process::MAX_APPLICATIONS;
+const CPU_COUNT: usize = 2;
+const IDLE_START: usize = APPLICATION_START + APPLICATION_COUNT;
+const TASK_COUNT: usize = IDLE_START + CPU_COUNT;
+
+const KERNEL_OFFSET: usize = 0xffffff8000000000;
+const IMAGE_BYTES: usize = 0xe0000;
+const HEAP_BYTES: usize = 0x100000;
+const HEAP_START: u64 = 0x0068_0000;
+const LARGE_HEAP_BYTES: usize = 0x2000000;
+const LARGE_HEAP_START: u64 = 0x0080_0000;
+const LARGE_HEAP_END: u64 = LARGE_HEAP_START + LARGE_HEAP_BYTES as u64;
+const LARGE_HEAP_TABLES: usize = LARGE_HEAP_BYTES / 0x20_0000;
+const STACK_BYTES: usize = 16 * 4096;
+const STACK_TOP: u64 = 0x0080_0000;
+const ASID_BASE: u16 = 0x20;
+const ENDPOINT_COUNT: usize = 25;
+const ENDPOINT_OWNERS: [usize; ENDPOINT_COUNT] = [
+    1, 2, 3, 0, 5, 2, 6, 6, 6, 7, 8, 9, 11, 11, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0,
+];
+const BLOCK_TASK: usize = 2;
+const CONSOLE_TASK: usize = 1;
+const SHELL_TASK: usize = 4;
+const DEVMGR_TASK: usize = 5;
+const WINDOWD_TASK: usize = 6;
+const TERMINAL_TASK: usize = 7;
+const FILES_TASK: usize = 8;
+const MONITOR_TASK: usize = 9;
+const SSHD_TASK: usize = 10;
+const NETD_TASK: usize = 11;
+const BLOCK_COMMON_VA: u64 = 0x005a_0000;
+const BLOCK_DEVICE_VA: u64 = 0x005a_1000;
+const BLOCK_NOTIFY_VA: u64 = 0x005a_2000;
+const BLOCK_ISR_VA: u64 = 0x005a_3000;
+const BLOCK_QUEUE_VA: u64 = 0x005b_0000;
+const SHARED_DATA_VA: u64 = 0x005c_0000;
+const FILESYSTEM_DATA_VA: u64 = 0x005e_0000;
+const SSH_FILESYSTEM_DATA_VA: u64 = 0x005f_0000;
+const WINDOWD_FILESYSTEM_DATA_VA: u64 = 0x0060_0000;
+const TERMINAL_FILESYSTEM_DATA_VA: u64 = 0x0061_0000;
+const CONSOLE_UART_VA: u64 = 0x005d_0000;
+const DEVMGR_PCI_CONFIG_VA: u64 = 0x005e_0000;
+const DEVMGR_ECAM_SCAN_VA: u64 = 0x0042_0000;
+const DEVMGR_ECAM_SLOTS: usize = 32;
+const MFS_TASK: usize = 3;
+const SHARED_FRAME_OBJECT: u32 = 1;
+const FILESYSTEM_FRAME_OBJECT: u32 = 13;
+const SSH_FILESYSTEM_FRAME_OBJECT: u32 = 14;
+const WINDOWD_FILESYSTEM_FRAME_OBJECT: u32 = 15;
+const TERMINAL_FILESYSTEM_FRAME_OBJECT: u32 = 16;
+const DEVICE_NOTIFICATION_OBJECT: u32 = 2;
+const SHARED_FRAME_NODE: u32 = 1;
+const FILESYSTEM_FRAME_NODE: u32 = 8;
+const SSH_FILESYSTEM_FRAME_NODE: u32 = 33;
+const WINDOWD_FILESYSTEM_FRAME_NODE: u32 = 43;
+const TERMINAL_FILESYSTEM_FRAME_NODE: u32 = 45;
+const DEVICE_NOTIFICATION_NODE: u32 = 2;
+const DEVICE_IRQ_OBJECT: u32 = 37;
+const DEVICE_IRQ_NODE: u32 = 3;
+const DEVICE_MMIO_OBJECT: u32 = 10;
+const DEVICE_MMIO_NODE: u32 = 4;
+const DEVICE_QUEUE_OBJECT: u32 = 11;
+const DEVICE_QUEUE_NODE: u32 = 5;
+const DMA_DOMAIN_OBJECT: u32 = 12;
+const DMA_DOMAIN_NODE: u32 = 6;
+const ROOT_MEMORY_POOL_OBJECT: u32 = 50;
+const ROOT_MEMORY_POOL_NODE: u32 = 7;
+const DRIVER_MEMORY_POOL_OBJECT: u32 = 51;
+const DRIVER_MEMORY_POOL_NODE: u32 = 9;
+const MEMORY_POOL_QUOTA: usize = 4;
+const MAX_MEMORY_POOLS: usize = 16;
+const MAX_MEMORY_POOL_QUOTA: usize = 2048;
+const MAX_DYNAMIC_NOTIFICATIONS: usize = 16;
+const RUNTIME_FRAME_OBJECT_BASE: u32 = 200;
+const RUNTIME_FRAME_COUNT: usize = 4096;
+const FRAME_REGION_COUNT: usize = 32;
+const FRAME_REGION_MAX_PAGES: usize = 2048;
+const GUI_MEMORY_POOL_OBJECT: u32 = 52;
+const GUI_MEMORY_POOL_NODE: u32 = 18;
+const GUI_MEMORY_POOL_QUOTA: usize = 1024;
+const SCRIPT_MEMORY_POOL_OBJECT: u32 = 53;
+const SCRIPT_MEMORY_POOL_NODE: u32 = 28;
+const SCRIPT_MEMORY_POOL_QUOTA: usize = 264;
+const NETWORK_MEMORY_POOL_OBJECT: u32 = 54;
+const NETWORK_MEMORY_POOL_NODE: u32 = 29;
+const NETWORK_MEMORY_POOL_QUOTA: usize = 128;
+const DYNAMIC_MAP_START: u64 = 0x0058_0000;
+const DYNAMIC_MAP_END: u64 = 0x005b_0000;
+const CONSOLE_ENDPOINT_NODE: u32 = 10;
+const BLOCK_ENDPOINT_NODE: u32 = 11;
+const FILESYSTEM_ENDPOINT_NODE: u32 = 12;
+const PROCESS_ENDPOINT_NODE: u32 = 13;
+const DEVMGR_ENDPOINT_NODE: u32 = 14;
+const BLOCK_CONFIG_ENDPOINT_NODE: u32 = 15;
+const TIME_ENDPOINT_NODE: u32 = 17;
+const GUI_TERMINAL_ENDPOINT_NODE: u32 = 19;
+const GUI_FILES_ENDPOINT_NODE: u32 = 20;
+const GUI_MONITOR_ENDPOINT_NODE: u32 = 21;
+const GUI_TERMINAL_EVENTS_NODE: u32 = 23;
+const GUI_FILES_EVENTS_NODE: u32 = 24;
+const GUI_MONITOR_EVENTS_NODE: u32 = 25;
+const NETWORK_DEVICE_NODE: u32 = 26;
+const RANDOM_SOURCE_NODE: u32 = 27;
+const GUI_CONFIG_ENDPOINT_NODE: u32 = 34;
+const GUI_DYNAMIC_ENDPOINT_NODE_BASE: u32 = 35;
+const GUI_LAUNCH_ENDPOINT_NODE: u32 = 44;
+
+#[repr(C, align(4096))]
+struct TaskMemory {
+    level1: [u64; 512],
+    level2: [u64; 512],
+    level3: [u64; 512],
+    level3_high: [u64; 512],
+    large_heap_level3: [[u64; 512]; LARGE_HEAP_TABLES],
+    image: [u8; IMAGE_BYTES],
+    stack: [u8; STACK_BYTES],
+    heap: [u8; HEAP_BYTES],
+    large_heap: *mut u8,
+}
+
+#[derive(Clone, Copy)]
+struct Start {
+    entry: u64,
+    stack: u64,
+    ttbr0: u64,
+}
+
+impl Start {
+    const EMPTY: Self = Self {
+        entry: 0,
+        stack: STACK_TOP,
+        ttbr0: 0,
+    };
+}
+
+struct MemoryCell(UnsafeCell<[*mut TaskMemory; TASK_COUNT]>);
+struct StartCell(UnsafeCell<[Start; TASK_COUNT]>);
+struct StateCell(UnsafeCell<State>);
+struct GrantCell(UnsafeCell<Option<UserTransportGrant>>);
+struct CapCell(UnsafeCell<[CapabilityTable; TASK_COUNT]>);
+struct StateGuard;
+
+#[derive(Clone, Copy)]
+struct FrameRegion {
+    object: u32,
+    pool: u32,
+    pages: u16,
+    frames: [u32; FRAME_REGION_MAX_PAGES],
+}
+
+impl FrameRegion {
+    const EMPTY: Self = Self {
+        object: 0,
+        pool: 0,
+        pages: 0,
+        frames: [0; FRAME_REGION_MAX_PAGES],
+    };
+}
+
+struct RegionCell(UnsafeCell<[FrameRegion; FRAME_REGION_COUNT]>);
+
+unsafe impl Sync for RegionCell {}
+
+unsafe impl Sync for MemoryCell {}
+unsafe impl Sync for StartCell {}
+unsafe impl Sync for StateCell {}
+unsafe impl Sync for GrantCell {}
+unsafe impl Sync for CapCell {}
+
+impl Drop for StateGuard {
+    fn drop(&mut self) {
+        STATE_LOCK_OWNER.fetch_add(1, Ordering::Release);
+    }
+}
+
+struct State {
+    contexts: [Context; TASK_COUNT],
+    threads: [ThreadState; TASK_COUNT],
+    endpoints: [Endpoint; ENDPOINT_COUNT],
+    reply_to: [Option<usize>; TASK_COUNT],
+    requests: [Message; TASK_COUNT],
+    current: [usize; CPU_COUNT],
+    last_accounted_ticks: [u64; CPU_COUNT],
+    applications: [ApplicationSlot; APPLICATION_COUNT],
+}
+
+#[derive(Clone, Copy)]
+struct ApplicationSlot {
+    program: u64,
+    profile: u16,
+    exit_status: i64,
+    cpu_mask: u32,
+    cpu_ticks: [u64; CPU_COUNT],
+    reclaimed_frames: u32,
+    reclaimed_pools: u32,
+    reclaimed_mappings: u32,
+}
+
+impl ApplicationSlot {
+    const EMPTY: Self = Self {
+        program: 0,
+        profile: microsystem_abi::THREAD_PROFILE_APPLICATION,
+        exit_status: 0,
+        cpu_mask: 0,
+        cpu_ticks: [0; CPU_COUNT],
+        reclaimed_frames: 0,
+        reclaimed_pools: 0,
+        reclaimed_mappings: 0,
+    };
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResourceCleanup {
+    frames: u32,
+    pools: u32,
+    mappings: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ThreadState {
+    Runnable,
+    Running {
+        cpu: usize,
+    },
+    Exited,
+    Sending {
+        endpoint: usize,
+        reply_buffer: u64,
+        deadline: u64,
+    },
+    Receiving {
+        endpoint: usize,
+        buffer: u64,
+        deadline: u64,
+    },
+    WaitingReply {
+        server: usize,
+        reply_buffer: u64,
+        deadline: u64,
+    },
+    WaitingNotification {
+        object: u32,
+        deadline: u64,
+    },
+    Terminating {
+        cpu: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct Endpoint {
+    pending: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct CapTransfer {
+    message: Message,
+    sender: usize,
+    receiver: usize,
+    sources: [CapHandle; MESSAGE_CAPS],
+    destinations: [CapHandle; MESSAGE_CAPS],
+    inserted: [bool; MESSAGE_CAPS],
+    moved: [bool; MESSAGE_CAPS],
+}
+
+impl Endpoint {
+    const EMPTY: Self = Self { pending: None };
+}
+
+static MEMORY: MemoryCell = MemoryCell(UnsafeCell::new([ptr::null_mut(); TASK_COUNT]));
+static STARTS: StartCell = StartCell(UnsafeCell::new([Start::EMPTY; TASK_COUNT]));
+static STATE: StateCell = StateCell(UnsafeCell::new(State {
+    contexts: [Context::EMPTY; TASK_COUNT],
+    threads: [ThreadState::Runnable; TASK_COUNT],
+    endpoints: [Endpoint::EMPTY; ENDPOINT_COUNT],
+    reply_to: [None; TASK_COUNT],
+    requests: [Message::new(0, 0); TASK_COUNT],
+    current: [0; CPU_COUNT],
+    last_accounted_ticks: [0; CPU_COUNT],
+    applications: [ApplicationSlot::EMPTY; APPLICATION_COUNT],
+}));
+static PREPARED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_CPUS: AtomicU32 = AtomicU32::new(0);
+static READY: AtomicU32 = AtomicU32::new(0);
+static ONLINE: AtomicU32 = AtomicU32::new(0);
+static SERVICE_STATUS_REPORTED: AtomicBool = AtomicBool::new(false);
+static SWITCHES: AtomicU64 = AtomicU64::new(0);
+static CPU_SWITCHES: [AtomicU64; CPU_COUNT] = [AtomicU64::new(0), AtomicU64::new(0)];
+static CPU_NON_IDLE_RUNS: [AtomicU64; CPU_COUNT] = [AtomicU64::new(0), AtomicU64::new(0)];
+static SMP_REPORTED: AtomicBool = AtomicBool::new(false);
+static STATE_LOCK_NEXT: AtomicU32 = AtomicU32::new(0);
+static STATE_LOCK_OWNER: AtomicU32 = AtomicU32::new(0);
+static BLOCK_GRANT: GrantCell = GrantCell(UnsafeCell::new(None));
+static CONSOLE_UART: AtomicU64 = AtomicU64::new(0);
+static CAPS: CapCell = CapCell(UnsafeCell::new(
+    [const { CapabilityTable::new() }; TASK_COUNT],
+));
+static NEXT_OBJECT: AtomicU32 = AtomicU32::new(100);
+static NEXT_DERIVATION: AtomicU32 = AtomicU32::new(1000);
+static DEVICE_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static DEVICE_IRQ_BOUND: AtomicBool = AtomicBool::new(false);
+static DEVICE_IRQ_ACKS: AtomicU64 = AtomicU64::new(0);
+static NOTIFICATION_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static RESCHEDULE_WAKEUPS: AtomicU64 = AtomicU64::new(0);
+static IPC_CALLS: AtomicU64 = AtomicU64::new(0);
+static GUI_PRESENT_REPORTED: AtomicBool = AtomicBool::new(false);
+static GUI_PARTIAL_PRESENT_REPORTED: AtomicBool = AtomicBool::new(false);
+const SERIAL_SERVICE_MASK: u32 = ((1u32 << 6) - 1) | (1u32 << SSHD_TASK) | (1u32 << NETD_TASK);
+static EXPECTED_SERVICE_MASK: AtomicU32 = AtomicU32::new(SERIAL_SERVICE_MASK);
+static DMA_AUTHORIZED: AtomicU32 = AtomicU32::new(0);
+static DMA_FRAME_OBJECTS: [AtomicU32; 128] = [const { AtomicU32::new(0) }; 128];
+static RUNTIME_FRAME_PHYSICAL: [AtomicU64; RUNTIME_FRAME_COUNT] =
+    [const { AtomicU64::new(0) }; RUNTIME_FRAME_COUNT];
+static RUNTIME_FRAME_POOL: [AtomicU32; RUNTIME_FRAME_COUNT] =
+    [const { AtomicU32::new(0) }; RUNTIME_FRAME_COUNT];
+static FRAME_REGIONS: RegionCell =
+    RegionCell(UnsafeCell::new([FrameRegion::EMPTY; FRAME_REGION_COUNT]));
+static MEMORY_POOL_OBJECTS: [AtomicU32; MAX_MEMORY_POOLS] =
+    [const { AtomicU32::new(0) }; MAX_MEMORY_POOLS];
+static MEMORY_POOL_QUOTAS: [AtomicU32; MAX_MEMORY_POOLS] =
+    [const { AtomicU32::new(0) }; MAX_MEMORY_POOLS];
+static NOTIFICATION_OBJECTS: [AtomicU32; MAX_DYNAMIC_NOTIFICATIONS] =
+    [const { AtomicU32::new(0) }; MAX_DYNAMIC_NOTIFICATIONS];
+static NOTIFICATION_BITS: [AtomicU64; MAX_DYNAMIC_NOTIFICATIONS] =
+    [const { AtomicU64::new(0) }; MAX_DYNAMIC_NOTIFICATIONS];
+static DTB_FRAME_REPORTED: AtomicBool = AtomicBool::new(false);
+static MEMORY_POOLS_SEEN: AtomicU32 = AtomicU32::new(0);
+static MEMORY_POOLS_REPORTED: AtomicBool = AtomicBool::new(false);
+static FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static SSH_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static WINDOWD_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static KERNEL_HEAP_REPORTED: AtomicBool = AtomicBool::new(false);
+static BOOTFS_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+static BOOTFS_LENGTH: AtomicUsize = AtomicUsize::new(0);
+
+fn lock_state() -> StateGuard {
+    let ticket = STATE_LOCK_NEXT.fetch_add(1, Ordering::Relaxed);
+    while STATE_LOCK_OWNER.load(Ordering::Acquire) != ticket {
+        core::hint::spin_loop();
+    }
+    StateGuard
+}
+
+fn current_cpu() -> usize {
+    aarch64::cpu_id().min(CPU_COUNT - 1)
+}
+
+fn current_task(state: &State) -> usize {
+    state.current[current_cpu()]
+}
+
+fn task_memory(task: usize) -> Option<&'static TaskMemory> {
+    let pointer = *unsafe { &*MEMORY.0.get() }.get(task)?;
+    unsafe { pointer.as_ref() }
+}
+
+fn task_memory_mut(task: usize) -> Option<&'static mut TaskMemory> {
+    let pointer = *unsafe { &*MEMORY.0.get() }.get(task)?;
+    unsafe { pointer.as_mut() }
+}
+
+fn idle_task(cpu: usize) -> usize {
+    IDLE_START + cpu
+}
+
+fn is_idle_task(task: usize) -> bool {
+    (IDLE_START..IDLE_START + CPU_COUNT).contains(&task)
+}
+
+fn set_running(state: &mut State, cpu: usize, task: usize) {
+    let now = aarch64::timer_ticks(cpu);
+    let previous = state.current[cpu];
+    let elapsed = now.saturating_sub(state.last_accounted_ticks[cpu]);
+    if let Some(index) = previous.checked_sub(APPLICATION_START)
+        && index < APPLICATION_COUNT
+    {
+        state.applications[index].cpu_ticks[cpu] =
+            state.applications[index].cpu_ticks[cpu].saturating_add(elapsed);
+    }
+    state.last_accounted_ticks[cpu] = now;
+    state.current[cpu] = task;
+    state.threads[task] = ThreadState::Running { cpu };
+    if let Some(index) = task.checked_sub(APPLICATION_START)
+        && index < APPLICATION_COUNT
+    {
+        state.applications[index].cpu_mask |= 1 << cpu;
+    }
+    if !is_idle_task(task) {
+        CPU_NON_IDLE_RUNS[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn grant_console_uart(physical: u64) {
+    CONSOLE_UART.store(physical, Ordering::Release);
+}
+
+pub fn prepare(bootfs: &'static [u8]) -> Result<(), ()> {
+    PREPARED.store(false, Ordering::Release);
+    ACTIVE_CPUS.store(0, Ordering::Release);
+    READY.store(0, Ordering::Release);
+    ONLINE.store(0, Ordering::Release);
+    SERVICE_STATUS_REPORTED.store(false, Ordering::Release);
+    SWITCHES.store(0, Ordering::Release);
+    BOOTFS_ADDRESS.store(bootfs.as_ptr() as usize, Ordering::Release);
+    BOOTFS_LENGTH.store(bootfs.len(), Ordering::Release);
+    unsafe { *BLOCK_GRANT.0.get() = None };
+
+    let init = image_by_name(bootfs, SERVICE_NAMES[0]).ok_or(())?;
+    load_task(0, init)?;
+    let idle = Archive::new(bootfs)
+        .find_map(|entry| match entry {
+            Ok(entry) if entry.name == "bin/idle" => Some(entry.data),
+            _ => None,
+        })
+        .ok_or(())?;
+    for cpu in 0..CPU_COUNT {
+        load_task(idle_task(cpu), idle)?;
+    }
+
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "ic iallu",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    PREPARED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn run() -> ! {
+    while !PREPARED.load(Ordering::Acquire) {
+        aarch64::wait_for_event();
+    }
+    let starts = unsafe { &*STARTS.0.get() };
+    let _guard = lock_state();
+    let state = unsafe { &mut *STATE.0.get() };
+    *state = State {
+        contexts: [Context::EMPTY; TASK_COUNT],
+        threads: [ThreadState::Exited; TASK_COUNT],
+        endpoints: [Endpoint::EMPTY; ENDPOINT_COUNT],
+        reply_to: [None; TASK_COUNT],
+        requests: [Message::new(0, 0); TASK_COUNT],
+        current: [0; CPU_COUNT],
+        last_accounted_ticks: [aarch64::timer_ticks(0), aarch64::timer_ticks(1)],
+        applications: [ApplicationSlot::EMPTY; APPLICATION_COUNT],
+    };
+    for (context, start) in state.contexts.iter_mut().zip(starts) {
+        *context = Context::EMPTY;
+        context.elr = start.entry;
+        context.sp_el0 = start.stack;
+        context.ttbr0 = start.ttbr0;
+    }
+    state.threads[0] = ThreadState::Runnable;
+    for cpu in 0..CPU_COUNT {
+        state.threads[idle_task(cpu)] = ThreadState::Runnable;
+    }
+    set_running(state, 1, 0);
+    for table in unsafe { &mut *CAPS.0.get() } {
+        *table = CapabilityTable::new();
+    }
+    NEXT_OBJECT.store(100, Ordering::Release);
+    NEXT_DERIVATION.store(1000, Ordering::Release);
+    DEVICE_NOTIFICATION.store(0, Ordering::Release);
+    DEVICE_IRQ_BOUND.store(false, Ordering::Release);
+    DEVICE_IRQ_ACKS.store(0, Ordering::Release);
+    NOTIFICATION_BLOCKS.store(0, Ordering::Release);
+    RESCHEDULE_WAKEUPS.store(0, Ordering::Release);
+    IPC_CALLS.store(0, Ordering::Release);
+    GUI_PRESENT_REPORTED.store(false, Ordering::Release);
+    GUI_PARTIAL_PRESENT_REPORTED.store(false, Ordering::Release);
+    DMA_AUTHORIZED.store(0, Ordering::Release);
+    for object in &DMA_FRAME_OBJECTS {
+        object.store(0, Ordering::Release);
+    }
+    reset_runtime_frames();
+    unsafe { *FRAME_REGIONS.0.get() = [FrameRegion::EMPTY; FRAME_REGION_COUNT] };
+    if reset_memory_pools().is_err() {
+        aarch64::shutdown(true);
+    }
+    reset_notifications();
+    reset_filesystem_frame();
+    DTB_FRAME_REPORTED.store(false, Ordering::Release);
+    MEMORY_POOLS_SEEN.store(0, Ordering::Release);
+    MEMORY_POOLS_REPORTED.store(false, Ordering::Release);
+    for switches in &CPU_SWITCHES {
+        switches.store(0, Ordering::Release);
+    }
+    for runs in &CPU_NON_IDLE_RUNS {
+        runs.store(0, Ordering::Release);
+    }
+    SMP_REPORTED.store(false, Ordering::Release);
+    if install_boot_capabilities().is_err() {
+        aarch64::shutdown(true);
+    }
+    aarch64::activate_ttbr0(starts[0].ttbr0);
+    ACTIVE_CPUS.fetch_or(1 << 1, Ordering::Release);
+    let registers = state.contexts[0].registers;
+    drop(_guard);
+    aarch64::enter_service(
+        starts[0].entry,
+        [
+            registers[0],
+            registers[1],
+            registers[2],
+            registers[3],
+            registers[4],
+            registers[5],
+            registers[6],
+        ],
+    );
+    ACTIVE_CPUS.fetch_and(!(1 << 1), Ordering::Release);
+    aarch64::shutdown(false)
+}
+
+pub fn join_primary() -> ! {
+    while ACTIVE_CPUS.load(Ordering::Acquire) & (1 << 1) == 0 {
+        aarch64::wait_for_event();
+    }
+    let starts = unsafe { &*STARTS.0.get() };
+    let guard = lock_state();
+    let state = unsafe { &mut *STATE.0.get() };
+    let task = next_runnable(state, IDLE_START, 0).unwrap_or_else(|| idle_task(0));
+    set_running(state, 0, task);
+    let context = state.contexts[task];
+    ACTIVE_CPUS.fetch_or(1, Ordering::Release);
+    drop(guard);
+    aarch64::activate_ttbr0(starts[task].ttbr0);
+    aarch64::enter_service(context.elr, context.registers[..7].try_into().unwrap());
+    ACTIVE_CPUS.fetch_and(!1, Ordering::Release);
+    aarch64::shutdown(false)
+}
+
+pub fn handle_yield(frame: &mut ExceptionFrame) -> Option<u64> {
+    if !active_on_current_cpu() {
+        return None;
+    }
+    let _guard = lock_state();
+    switch(frame);
+    Some(2)
+}
+
+pub fn handle_ipc(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !(2..=4).contains(&syscall) {
+        return None;
+    }
+    if syscall == 2 {
+        IPC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    let _guard = lock_state();
+    Some(match syscall {
+        2 => call(frame),
+        3 => receive(frame),
+        4 => reply_receive(frame),
+        _ => unreachable!(),
+    })
+}
+
+pub fn handle_capability(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !(6..=10).contains(&syscall) {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    let result = match syscall {
+        6 => unsafe { &mut (&mut *CAPS.0.get())[task] }
+            .copy_cap_with_node(
+                CapHandle(frame.registers[0] as u32),
+                Rights(frame.registers[1] as u32),
+                allocate_derivation(),
+            )
+            .map(|handle| handle.0 as u64),
+        7 => unsafe { &mut (&mut *CAPS.0.get())[task] }
+            .move_cap(CapHandle(frame.registers[0] as u32))
+            .map(|handle| handle.0 as u64),
+        8 => delete_capability(task, CapHandle(frame.registers[0] as u32)).map(|()| 0),
+        9 => revoke_global(task, CapHandle(frame.registers[0] as u32)).map(|count| count as u64),
+        10 if task == 0
+            || matches!(
+                frame.registers[0],
+                value if value == ObjectType::Frame as u64
+                    || value == ObjectType::FrameRegion as u64
+            ) =>
+        {
+            create_object(
+                task,
+                frame.registers[0],
+                Rights(frame.registers[1] as u32),
+                frame.registers[2],
+                frame.registers[3],
+            )
+            .map(|handle| handle.0 as u64)
+        }
+        10 => Err(Status::AccessDenied),
+        _ => unreachable!(),
+    };
+    frame.registers[0] = match result {
+        Ok(value) => value,
+        Err(status) => status as i64 as u64,
+    };
+    Some(0)
+}
+
+pub fn handle_frame_mapping(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !(11..=12).contains(&syscall) {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    let handle = CapHandle(frame.registers[0] as u32);
+    let capability = unsafe { &(&*CAPS.0.get())[task] }.capability(handle, Rights::MAP);
+    let Ok(capability) = capability else {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    };
+    let (pages, region) = match capability.object_type {
+        ObjectType::Frame => (1usize, None),
+        ObjectType::FrameRegion => {
+            let Some(region) = frame_region(capability.object) else {
+                frame.registers[0] = Status::BadCapability as i64 as u64;
+                return Some(0);
+            };
+            (region.pages as usize, Some(region))
+        }
+        _ => {
+            frame.registers[0] = Status::BadCapability as i64 as u64;
+            return Some(0);
+        }
+    };
+    if capability.object_type == ObjectType::Frame
+        && runtime_frame_physical(capability.object).is_none()
+    {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    }
+    let address = frame.registers[1];
+    let bytes = (pages as u64).saturating_mul(4096);
+    let end = address.checked_add(bytes);
+    let valid_single = pages == 1
+        && ((DYNAMIC_MAP_START..DYNAMIC_MAP_END).contains(&address)
+            || (task == WINDOWD_TASK
+                && address >= LARGE_HEAP_START
+                && end.is_some_and(|end| end <= LARGE_HEAP_END)));
+    let mica_region = matches!(task, 0 | MFS_TASK | SHELL_TASK | SSHD_TASK | NETD_TASK)
+        || task
+            .checked_sub(APPLICATION_START)
+            .and_then(|index| unsafe { (&*STATE.0.get()).applications.get(index) })
+            .is_some_and(|application| {
+                application.profile == microsystem_abi::THREAD_PROFILE_MICA
+                    && address >= DYNAMIC_MAP_START
+                    && end.is_some_and(|end| end <= DYNAMIC_MAP_END)
+            });
+    let valid_region = pages > 1
+        && ((task == WINDOWD_TASK
+            && address >= LARGE_HEAP_START
+            && end.is_some_and(|end| end <= LARGE_HEAP_END))
+            || mica_region);
+    if address % 4096 != 0 || !(valid_single || valid_region) {
+        frame.registers[0] = Status::Invalid as i64 as u64;
+        return Some(0);
+    }
+    let Some(memory) = task_memory_mut(task) else {
+        frame.registers[0] = Status::Fault as i64 as u64;
+        return Some(0);
+    };
+    let result = (|| -> Result<(), Status> {
+        if syscall == 11 {
+            let requested = Rights(frame.registers[2] as u32);
+            let allowed = Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::EXECUTE.0);
+            if requested.0 == 0
+                || requested.0 & !allowed.0 != 0
+                || !capability.rights.contains(requested)
+            {
+                Err(Status::AccessDenied)
+            } else if requested.contains(Rights::WRITE) && requested.contains(Rights::EXECUTE) {
+                Err(Status::AccessDenied)
+            } else if (0..pages).any(|page| {
+                user_descriptor(memory, address + page as u64 * 4096)
+                    .is_some_and(|descriptor| descriptor & 0b11 != 0)
+            }) {
+                Err(Status::Busy)
+            } else {
+                for page in 0..pages {
+                    let physical = region
+                        .as_ref()
+                        .and_then(|region| runtime_frame_physical(region.frames[page]))
+                        .or_else(|| runtime_frame_physical(capability.object))
+                        .ok_or(Status::BadCapability)?;
+                    *user_descriptor_mut(memory, address + page as u64 * 4096)
+                        .ok_or(Status::Invalid)? = physical
+                        | user_page_flags(
+                            requested.contains(Rights::WRITE),
+                            requested.contains(Rights::EXECUTE),
+                        );
+                }
+                Ok(())
+            }
+        } else {
+            for page in 0..pages {
+                let expected = region
+                    .as_ref()
+                    .and_then(|region| runtime_frame_physical(region.frames[page]))
+                    .or_else(|| runtime_frame_physical(capability.object))
+                    .ok_or(Status::BadCapability)?;
+                let descriptor =
+                    user_descriptor(memory, address + page as u64 * 4096).ok_or(Status::Invalid)?;
+                if descriptor & 0b11 == 0 {
+                    return Err(Status::NotFound);
+                }
+                if descriptor & 0x0000_ffff_ffff_f000 != expected {
+                    return Err(Status::AccessDenied);
+                }
+            }
+            for page in 0..pages {
+                *user_descriptor_mut(memory, address + page as u64 * 4096)
+                    .ok_or(Status::Invalid)? = 0;
+            }
+            Ok(())
+        }
+    })();
+    if result.is_ok() {
+        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+    }
+    frame.registers[0] = match result {
+        Ok(()) => Status::Ok as i64 as u64,
+        Err(status) => status as i64 as u64,
+    };
+    Some(0)
+}
+
+pub fn handle_notification(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !matches!(syscall, 5 | 23) {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    let required = if syscall == 5 {
+        Rights::READ
+    } else {
+        Rights::WRITE
+    };
+    let notification = unsafe { &(&*CAPS.0.get())[task] }
+        .capability(CapHandle(frame.registers[0] as u32), required);
+    let Ok(notification) = notification else {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    };
+    if notification.object_type != ObjectType::Notification {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    if syscall == 23 {
+        let bits = frame.registers[1];
+        if notification.object == DEVICE_NOTIFICATION_OBJECT {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+        } else if bits == 0 {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+        } else if signal_notification(notification.object, bits).is_none() {
+            frame.registers[0] = Status::BadCapability as i64 as u64;
+        } else {
+            frame.registers[0] = Status::Ok as i64 as u64;
+        }
+        return Some(0);
+    }
+    if notification.object == DEVICE_NOTIFICATION_OBJECT && task != BLOCK_TASK {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    if deadline_elapsed(frame.registers[1]) {
+        frame.registers[0] = Status::TimedOut as i64 as u64;
+        return Some(0);
+    }
+    let Some(bits) = take_notification_bits(notification.object) else {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    };
+    if bits != 0 {
+        frame.registers[0] = bits;
+        return Some(0);
+    }
+
+    let cpu = current_cpu();
+    let state = unsafe { &mut *STATE.0.get() };
+    let Some(next) = next_other_runnable(state, task, cpu) else {
+        frame.registers[0] = Status::Busy as i64 as u64;
+        return Some(0);
+    };
+    preempt::save(&mut state.contexts[task], frame);
+    state.threads[task] = ThreadState::WaitingNotification {
+        object: notification.object,
+        deadline: frame.registers[1],
+    };
+    set_running(state, cpu, next);
+    NOTIFICATION_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    preempt::load(&state.contexts[next], frame);
+    record_switch(cpu);
+    Some(2)
+}
+
+pub fn handle_irq_control(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !(14..=15).contains(&syscall) {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    if task != BLOCK_TASK {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    let table = unsafe { &(&*CAPS.0.get())[task] };
+    let irq = table.capability(CapHandle(frame.registers[0] as u32), Rights::ACK);
+    if !matches!(irq, Ok(capability) if capability.object_type == ObjectType::Irq && capability.object == DEVICE_IRQ_OBJECT)
+    {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    }
+    if syscall == 14 {
+        let notification = table.capability(CapHandle(frame.registers[1] as u32), Rights::READ);
+        if !matches!(notification, Ok(capability) if capability.object_type == ObjectType::Notification && capability.object == DEVICE_NOTIFICATION_OBJECT)
+        {
+            frame.registers[0] = Status::BadCapability as i64 as u64;
+            return Some(0);
+        }
+        DEVICE_IRQ_BOUND.store(true, Ordering::Release);
+    } else {
+        if !DEVICE_IRQ_BOUND.load(Ordering::Acquire) {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+            return Some(0);
+        }
+        let acknowledgements = DEVICE_IRQ_ACKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if acknowledgements == 1 {
+            crate::kprintln!(
+                "[irq] virtio-blk INTx completions={}",
+                aarch64::device_interrupts()
+            );
+        }
+    }
+    frame.registers[0] = Status::Ok as i64 as u64;
+    Some(0)
+}
+
+pub fn handle_dma_control(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !(16..=17).contains(&syscall) {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    if task != BLOCK_TASK {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    let table = unsafe { &(&*CAPS.0.get())[task] };
+    let domain = table.capability(CapHandle(frame.registers[0] as u32), Rights::MAP);
+    if !matches!(domain, Ok(capability) if capability.object_type == ObjectType::DmaDomain && capability.object == DMA_DOMAIN_OBJECT)
+    {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    }
+    let Some(grant) = (unsafe { *BLOCK_GRANT.0.get() }) else {
+        frame.registers[0] = Status::Invalid as i64 as u64;
+        return Some(0);
+    };
+    if syscall == 16 {
+        let iova = frame.registers[2];
+        let Some(index) = iova
+            .checked_sub(grant.dma_iova)
+            .filter(|offset| offset.is_multiple_of(4096))
+            .map(|offset| offset / 4096)
+            .filter(|index| *index < 32)
+        else {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+            return Some(0);
+        };
+        let authorization_bit = 1u32 << index;
+        if DMA_AUTHORIZED.load(Ordering::Acquire) & authorization_bit != 0 {
+            frame.registers[0] = Status::Busy as i64 as u64;
+            return Some(0);
+        }
+        let frame_capability = table.capability(CapHandle(frame.registers[1] as u32), Rights::MAP);
+        let Ok(frame_capability) = frame_capability else {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+            return Some(0);
+        };
+        let physical = if index == 0 {
+            if frame_capability.object != DEVICE_QUEUE_OBJECT {
+                frame.registers[0] = Status::AccessDenied as i64 as u64;
+                return Some(0);
+            }
+            grant.queue_physical
+        } else if index == 1 {
+            if frame_capability.object != SHARED_FRAME_OBJECT {
+                frame.registers[0] = Status::AccessDenied as i64 as u64;
+                return Some(0);
+            }
+            grant.data_physical
+        } else if frame_capability.object_type == ObjectType::Frame {
+            let Some(physical) = runtime_frame_physical(frame_capability.object) else {
+                frame.registers[0] = Status::AccessDenied as i64 as u64;
+                return Some(0);
+            };
+            physical
+        } else {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+            return Some(0);
+        };
+        if frame_capability.object_type != ObjectType::Frame {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+            return Some(0);
+        }
+        if smmu::map_runtime_page(iova, physical).is_err() {
+            frame.registers[0] = Status::Io as i64 as u64;
+            return Some(0);
+        }
+        DMA_FRAME_OBJECTS[index as usize].store(frame_capability.object, Ordering::Release);
+        DMA_AUTHORIZED.fetch_or(authorization_bit, Ordering::Release);
+    } else {
+        let iova = frame.registers[1];
+        let Some(index) = iova
+            .checked_sub(grant.dma_iova)
+            .filter(|offset| offset.is_multiple_of(4096))
+            .map(|offset| offset / 4096)
+            .filter(|index| *index < 32)
+        else {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+            return Some(0);
+        };
+        let authorization_bit = 1u32 << index;
+        if DMA_AUTHORIZED.load(Ordering::Acquire) & authorization_bit == 0 {
+            frame.registers[0] = Status::NotFound as i64 as u64;
+            return Some(0);
+        }
+        if smmu::unmap_runtime_page(iova).is_err() {
+            frame.registers[0] = Status::Io as i64 as u64;
+            return Some(0);
+        }
+        DMA_FRAME_OBJECTS[index as usize].store(0, Ordering::Release);
+        DMA_AUTHORIZED.fetch_and(!authorization_bit, Ordering::Release);
+    }
+    frame.registers[0] = Status::Ok as i64 as u64;
+    Some(0)
+}
+
+pub fn handle_system_control(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || syscall != 22 {
+        return None;
+    }
+    let guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    let capability = unsafe { &(&*CAPS.0.get())[task] }
+        .capability(CapHandle(frame.registers[0] as u32), Rights::MANAGE);
+    let authorized = task == DEVMGR_TASK
+        && matches!(capability, Ok(capability) if capability.object_type == ObjectType::SystemControl);
+    drop(guard);
+    if !authorized {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    let slot = u8::try_from(frame.registers[1]).ok();
+    let function = u8::try_from(frame.registers[2]).ok();
+    let result = match (slot, function) {
+        (Some(slot), Some(function)) => {
+            device_control::activate(slot, function).and_then(install_transport)
+        }
+        _ => Err(Status::Invalid),
+    };
+    frame.registers[0] = match result {
+        Ok(()) => Status::Ok as i64 as u64,
+        Err(status) => status as i64 as u64,
+    };
+    Some(0)
+}
+
+pub fn handle_system_stats(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || syscall != 24 {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    let capability = unsafe { &(&*CAPS.0.get())[task] }
+        .capability(CapHandle(frame.registers[0] as u32), Rights::READ);
+    if !matches!(capability, Ok(capability) if capability.object_type == ObjectType::SystemInfo) {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    if frame.registers[2] as usize != core::mem::size_of::<microsystem_abi::SystemStats>() {
+        frame.registers[0] = Status::Invalid as i64 as u64;
+        return Some(0);
+    }
+    let state = unsafe { &*STATE.0.get() };
+    let mut runnable = 0u32;
+    let mut blocked = 0u32;
+    for thread in &state.threads {
+        match thread {
+            ThreadState::Runnable | ThreadState::Running { .. } => runnable += 1,
+            ThreadState::Sending { .. }
+            | ThreadState::Receiving { .. }
+            | ThreadState::WaitingReply { .. }
+            | ThreadState::WaitingNotification { .. }
+            | ThreadState::Terminating { .. } => blocked += 1,
+            ThreadState::Exited => {}
+        }
+    }
+    let stats = microsystem_abi::SystemStats {
+        version: 1,
+        cpu_count: CPU_COUNT as u16,
+        reserved: 0,
+        cpu_ticks: [aarch64::timer_ticks(0), aarch64::timer_ticks(1)],
+        free_frames: physical_memory::free_frames() as u64,
+        kernel_heap_used: kernel_heap::allocated_bytes() as u64,
+        kernel_heap_total: physical_memory::kernel_heap_bytes() as u64,
+        runnable_threads: runnable,
+        blocked_threads: blocked,
+        irq_count: aarch64::device_interrupts(),
+        ipc_calls: IPC_CALLS.load(Ordering::Relaxed),
+    };
+    frame.registers[0] = if copy_to_user(
+        task,
+        frame.registers[1],
+        (&stats as *const microsystem_abi::SystemStats).cast::<u8>(),
+        core::mem::size_of::<microsystem_abi::SystemStats>(),
+    )
+    .is_some()
+    {
+        Status::Ok as i64 as u64
+    } else {
+        Status::Fault as i64 as u64
+    };
+    Some(0)
+}
+
+pub fn handle_gui_present(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || syscall != 25 {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    if task != WINDOWD_TASK {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    let capability = unsafe { &(&*CAPS.0.get())[task] }
+        .capability(CapHandle(frame.registers[0] as u32), Rights::READ);
+    let Ok(capability) = capability else {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    };
+    let Some(region) = (capability.object_type == ObjectType::FrameRegion)
+        .then(|| frame_region(capability.object))
+        .flatten()
+    else {
+        frame.registers[0] = Status::BadCapability as i64 as u64;
+        return Some(0);
+    };
+    const FRAMEBUFFER_PAGES: usize = 1024 * 768 * 4 / 4096;
+    if region.pages as usize != FRAMEBUFFER_PAGES {
+        frame.registers[0] = Status::Invalid as i64 as u64;
+        return Some(0);
+    }
+    let requested = (
+        frame.registers[1],
+        frame.registers[2],
+        frame.registers[3],
+        frame.registers[4],
+    );
+    let (x, y, width, height) = if requested == (0, 0, 0, 0) {
+        (0usize, 0usize, 1024usize, 768usize)
+    } else {
+        let Ok(x) = usize::try_from(requested.0) else {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+            return Some(0);
+        };
+        let Ok(y) = usize::try_from(requested.1) else {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+            return Some(0);
+        };
+        let Ok(width) = usize::try_from(requested.2) else {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+            return Some(0);
+        };
+        let Ok(height) = usize::try_from(requested.3) else {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+            return Some(0);
+        };
+        if width == 0
+            || height == 0
+            || x.checked_add(width).is_none_or(|right| right > 1024)
+            || y.checked_add(height).is_none_or(|bottom| bottom > 768)
+        {
+            frame.registers[0] = Status::Invalid as i64 as u64;
+            return Some(0);
+        }
+        (x, y, width, height)
+    };
+    let Some(destination) = crate::gpu::framebuffer_mut() else {
+        frame.registers[0] = Status::NotFound as i64 as u64;
+        return Some(0);
+    };
+    for row in y..y + height {
+        let mut offset = (row * 1024 + x) * 4;
+        let mut remaining = width * 4;
+        while remaining != 0 {
+            let page = offset / 4096;
+            let within_page = offset % 4096;
+            let bytes = remaining.min(4096 - within_page);
+            let Some(physical) = runtime_frame_physical(region.frames[page]) else {
+                frame.registers[0] = Status::Fault as i64 as u64;
+                return Some(0);
+            };
+            let source = (KERNEL_OFFSET + physical as usize + within_page) as *const u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source,
+                    destination.as_mut_ptr().add(offset),
+                    bytes,
+                );
+            }
+            offset += bytes;
+            remaining -= bytes;
+        }
+    }
+    frame.registers[0] = if crate::gpu::flush_rect(
+        x as u32,
+        y as u32,
+        width as u32,
+        height as u32,
+    )
+    .is_ok()
+    {
+        if !GUI_PRESENT_REPORTED.swap(true, Ordering::AcqRel) {
+            crate::kprintln!(
+                "[gui] EL0 windowd presented scanout bytes={} dma-isolated=true",
+                destination.len()
+            );
+        }
+        if (width != 1024 || height != 768)
+            && !GUI_PARTIAL_PRESENT_REPORTED.swap(true, Ordering::AcqRel)
+        {
+            crate::kprintln!(
+                "[gui] EL0 windowd partial-present=true rect={}x{}+{},{}",
+                width,
+                height,
+                x,
+                y
+            );
+        }
+        Status::Ok as i64 as u64
+    } else {
+        Status::Io as i64 as u64
+    };
+    Some(0)
+}
+
+pub fn handle_gui_input(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || syscall != 26 {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    if task != WINDOWD_TASK {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    if frame.registers[1] as usize != core::mem::size_of::<microsystem_abi::gui::InputEvent>() {
+        frame.registers[0] = Status::Invalid as i64 as u64;
+        return Some(0);
+    }
+    let Some(event) = crate::input::poll() else {
+        frame.registers[0] = Status::Busy as i64 as u64;
+        return Some(0);
+    };
+    frame.registers[0] = if copy_to_user(
+        task,
+        frame.registers[0],
+        (&event as *const microsystem_abi::gui::InputEvent).cast::<u8>(),
+        core::mem::size_of::<microsystem_abi::gui::InputEvent>(),
+    )
+    .is_some()
+    {
+        Status::Ok as i64 as u64
+    } else {
+        Status::Fault as i64 as u64
+    };
+    Some(0)
+}
+
+pub fn handle_network(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    if !active_on_current_cpu() || !(27..=29).contains(&syscall) {
+        return None;
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    if syscall != 29 && task != NETD_TASK {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    let handle = CapHandle(frame.registers[0] as u32);
+    let (object_type, rights) = if syscall == 27 {
+        (ObjectType::NetworkDevice, Rights::READ)
+    } else if syscall == 28 {
+        (ObjectType::NetworkDevice, Rights::WRITE)
+    } else {
+        (ObjectType::RandomSource, Rights::READ)
+    };
+    let capability = unsafe { &(&*CAPS.0.get())[task] }.capability(handle, rights);
+    if !matches!(capability, Ok(capability) if capability.object_type == object_type) {
+        frame.registers[0] = Status::AccessDenied as i64 as u64;
+        return Some(0);
+    }
+    let pointer = frame.registers[1];
+    let bytes = frame.registers[2] as usize;
+    let maximum = if syscall == 29 { 256 } else { 1536 };
+    if bytes == 0 || bytes > maximum {
+        frame.registers[0] = Status::Invalid as i64 as u64;
+        return Some(0);
+    }
+    let mut buffer = [0u8; 1536];
+    frame.registers[0] = match syscall {
+        27 => match crate::net::receive(&mut buffer[..bytes]) {
+            Ok(0) => 0,
+            Ok(received)
+                if validate_user_range(task, pointer, received as u64, true)
+                    && copy_to_user(task, pointer, buffer.as_ptr(), received).is_some() =>
+            {
+                received as u64
+            }
+            Ok(_) => Status::Fault as i64 as u64,
+            Err(()) => Status::Io as i64 as u64,
+        },
+        28 if validate_user_range(task, pointer, bytes as u64, false)
+            && copy_from_user(task, pointer, buffer.as_mut_ptr(), bytes).is_some() =>
+        {
+            match crate::net::send(&buffer[..bytes]) {
+                Ok(true) => Status::Ok as i64 as u64,
+                Ok(false) => Status::Busy as i64 as u64,
+                Err(()) => Status::Io as i64 as u64,
+            }
+        }
+        29 if validate_user_range(task, pointer, bytes as u64, true) => {
+            match crate::random::fill(&mut buffer[..bytes]) {
+                Ok(()) if copy_to_user(task, pointer, buffer.as_ptr(), bytes).is_some() => {
+                    Status::Ok as i64 as u64
+                }
+                Ok(()) => Status::Fault as i64 as u64,
+                Err(()) => Status::Io as i64 as u64,
+            }
+        }
+        _ => Status::Fault as i64 as u64,
+    };
+    Some(0)
+}
+
+fn install_transport(grant: UserTransportGrant) -> Result<(), Status> {
+    let _guard = lock_state();
+    if unsafe { (*BLOCK_GRANT.0.get()).is_some() } {
+        return Err(Status::Busy);
+    }
+    unsafe { *BLOCK_GRANT.0.get() = Some(grant) };
+    for task in [BLOCK_TASK, DEVMGR_TASK] {
+        let memory = task_memory_mut(task).ok_or(Status::Invalid)?;
+        map_page(
+            memory,
+            BLOCK_COMMON_VA,
+            grant.common_physical,
+            device_page_flags(),
+        );
+        map_page(
+            memory,
+            BLOCK_NOTIFY_VA,
+            grant.notify_physical,
+            device_page_flags(),
+        );
+        map_page(
+            memory,
+            BLOCK_ISR_VA,
+            grant.isr_physical,
+            device_page_flags(),
+        );
+        map_page(
+            memory,
+            BLOCK_DEVICE_VA,
+            grant.device_physical,
+            device_page_flags(),
+        );
+    }
+    let devmgr_memory = task_memory_mut(DEVMGR_TASK).ok_or(Status::Invalid)?;
+    map_page(
+        devmgr_memory,
+        DEVMGR_PCI_CONFIG_VA,
+        grant.pci_function_physical,
+        device_page_flags(),
+    );
+    let block_memory = task_memory_mut(BLOCK_TASK).ok_or(Status::Invalid)?;
+    map_page(
+        block_memory,
+        BLOCK_QUEUE_VA,
+        grant.queue_physical,
+        normal_page_flags(),
+    );
+    for task in [BLOCK_TASK, MFS_TASK] {
+        let memory = task_memory_mut(task).ok_or(Status::Invalid)?;
+        map_page(
+            memory,
+            SHARED_DATA_VA,
+            grant.data_physical,
+            normal_page_flags(),
+        );
+    }
+    unsafe {
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+    }
+    for task in [BLOCK_TASK, MFS_TASK, DEVMGR_TASK] {
+        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+    }
+    Ok(())
+}
+
+pub fn notify_device_irq() {
+    if !DEVICE_IRQ_BOUND.load(Ordering::Acquire) {
+        return;
+    }
+    DEVICE_NOTIFICATION.fetch_or(1, Ordering::Release);
+    aarch64::send_reschedule(0);
+    aarch64::send_reschedule(1);
+    aarch64::send_event();
+}
+
+pub fn on_timer(frame: &mut ExceptionFrame) {
+    if !active_on_current_cpu() || preempt::exception_level() != 0 {
+        return;
+    }
+    let _guard = lock_state();
+    wake_notifications();
+    expire_deadlines();
+    switch(frame);
+}
+
+pub fn on_reschedule(frame: &mut ExceptionFrame) {
+    if !active_on_current_cpu() || preempt::exception_level() != 0 {
+        return;
+    }
+    let _guard = lock_state();
+    wake_notifications();
+    RESCHEDULE_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    switch(frame);
+}
+
+pub fn mark_current_ready() {
+    if !active_on_current_cpu() {
+        return;
+    }
+    let _guard = lock_state();
+    let current = current_task(unsafe { &*STATE.0.get() });
+    if current < SERVICE_COUNT {
+        READY.fetch_or(1 << current, Ordering::Release);
+    }
+}
+
+pub fn enable_gui_services() {
+    EXPECTED_SERVICE_MASK.store((1u32 << SERVICE_COUNT) - 1, Ordering::Release);
+}
+
+pub fn ready_count() -> u32 {
+    let expected_mask = EXPECTED_SERVICE_MASK.load(Ordering::Acquire);
+    (READY.load(Ordering::Acquire) & expected_mask).count_ones()
+}
+
+pub fn mark_current_online() {
+    if !active_on_current_cpu() {
+        return;
+    }
+    let _guard = lock_state();
+    let current = current_task(unsafe { &*STATE.0.get() });
+    if current >= SERVICE_COUNT {
+        return;
+    }
+    let online = ONLINE.fetch_or(1 << current, Ordering::AcqRel) | (1 << current);
+    let expected_mask = EXPECTED_SERVICE_MASK.load(Ordering::Acquire);
+    let expected = expected_mask.count_ones();
+    if online & expected_mask == expected_mask
+        && SERVICE_STATUS_REPORTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        crate::kprintln!(
+            "[service] resident EL0 ready={}/{} online={}/{} switches={}",
+            ready_count(),
+            expected,
+            (online & expected_mask).count_ones(),
+            expected,
+            switches()
+        );
+        let (waits, acknowledgements, wakeups) = notification_diagnostics();
+        crate::kprintln!(
+            "[irq] resident notification blocking-waits={} irq-acks={} sgi-wakeups={}",
+            waits,
+            acknowledgements,
+            wakeups
+        );
+        crate::kprintln!("[service] root task ready");
+        crate::kprintln!("[service] block transport ready (VirtIO-PCI)");
+        crate::kprintln!("[service] mfs1 ready (resident EL0)");
+    }
+    aarch64::send_event();
+}
+
+pub fn exit_disposition(code: u64) -> Option<(&'static str, bool)> {
+    if !active_on_current_cpu() {
+        return None;
+    }
+    let _guard = lock_state();
+    let current = current_task(unsafe { &*STATE.0.get() });
+    if current < SERVICE_COUNT {
+        Some((SERVICE_NAMES[current], current == SHELL_TASK && code == 0))
+    } else {
+        None
+    }
+}
+
+pub fn start_thread(program: u64) -> Result<u64, Status> {
+    start_thread_inner(program, None)
+}
+
+pub fn clock_realtime() -> Result<u64, Status> {
+    crate::rtc::realtime().ok_or(Status::NotSupported)
+}
+
+pub fn start_thread_ex(pointer: u64, bytes: u64) -> Result<u64, Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let _guard = lock_state();
+    let task = current_task(unsafe { &*STATE.0.get() });
+    if task != 0 {
+        return Err(Status::AccessDenied);
+    }
+    if !matches!(bytes as usize, size if size == mem::size_of::<ThreadLaunchV1>() || size == mem::size_of::<ThreadLaunchV2>())
+        || !validate_user_range(task, pointer, bytes, false)
+    {
+        return Err(Status::Invalid);
+    }
+    let launch = if bytes as usize == mem::size_of::<ThreadLaunchV1>() {
+        let mut legacy = ThreadLaunchV1::default();
+        copy_from_user(
+            task,
+            pointer,
+            (&mut legacy as *mut ThreadLaunchV1).cast::<u8>(),
+            mem::size_of::<ThreadLaunchV1>(),
+        )
+        .ok_or(Status::Fault)?;
+        let mut launch = ThreadLaunchV2 {
+            version: legacy.version,
+            profile: legacy.profile,
+            flags: legacy.flags,
+            program: legacy.program,
+            arguments: legacy.arguments,
+            ..ThreadLaunchV2::default()
+        };
+        launch.caps[..microsystem_abi::THREAD_LAUNCH_CAPS].copy_from_slice(&legacy.caps);
+        launch.rights[..microsystem_abi::THREAD_LAUNCH_CAPS].copy_from_slice(&legacy.rights);
+        launch
+    } else {
+        let mut launch = ThreadLaunchV2::default();
+        copy_from_user(
+            task,
+            pointer,
+            (&mut launch as *mut ThreadLaunchV2).cast::<u8>(),
+            mem::size_of::<ThreadLaunchV2>(),
+        )
+        .ok_or(Status::Fault)?;
+        launch
+    };
+    drop(_guard);
+    start_thread_inner(launch.program, Some(&launch))
+}
+
+fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u64, Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let guard = lock_state();
+    if current_task(unsafe { &*STATE.0.get() }) != 0 {
+        return Err(Status::AccessDenied);
+    }
+    if program == 0 {
+        return Err(Status::Invalid);
+    }
+    let profile = launch.map_or(microsystem_abi::THREAD_PROFILE_APPLICATION, |launch| {
+        launch.profile
+    });
+    if let Some(launch) = launch {
+        if !matches!(launch.version, 1 | 2)
+            || launch.flags & !microsystem_abi::THREAD_LAUNCH_FLAG_GUI != 0
+            || launch.version == 1 && launch.flags != 0
+            || launch.profile != microsystem_abi::THREAD_PROFILE_MICA
+            || program != program_id("mica")
+        {
+            return Err(Status::Invalid);
+        }
+    }
+    let state = unsafe { &mut *STATE.0.get() };
+    let service_task = SERVICE_NAMES
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(task, name)| (program_id(name) == program).then_some(task));
+    let (task, image, application) = if let Some(task) = service_task {
+        if !matches!(state.threads[task], ThreadState::Exited) {
+            return Err(Status::Busy);
+        }
+        (
+            task,
+            image_by_name(bootfs(), SERVICE_NAMES[task]).ok_or(Status::NotFound)?,
+            false,
+        )
+    } else {
+        let task = (APPLICATION_START..APPLICATION_START + APPLICATION_COUNT)
+            .find(|task| matches!(state.threads[*task], ThreadState::Exited))
+            .ok_or(Status::Busy)?;
+        (
+            task,
+            application_image_by_id(program, launch.is_some())?,
+            true,
+        )
+    };
+    if launch.is_some() && !application {
+        return Err(Status::Invalid);
+    }
+    let launch_caps = if let Some(launch) = launch {
+        Some(validate_launch_capabilities(launch)?)
+    } else {
+        None
+    };
+    load_task(task, image).map_err(|_| Status::Invalid)?;
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "ic ialluis",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+    let start = unsafe { (&*STARTS.0.get())[task] };
+    state.contexts[task] = Context::EMPTY;
+    state.contexts[task].elr = start.entry;
+    state.contexts[task].sp_el0 = start.stack;
+    state.contexts[task].ttbr0 = start.ttbr0;
+    if application {
+        state.contexts[task].registers[0] = (task + 1) as u64;
+    } else if task == CONSOLE_TASK {
+        let uart = CONSOLE_UART.load(Ordering::Acquire);
+        state.contexts[task].registers[0] = CONSOLE_UART_VA + (uart & 0xfff);
+    } else if task == DEVMGR_TASK {
+        let (base, bytes) = device_control::pcie_window().ok_or(Status::NotFound)?;
+        state.contexts[task].registers[0] = base;
+        state.contexts[task].registers[1] = bytes;
+        state.contexts[task].registers[2] = DEVMGR_ECAM_SCAN_VA;
+    }
+    if application {
+        let index = task - APPLICATION_START;
+        let tables = unsafe { &mut *CAPS.0.get() };
+        tables[task] = CapabilityTable::new();
+        let install = if let (Some(launch), Some(capabilities)) = (launch, launch_caps) {
+            install_launch_capabilities(
+                &mut tables[task],
+                launch,
+                capabilities,
+                &mut state.contexts[task],
+            )
+        } else {
+            insert_endpoint_cap(
+                tables,
+                task,
+                microsystem_abi::boot_cap::PROCESS_ENDPOINT,
+                4,
+                Rights::WRITE,
+                PROCESS_ENDPOINT_NODE,
+            )
+        };
+        if let Err(status) = install {
+            tables[task] = CapabilityTable::new();
+            unsafe { (&mut *STARTS.0.get())[task] = Start::EMPTY };
+            state.contexts[task] = Context::EMPTY;
+            state.threads[task] = ThreadState::Exited;
+            return Err(status);
+        }
+        state.applications[index] = ApplicationSlot {
+            program,
+            profile,
+            exit_status: 0,
+            cpu_mask: 0,
+            cpu_ticks: [0; CPU_COUNT],
+            reclaimed_frames: 0,
+            reclaimed_pools: 0,
+            reclaimed_mappings: 0,
+        };
+    }
+    state.threads[task] = ThreadState::Runnable;
+    let pid = (task + 1) as u64;
+    drop(guard);
+    aarch64::send_reschedule(0);
+    aarch64::send_reschedule(1);
+    aarch64::send_event();
+    Ok(pid)
+}
+
+fn validate_launch_capabilities(
+    launch: &ThreadLaunchV2,
+) -> Result<[Option<Capability>; microsystem_abi::THREAD_LAUNCH_V2_CAPS], Status> {
+    let expected_types = [
+        ObjectType::FrameRegion,
+        ObjectType::Notification,
+        ObjectType::Endpoint,
+        ObjectType::Endpoint,
+        ObjectType::RandomSource,
+        ObjectType::SystemInfo,
+        ObjectType::FrameRegion,
+        ObjectType::Frame,
+        ObjectType::Endpoint,
+    ];
+    let allowed_rights = [
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0),
+        Rights(Rights::READ.0 | Rights::WRITE.0),
+        Rights::WRITE,
+        Rights::WRITE,
+        Rights::READ,
+        Rights::READ,
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0),
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0),
+        Rights::WRITE,
+    ];
+    let tables = unsafe { &*CAPS.0.get() };
+    let mut output = [None; microsystem_abi::THREAD_LAUNCH_V2_CAPS];
+    let gui = launch.flags & microsystem_abi::THREAD_LAUNCH_FLAG_GUI != 0;
+    for index in 0..microsystem_abi::THREAD_LAUNCH_V2_CAPS {
+        let handle = launch.caps[index];
+        let rights = launch.rights[index];
+        if handle == CapHandle::INVALID {
+            if index < 4 || gui && index >= microsystem_abi::THREAD_LAUNCH_CAPS || rights.0 != 0 {
+                return Err(Status::Invalid);
+            }
+            continue;
+        }
+        if !gui && index >= microsystem_abi::THREAD_LAUNCH_CAPS {
+            return Err(Status::Invalid);
+        }
+        if rights.0 == 0 || rights.0 & !allowed_rights[index].0 != 0 {
+            return Err(Status::AccessDenied);
+        }
+        let capability = tables[0].capability(handle, Rights::GRANT)?;
+        if capability.object_type != expected_types[index] || !capability.rights.contains(rights) {
+            return Err(Status::AccessDenied);
+        }
+        output[index] = Some(capability);
+    }
+    Ok(output)
+}
+
+fn install_launch_capabilities(
+    table: &mut CapabilityTable,
+    launch: &ThreadLaunchV2,
+    capabilities: [Option<Capability>; microsystem_abi::THREAD_LAUNCH_V2_CAPS],
+    context: &mut Context,
+) -> Result<(), Status> {
+    let destinations = [
+        microsystem_abi::boot_cap::SCRIPT_SESSION_REGION,
+        microsystem_abi::boot_cap::SCRIPT_IO_NOTIFICATION,
+        microsystem_abi::boot_cap::SCRIPT_FILESYSTEM_ENDPOINT,
+        microsystem_abi::boot_cap::SCRIPT_NETWORK_ENDPOINT,
+        microsystem_abi::boot_cap::SCRIPT_RANDOM_SOURCE,
+        microsystem_abi::boot_cap::SCRIPT_SYSTEM_DATA,
+        microsystem_abi::boot_cap::SCRIPT_GUI_COMMANDS,
+        microsystem_abi::boot_cap::SCRIPT_GUI_EVENTS,
+        microsystem_abi::boot_cap::SCRIPT_GUI_ENDPOINT,
+    ];
+    for index in 0..microsystem_abi::THREAD_LAUNCH_V2_CAPS {
+        let Some(capability) = capabilities[index] else {
+            if index < microsystem_abi::THREAD_LAUNCH_CAPS {
+                context.registers[index + 1] = CapHandle::INVALID.0 as u64;
+            }
+            continue;
+        };
+        table.import_copy_at(
+            destinations[index],
+            capability,
+            launch.rights[index],
+            allocate_derivation(),
+        )?;
+        if index < microsystem_abi::THREAD_LAUNCH_CAPS {
+            context.registers[index + 1] = destinations[index].0 as u64;
+        }
+    }
+    table.insert_root_at(
+        microsystem_abi::boot_cap::SCRIPT_BROKER_ENDPOINT,
+        15,
+        ObjectType::Endpoint,
+        Rights::WRITE,
+        32,
+    )?;
+    context.registers[7..11].copy_from_slice(&launch.arguments);
+    Ok(())
+}
+
+fn image_by_name(bootfs: &'static [u8], name: &str) -> Option<&'static [u8]> {
+    Archive::new(bootfs).find_map(|entry| match entry {
+        Ok(entry) if entry.name.strip_prefix("bin/") == Some(name) => Some(entry.data),
+        _ => None,
+    })
+}
+
+fn application_image_by_id(program: u64, allow_mica: bool) -> Result<&'static [u8], Status> {
+    Archive::new(bootfs())
+        .find_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.name.strip_prefix("bin/")?;
+            if SERVICE_NAMES.contains(&name)
+                || name == "idle"
+                || name == "mica" && !allow_mica
+                || program_id(name) != program
+            {
+                return None;
+            }
+            Some(entry.data)
+        })
+        .ok_or(Status::NotFound)
+}
+
+fn bootfs() -> &'static [u8] {
+    let address = BOOTFS_ADDRESS.load(Ordering::Acquire);
+    let length = BOOTFS_LENGTH.load(Ordering::Acquire);
+    if address == 0 || length == 0 {
+        return &[];
+    }
+    unsafe { core::slice::from_raw_parts(address as *const u8, length) }
+}
+
+fn program_id(name: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn finish_application(state: &mut State, task: usize, status: i64) {
+    match state.threads[task] {
+        ThreadState::Sending { endpoint, .. } => {
+            if let Some(index) = endpoint.checked_sub(1)
+                && state.endpoints[index].pending == Some(task)
+            {
+                state.endpoints[index].pending = None;
+            }
+        }
+        ThreadState::WaitingReply { server, .. } => {
+            if state.reply_to[server] == Some(task) {
+                state.reply_to[server] = None;
+            }
+        }
+        _ => {}
+    }
+    state.threads[task] = ThreadState::Exited;
+    state.reply_to[task] = None;
+    state.requests[task] = Message::new(0, 0);
+    let cleanup = reclaim_task_capabilities(task);
+    let application = &mut state.applications[task - APPLICATION_START];
+    application.exit_status = status;
+    application.reclaimed_frames = cleanup.frames;
+    application.reclaimed_pools = cleanup.pools;
+    application.reclaimed_mappings = cleanup.mappings;
+}
+
+pub fn handle_application_exit(frame: &mut ExceptionFrame, status: i64) -> Option<(u64, u64)> {
+    if !active_on_current_cpu() {
+        return None;
+    }
+    let _guard = lock_state();
+    let cpu = current_cpu();
+    let state = unsafe { &mut *STATE.0.get() };
+    let task = state.current[cpu];
+    let Some(index) = task.checked_sub(APPLICATION_START) else {
+        return None;
+    };
+    if index >= APPLICATION_COUNT {
+        return None;
+    }
+    finish_application(state, task, status);
+    let next = next_other_runnable(state, task, cpu)?;
+    set_running(state, cpu, next);
+    preempt::load(&state.contexts[next], frame);
+    record_switch(cpu);
+    Some((2, (task + 1) as u64))
+}
+
+pub fn write_application_status(pid: u64, pointer: u64, mode: u64) -> Result<(), Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let _guard = lock_state();
+    if current_task(unsafe { &*STATE.0.get() }) != 0 {
+        return Err(Status::AccessDenied);
+    }
+    let (task, index) = application_slot(pid)?;
+    let state = unsafe { &*STATE.0.get() };
+    if state.applications[index].program == 0 {
+        return Err(Status::NotFound);
+    }
+    let running = !matches!(state.threads[task], ThreadState::Exited);
+    let (frames, pools, mappings) = if running {
+        task_live_resources(task)
+    } else {
+        (
+            state.applications[index].reclaimed_frames,
+            state.applications[index].reclaimed_pools,
+            state.applications[index].reclaimed_mappings,
+        )
+    };
+    if mode == 5 {
+        let output = microsystem_abi::ProcessInfoV2 {
+            version: 2,
+            running: running as u16,
+            pid: pid as u32,
+            exit_status: state.applications[index].exit_status,
+            program: state.applications[index].program,
+            cpu_ticks: state.applications[index].cpu_ticks,
+            cpu_mask: state.applications[index].cpu_mask,
+            owned_pages: if running { task_owned_pages(task) } else { 0 },
+        };
+        let bytes = mem::size_of::<microsystem_abi::ProcessInfoV2>();
+        if !validate_user_range(0, pointer, bytes as u64, true)
+            || copy_to_user(
+                0,
+                pointer,
+                (&output as *const microsystem_abi::ProcessInfoV2).cast::<u8>(),
+                bytes,
+            )
+            .is_none()
+        {
+            return Err(Status::Fault);
+        }
+        return Ok(());
+    }
+    let output = [
+        running as i64,
+        state.applications[index].exit_status,
+        state.applications[index].cpu_mask as i64,
+        frames as i64,
+        pools as i64,
+        mappings as i64,
+    ];
+    let output_words = match mode {
+        0 => 2,
+        3 => 3,
+        4 => output.len(),
+        _ => return Err(Status::Invalid),
+    };
+    let output_bytes = output_words * core::mem::size_of::<i64>();
+    if !validate_user_range(0, pointer, output_bytes as u64, true)
+        || copy_to_user(0, pointer, output.as_ptr().cast::<u8>(), output_bytes).is_none()
+    {
+        return Err(Status::Fault);
+    }
+    Ok(())
+}
+
+fn task_owned_pages(task: usize) -> u32 {
+    let tables = unsafe { &*CAPS.0.get() };
+    let mut objects = [0u32; MAX_CAPABILITIES];
+    let mut count = 0usize;
+    let mut pages = 0u32;
+    for capability in tables[task].capabilities() {
+        if !matches!(
+            capability.object_type,
+            ObjectType::Frame | ObjectType::FrameRegion
+        ) || objects[..count].contains(&capability.object)
+        {
+            continue;
+        }
+        objects[count] = capability.object;
+        count += 1;
+        pages = pages.saturating_add(
+            frame_region(capability.object)
+                .map(|region| region.pages as u32)
+                .unwrap_or(1),
+        );
+    }
+    pages
+}
+
+pub fn kill_application(pid: u64, status: i64) -> Result<(), Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let _guard = lock_state();
+    if current_task(unsafe { &*STATE.0.get() }) != 0 {
+        return Err(Status::AccessDenied);
+    }
+    let (task, index) = application_slot(pid)?;
+    let state = unsafe { &mut *STATE.0.get() };
+    if state.applications[index].program == 0 {
+        return Err(Status::NotFound);
+    }
+    if matches!(state.threads[task], ThreadState::Exited) {
+        return Err(Status::Invalid);
+    }
+    if matches!(state.threads[task], ThreadState::Terminating { .. }) {
+        return Err(Status::Busy);
+    }
+    let running_cpu = match state.threads[task] {
+        ThreadState::Running { cpu } => Some(cpu),
+        _ => None,
+    };
+    if let Some(cpu) = running_cpu {
+        state.threads[task] = ThreadState::Terminating { cpu };
+        state.applications[index].exit_status = status;
+        aarch64::send_reschedule(cpu);
+    } else {
+        finish_application(state, task, status);
+    }
+    Ok(())
+}
+
+pub fn switches() -> u64 {
+    SWITCHES.load(Ordering::Acquire)
+}
+
+pub fn notification_diagnostics() -> (u64, u64, u64) {
+    (
+        NOTIFICATION_BLOCKS.load(Ordering::Acquire),
+        DEVICE_IRQ_ACKS.load(Ordering::Acquire),
+        RESCHEDULE_WAKEUPS.load(Ordering::Acquire),
+    )
+}
+
+pub fn validate_user_read(pointer: u64, bytes: u64) -> bool {
+    if !active_on_current_cpu() {
+        return false;
+    }
+    let _guard = lock_state();
+    let current = current_task(unsafe { &*STATE.0.get() });
+    validate_user_range(current, pointer, bytes, false)
+}
+
+fn active_on_current_cpu() -> bool {
+    let cpu = aarch64::cpu_id();
+    cpu < CPU_COUNT && ACTIVE_CPUS.load(Ordering::Acquire) & (1 << cpu) != 0
+}
+
+fn switch(frame: &mut ExceptionFrame) {
+    wake_notifications();
+    let cpu = current_cpu();
+    let state = unsafe { &mut *STATE.0.get() };
+    let current = state.current[cpu];
+    preempt::save(&mut state.contexts[current], frame);
+    if matches!(state.threads[current], ThreadState::Running { cpu: owner } if owner == cpu) {
+        state.threads[current] = ThreadState::Runnable;
+    } else if matches!(state.threads[current], ThreadState::Terminating { cpu: owner } if owner == cpu)
+    {
+        let status = state.applications[current - APPLICATION_START].exit_status;
+        finish_application(state, current, status);
+    }
+    let Some(next) = next_runnable(state, current, cpu) else {
+        return;
+    };
+    set_running(state, cpu, next);
+    preempt::load(&state.contexts[next], frame);
+    record_switch(cpu);
+}
+
+fn call(frame: &mut ExceptionFrame) -> u64 {
+    let request_pointer = frame.registers[1];
+    let reply_pointer = frame.registers[2];
+    let deadline = frame.registers[3];
+    let cpu = current_cpu();
+    let state = unsafe { &mut *STATE.0.get() };
+    let caller = state.current[cpu];
+    let endpoint =
+        match resolve_endpoint(caller, CapHandle(frame.registers[0] as u32), Rights::WRITE) {
+            Ok(endpoint) => endpoint,
+            Err(status) => return fail(frame, status),
+        };
+    let Some(endpoint_index) = endpoint
+        .checked_sub(1)
+        .filter(|index| *index < ENDPOINT_COUNT)
+    else {
+        return fail(frame, Status::BadCapability);
+    };
+    if deadline_elapsed(deadline) {
+        return fail(frame, Status::TimedOut);
+    }
+    let Some(request) = read_message(caller, request_pointer) else {
+        return fail(frame, Status::Fault);
+    };
+    if request.version != ABI_VERSION
+        || !validate_user_range(
+            caller,
+            reply_pointer,
+            core::mem::size_of::<Message>() as u64,
+            true,
+        )
+    {
+        return fail(frame, Status::Invalid);
+    }
+    let server = ENDPOINT_OWNERS[endpoint_index];
+    let waiting_buffer = match state.threads[server] {
+        ThreadState::Receiving {
+            endpoint: waiting_endpoint,
+            buffer,
+            ..
+        } if waiting_endpoint == endpoint => Some(buffer),
+        _ => None,
+    };
+    if waiting_buffer.is_none() && state.endpoints[endpoint_index].pending.is_some() {
+        return fail(frame, Status::Busy);
+    }
+    let Some(next) = waiting_buffer
+        .map(|_| server)
+        .or_else(|| next_other_runnable(state, caller, cpu))
+    else {
+        return fail(frame, Status::Busy);
+    };
+
+    if let Some(buffer) = waiting_buffer {
+        let transfer = match stage_cap_transfer(caller, server, request) {
+            Ok(transfer) => transfer,
+            Err(status) => return fail(frame, status),
+        };
+        if !write_message(server, buffer, &transfer.message) {
+            transfer.rollback();
+            return fail(frame, Status::Fault);
+        }
+        transfer.commit();
+    }
+
+    state.requests[caller] = request;
+    preempt::save(&mut state.contexts[caller], frame);
+    if waiting_buffer.is_some() {
+        state.threads[caller] = ThreadState::WaitingReply {
+            server,
+            reply_buffer: reply_pointer,
+            deadline,
+        };
+        state.threads[server] = ThreadState::Runnable;
+        state.reply_to[server] = Some(caller);
+        state.contexts[server].registers[0] = Status::Ok as i64 as u64;
+    } else {
+        state.threads[caller] = ThreadState::Sending {
+            endpoint,
+            reply_buffer: reply_pointer,
+            deadline,
+        };
+        state.endpoints[endpoint_index].pending = Some(caller);
+    }
+    set_running(state, cpu, next);
+    preempt::load(&state.contexts[next], frame);
+    record_switch(cpu);
+    2
+}
+
+fn receive(frame: &mut ExceptionFrame) -> u64 {
+    let state = unsafe { &*STATE.0.get() };
+    let endpoint = match resolve_endpoint(
+        current_task(state),
+        CapHandle(frame.registers[0] as u32),
+        Rights::READ,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(status) => return fail(frame, status),
+    };
+    let buffer = frame.registers[1];
+    let deadline = frame.registers[2];
+    receive_after_reply(frame, endpoint, buffer, deadline, None)
+}
+
+fn reply_receive(frame: &mut ExceptionFrame) -> u64 {
+    let state = unsafe { &*STATE.0.get() };
+    let endpoint = match resolve_endpoint(
+        current_task(state),
+        CapHandle(frame.registers[0] as u32),
+        Rights::READ,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(status) => return fail(frame, status),
+    };
+    let reply_pointer = frame.registers[1];
+    let buffer = frame.registers[2];
+    let deadline = frame.registers[3];
+    let server = current_task(state);
+    let Some(caller) = state.reply_to[server] else {
+        return fail(frame, Status::Invalid);
+    };
+    let Some(reply) = read_message(server, reply_pointer) else {
+        return fail(frame, Status::Fault);
+    };
+    if reply.version != ABI_VERSION {
+        return fail(frame, Status::Invalid);
+    }
+    receive_after_reply(frame, endpoint, buffer, deadline, Some((caller, reply)))
+}
+
+fn receive_after_reply(
+    frame: &mut ExceptionFrame,
+    endpoint: usize,
+    buffer: u64,
+    deadline: u64,
+    reply: Option<(usize, Message)>,
+) -> u64 {
+    let cpu = current_cpu();
+    let state = unsafe { &mut *STATE.0.get() };
+    let server = state.current[cpu];
+    let Some(endpoint_index) = endpoint
+        .checked_sub(1)
+        .filter(|index| *index < ENDPOINT_COUNT)
+    else {
+        return fail(frame, Status::BadCapability);
+    };
+    if ENDPOINT_OWNERS[endpoint_index] != server {
+        return fail(frame, Status::AccessDenied);
+    }
+    let mut reply_transfer = None;
+    if let Some((caller, message)) = reply {
+        let ThreadState::WaitingReply {
+            server: expected_server,
+            reply_buffer,
+            ..
+        } = state.threads[caller]
+        else {
+            return fail(frame, Status::Invalid);
+        };
+        if expected_server != server {
+            return fail(frame, Status::Invalid);
+        }
+        reply_transfer = match stage_cap_transfer(server, caller, message) {
+            Ok(transfer) => Some((reply_buffer, transfer)),
+            Err(status) => return fail(frame, status),
+        };
+    }
+
+    if deadline_elapsed(deadline) {
+        if let Some((reply_buffer, transfer)) = reply_transfer {
+            if !write_message(transfer.receiver, reply_buffer, &transfer.message) {
+                transfer.rollback();
+                return fail(frame, Status::Fault);
+            }
+            transfer.commit();
+        }
+        if let Some((caller, _)) = reply {
+            state.threads[caller] = ThreadState::Runnable;
+            state.contexts[caller].registers[0] = Status::Ok as i64 as u64;
+            state.reply_to[server] = None;
+        }
+        return fail(frame, Status::TimedOut);
+    }
+    if !validate_user_range(server, buffer, core::mem::size_of::<Message>() as u64, true) {
+        if let Some((_, transfer)) = reply_transfer {
+            transfer.rollback();
+        }
+        return fail(frame, Status::Fault);
+    }
+
+    let pending = state.endpoints[endpoint_index].pending;
+    if let Some(caller) = pending {
+        let request = state.requests[caller];
+        let ThreadState::Sending {
+            reply_buffer,
+            deadline,
+            ..
+        } = state.threads[caller]
+        else {
+            if let Some((_, transfer)) = reply_transfer {
+                transfer.rollback();
+            }
+            return fail(frame, Status::Invalid);
+        };
+        let request_transfer = match stage_cap_transfer(caller, server, request) {
+            Ok(transfer) => transfer,
+            Err(status) => {
+                if let Some((_, transfer)) = reply_transfer {
+                    transfer.rollback();
+                }
+                return fail(frame, status);
+            }
+        };
+        if let Some((reply_buffer, transfer)) = reply_transfer {
+            if !write_message(transfer.receiver, reply_buffer, &transfer.message) {
+                transfer.rollback();
+                request_transfer.rollback();
+                return fail(frame, Status::Fault);
+            }
+        }
+        if !write_message(server, buffer, &request_transfer.message) {
+            if let Some((_, transfer)) = reply_transfer {
+                transfer.rollback();
+            }
+            request_transfer.rollback();
+            return fail(frame, Status::Fault);
+        }
+        if let Some((_, transfer)) = reply_transfer {
+            transfer.commit();
+        }
+        request_transfer.commit();
+        if let Some((previous, _)) = reply {
+            state.threads[previous] = ThreadState::Runnable;
+            state.contexts[previous].registers[0] = Status::Ok as i64 as u64;
+        }
+        state.endpoints[endpoint_index].pending = None;
+        state.threads[caller] = ThreadState::WaitingReply {
+            server,
+            reply_buffer,
+            deadline,
+        };
+        state.reply_to[server] = Some(caller);
+        frame.registers[0] = Status::Ok as i64 as u64;
+        return 0;
+    }
+
+    let Some(next) = reply
+        .map(|(caller, _)| caller)
+        .or_else(|| next_other_runnable(state, server, cpu))
+    else {
+        if let Some((_, transfer)) = reply_transfer {
+            transfer.rollback();
+        }
+        return fail(frame, Status::Busy);
+    };
+    if let Some((reply_buffer, transfer)) = reply_transfer {
+        if !write_message(transfer.receiver, reply_buffer, &transfer.message) {
+            transfer.rollback();
+            return fail(frame, Status::Fault);
+        }
+        transfer.commit();
+    }
+    preempt::save(&mut state.contexts[server], frame);
+    if let Some((caller, _)) = reply {
+        state.threads[caller] = ThreadState::Runnable;
+        state.contexts[caller].registers[0] = Status::Ok as i64 as u64;
+        state.reply_to[server] = None;
+    }
+    state.threads[server] = ThreadState::Receiving {
+        endpoint,
+        buffer,
+        deadline,
+    };
+    set_running(state, cpu, next);
+    preempt::load(&state.contexts[next], frame);
+    record_switch(cpu);
+    2
+}
+
+fn resolve_endpoint(task: usize, handle: CapHandle, rights: Rights) -> Result<usize, Status> {
+    let capability = unsafe { &(&*CAPS.0.get())[task] }.capability(handle, rights)?;
+    if capability.object_type != ObjectType::Endpoint
+        || !(1..=ENDPOINT_COUNT as u32).contains(&capability.object)
+    {
+        return Err(Status::BadCapability);
+    }
+    Ok(capability.object as usize)
+}
+
+fn install_boot_capabilities() -> Result<(), Status> {
+    let filesystem_physical = physical_memory::allocate_zeroed()?;
+    FILESYSTEM_FRAME_PHYSICAL.store(filesystem_physical, Ordering::Release);
+    let ssh_filesystem_physical = physical_memory::allocate_zeroed()?;
+    SSH_FILESYSTEM_FRAME_PHYSICAL.store(ssh_filesystem_physical, Ordering::Release);
+    let windowd_filesystem_physical = physical_memory::allocate_zeroed()?;
+    WINDOWD_FILESYSTEM_FRAME_PHYSICAL.store(windowd_filesystem_physical, Ordering::Release);
+    let terminal_filesystem_physical = physical_memory::allocate_zeroed()?;
+    TERMINAL_FILESYSTEM_FRAME_PHYSICAL.store(terminal_filesystem_physical, Ordering::Release);
+    let tables = unsafe { &mut *CAPS.0.get() };
+    let shared_rights = Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0);
+    for task in [BLOCK_TASK, MFS_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::SHARED_BLOCK_FRAME,
+            SHARED_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            SHARED_FRAME_NODE,
+        )?;
+    }
+    for task in [MFS_TASK, SHELL_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::SHARED_FILESYSTEM_FRAME,
+            FILESYSTEM_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            FILESYSTEM_FRAME_NODE,
+        )?;
+    }
+    for task in [MFS_TASK, SSHD_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::SSH_FILESYSTEM_FRAME,
+            SSH_FILESYSTEM_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            SSH_FILESYSTEM_FRAME_NODE,
+        )?;
+    }
+    for task in [MFS_TASK, WINDOWD_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::WINDOWD_FILESYSTEM_FRAME,
+            WINDOWD_FILESYSTEM_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            WINDOWD_FILESYSTEM_FRAME_NODE,
+        )?;
+    }
+    for task in [MFS_TASK, WINDOWD_TASK, TERMINAL_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::GUI_TERMINAL_COMMANDS,
+            TERMINAL_FILESYSTEM_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            TERMINAL_FILESYSTEM_FRAME_NODE,
+        )?;
+    }
+    tables[BLOCK_TASK].insert_root_at(
+        microsystem_abi::boot_cap::BLOCK_IRQ_NOTIFICATION,
+        DEVICE_NOTIFICATION_OBJECT,
+        ObjectType::Notification,
+        Rights(Rights::READ.0 | Rights::ACK.0),
+        DEVICE_NOTIFICATION_NODE,
+    )?;
+    tables[WINDOWD_TASK].insert_root_at(
+        microsystem_abi::boot_cap::GUI_MEMORY_POOL,
+        GUI_MEMORY_POOL_OBJECT,
+        ObjectType::MemoryPool,
+        Rights::MANAGE,
+        GUI_MEMORY_POOL_NODE,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::SCRIPT_MEMORY_POOL,
+        SCRIPT_MEMORY_POOL_OBJECT,
+        ObjectType::MemoryPool,
+        Rights(Rights::MANAGE.0 | Rights::GRANT.0),
+        SCRIPT_MEMORY_POOL_NODE,
+    )?;
+    tables[NETD_TASK].insert_root_at(
+        microsystem_abi::boot_cap::NETWORK_MEMORY_POOL,
+        NETWORK_MEMORY_POOL_OBJECT,
+        ObjectType::MemoryPool,
+        Rights::MANAGE,
+        NETWORK_MEMORY_POOL_NODE,
+    )?;
+    for task in [TERMINAL_TASK, MONITOR_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::SYSTEM_INFO,
+            60,
+            ObjectType::SystemInfo,
+            Rights::READ,
+            22,
+        )?;
+    }
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::SYSTEM_INFO,
+        60,
+        ObjectType::SystemInfo,
+        Rights(Rights::READ.0 | Rights::GRANT.0),
+        22,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::RANDOM_SOURCE,
+        62,
+        ObjectType::RandomSource,
+        Rights(Rights::READ.0 | Rights::GRANT.0),
+        RANDOM_SOURCE_NODE,
+    )?;
+    tables[NETD_TASK].insert_root_at(
+        microsystem_abi::boot_cap::NETWORK_DEVICE,
+        61,
+        ObjectType::NetworkDevice,
+        Rights(Rights::READ.0 | Rights::WRITE.0),
+        NETWORK_DEVICE_NODE,
+    )?;
+    tables[NETD_TASK].insert_root_at(
+        microsystem_abi::boot_cap::RANDOM_SOURCE,
+        62,
+        ObjectType::RandomSource,
+        Rights::READ,
+        RANDOM_SOURCE_NODE,
+    )?;
+    tables[SSHD_TASK].insert_root_at(
+        microsystem_abi::boot_cap::RANDOM_SOURCE,
+        62,
+        ObjectType::RandomSource,
+        Rights::READ,
+        RANDOM_SOURCE_NODE,
+    )?;
+    tables[SSHD_TASK].insert_root_at(
+        microsystem_abi::boot_cap::SYSTEM_INFO,
+        60,
+        ObjectType::SystemInfo,
+        Rights::READ,
+        22,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::DEVMGR_VIRTIO_IRQ,
+        DEVICE_IRQ_OBJECT,
+        ObjectType::Irq,
+        Rights(Rights::ACK.0 | Rights::MANAGE.0 | Rights::GRANT.0),
+        DEVICE_IRQ_NODE,
+    )?;
+    tables[DEVMGR_TASK].insert_root_at(
+        microsystem_abi::boot_cap::DEVICE_SYSTEM_CONTROL,
+        1,
+        ObjectType::SystemControl,
+        Rights::MANAGE,
+        16,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::DEVMGR_VIRTIO_MMIO,
+        DEVICE_MMIO_OBJECT,
+        ObjectType::MmioRegion,
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0),
+        DEVICE_MMIO_NODE,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::DEVMGR_QUEUE_FRAME,
+        DEVICE_QUEUE_OBJECT,
+        ObjectType::Frame,
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0),
+        DEVICE_QUEUE_NODE,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::DEVMGR_DMA_DOMAIN,
+        DMA_DOMAIN_OBJECT,
+        ObjectType::DmaDomain,
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0),
+        DMA_DOMAIN_NODE,
+    )?;
+    tables[0].insert_root_at(
+        microsystem_abi::boot_cap::ROOT_MEMORY_POOL,
+        ROOT_MEMORY_POOL_OBJECT,
+        ObjectType::MemoryPool,
+        Rights(Rights::MANAGE.0 | Rights::GRANT.0),
+        ROOT_MEMORY_POOL_NODE,
+    )?;
+    tables[BLOCK_TASK].insert_root_at(
+        microsystem_abi::boot_cap::DRIVER_MEMORY_POOL,
+        DRIVER_MEMORY_POOL_OBJECT,
+        ObjectType::MemoryPool,
+        Rights(Rights::MANAGE.0),
+        DRIVER_MEMORY_POOL_NODE,
+    )?;
+    for (task, rights) in [
+        (CONSOLE_TASK, Rights::READ),
+        (0, Rights::WRITE),
+        (SHELL_TASK, Rights::WRITE),
+    ] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::CONSOLE_ENDPOINT,
+            1,
+            rights,
+            CONSOLE_ENDPOINT_NODE,
+        )?;
+    }
+    insert_endpoint_cap(
+        tables,
+        WINDOWD_TASK,
+        microsystem_abi::boot_cap::GUI_FILESYSTEM_ENDPOINT,
+        3,
+        Rights::WRITE,
+        FILESYSTEM_ENDPOINT_NODE,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        TERMINAL_TASK,
+        microsystem_abi::boot_cap::TERMINAL_FILESYSTEM_ENDPOINT,
+        3,
+        Rights::WRITE,
+        FILESYSTEM_ENDPOINT_NODE,
+    )?;
+    for (task, rights) in [(BLOCK_TASK, Rights::READ), (MFS_TASK, Rights::WRITE)] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::BLOCK_ENDPOINT,
+            2,
+            rights,
+            BLOCK_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [
+        (MFS_TASK, Rights::READ),
+        (SHELL_TASK, Rights::WRITE),
+        (SSHD_TASK, Rights::WRITE),
+        (0, Rights(Rights::WRITE.0 | Rights::GRANT.0)),
+    ] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::FILESYSTEM_ENDPOINT,
+            3,
+            rights,
+            FILESYSTEM_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [
+        (0, Rights::READ),
+        (SHELL_TASK, Rights::WRITE),
+        (TERMINAL_TASK, Rights::WRITE),
+        (MONITOR_TASK, Rights::WRITE),
+        (SSHD_TASK, Rights::WRITE),
+    ] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::PROCESS_ENDPOINT,
+            4,
+            rights,
+            PROCESS_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [
+        (0, Rights::READ),
+        (SHELL_TASK, Rights::WRITE),
+        (TERMINAL_TASK, Rights::WRITE),
+        (MONITOR_TASK, Rights::WRITE),
+    ] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::TIME_ENDPOINT,
+            4,
+            rights,
+            TIME_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [(DEVMGR_TASK, Rights::READ), (0, Rights::WRITE)] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::DEVMGR_ENDPOINT,
+            5,
+            rights,
+            DEVMGR_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [(BLOCK_TASK, Rights::READ), (DEVMGR_TASK, Rights::WRITE)] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::BLOCK_CONFIG_ENDPOINT,
+            6,
+            rights,
+            BLOCK_CONFIG_ENDPOINT_NODE,
+        )?;
+    }
+    insert_endpoint_cap(
+        tables,
+        0,
+        microsystem_abi::boot_cap::NETWORK_ENDPOINT,
+        13,
+        Rights(Rights::WRITE.0 | Rights::GRANT.0),
+        30,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        NETD_TASK,
+        microsystem_abi::boot_cap::NETWORK_ENDPOINT,
+        13,
+        Rights::READ,
+        30,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        SSHD_TASK,
+        microsystem_abi::boot_cap::SSH_NETWORK_ENDPOINT,
+        14,
+        Rights::WRITE,
+        31,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        0,
+        microsystem_abi::boot_cap::SCRIPT_BROKER_ENDPOINT,
+        15,
+        Rights::READ,
+        32,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        NETD_TASK,
+        microsystem_abi::boot_cap::SSH_NETWORK_ENDPOINT,
+        14,
+        Rights::READ,
+        31,
+    )?;
+    for (handle, object, node, client) in [
+        (
+            microsystem_abi::boot_cap::GUI_TERMINAL_ENDPOINT,
+            7,
+            GUI_TERMINAL_ENDPOINT_NODE,
+            TERMINAL_TASK,
+        ),
+        (
+            microsystem_abi::boot_cap::GUI_FILES_ENDPOINT,
+            8,
+            GUI_FILES_ENDPOINT_NODE,
+            FILES_TASK,
+        ),
+        (
+            microsystem_abi::boot_cap::GUI_MONITOR_ENDPOINT,
+            9,
+            GUI_MONITOR_ENDPOINT_NODE,
+            MONITOR_TASK,
+        ),
+    ] {
+        insert_endpoint_cap(tables, WINDOWD_TASK, handle, object, Rights::READ, node)?;
+        insert_endpoint_cap(tables, client, handle, object, Rights::WRITE, node)?;
+    }
+    for (handle, object, node, client) in [
+        (
+            microsystem_abi::boot_cap::GUI_TERMINAL_EVENTS,
+            10,
+            GUI_TERMINAL_EVENTS_NODE,
+            TERMINAL_TASK,
+        ),
+        (
+            microsystem_abi::boot_cap::GUI_FILES_EVENTS,
+            11,
+            GUI_FILES_EVENTS_NODE,
+            FILES_TASK,
+        ),
+        (
+            microsystem_abi::boot_cap::GUI_MONITOR_EVENTS,
+            12,
+            GUI_MONITOR_EVENTS_NODE,
+            MONITOR_TASK,
+        ),
+    ] {
+        insert_endpoint_cap(tables, WINDOWD_TASK, handle, object, Rights::WRITE, node)?;
+        insert_endpoint_cap(tables, client, handle, object, Rights::READ, node)?;
+    }
+    insert_endpoint_cap(
+        tables,
+        0,
+        microsystem_abi::boot_cap::GUI_CONFIG_ENDPOINT,
+        16,
+        Rights(Rights::WRITE.0 | Rights::GRANT.0 | Rights::MANAGE.0),
+        GUI_CONFIG_ENDPOINT_NODE,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        0,
+        microsystem_abi::boot_cap::GUI_LAUNCH_ENDPOINT,
+        25,
+        Rights::READ,
+        GUI_LAUNCH_ENDPOINT_NODE,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        WINDOWD_TASK,
+        microsystem_abi::boot_cap::GUI_LAUNCH_ENDPOINT,
+        25,
+        Rights::WRITE,
+        GUI_LAUNCH_ENDPOINT_NODE,
+    )?;
+    insert_endpoint_cap(
+        tables,
+        WINDOWD_TASK,
+        microsystem_abi::boot_cap::GUI_CONFIG_ENDPOINT,
+        16,
+        Rights::READ,
+        GUI_CONFIG_ENDPOINT_NODE,
+    )?;
+    for index in 0..microsystem_abi::gui::MAX_DYNAMIC_CLIENTS {
+        let handle = microsystem_abi::boot_cap::gui_dynamic_endpoint(index);
+        let object = 17 + index as u32;
+        let node = GUI_DYNAMIC_ENDPOINT_NODE_BASE + index as u32;
+        insert_endpoint_cap(
+            tables,
+            0,
+            handle,
+            object,
+            Rights(Rights::WRITE.0 | Rights::GRANT.0 | Rights::MANAGE.0),
+            node,
+        )?;
+        insert_endpoint_cap(tables, WINDOWD_TASK, handle, object, Rights::READ, node)?;
+    }
+    crate::kprintln!("[ipc] filesystem payload frame isolated from block DMA=true");
+    Ok(())
+}
+
+fn insert_endpoint_cap(
+    tables: &mut [CapabilityTable; TASK_COUNT],
+    task: usize,
+    handle: CapHandle,
+    object: u32,
+    rights: Rights,
+    node: u32,
+) -> Result<(), Status> {
+    tables[task].insert_root_at(handle, object, ObjectType::Endpoint, rights, node)
+}
+
+fn allocate_derivation() -> u32 {
+    loop {
+        let node = NEXT_DERIVATION.fetch_add(1, Ordering::Relaxed);
+        if node != 0 {
+            return node;
+        }
+    }
+}
+
+fn stage_cap_transfer(
+    sender: usize,
+    receiver: usize,
+    message: Message,
+) -> Result<CapTransfer, Status> {
+    if sender >= TASK_COUNT || receiver >= TASK_COUNT || sender == receiver {
+        return Err(Status::Invalid);
+    }
+    let tables = unsafe { &mut *CAPS.0.get() };
+    let mut capabilities: [Option<Capability>; MESSAGE_CAPS] = [None; MESSAGE_CAPS];
+    let mut moved = [false; MESSAGE_CAPS];
+    let mut destinations = [CapHandle::INVALID; MESSAGE_CAPS];
+    let mut inserted = [false; MESSAGE_CAPS];
+    let mut required_slots = 0usize;
+
+    for index in 0..MESSAGE_CAPS {
+        let source = message.caps[index];
+        moved[index] = message.flags & message_cap_move(index) != 0;
+        if source == CapHandle::INVALID {
+            if moved[index] {
+                return Err(Status::Invalid);
+            }
+            continue;
+        }
+        if message.caps[..index].contains(&source) {
+            return Err(Status::Invalid);
+        }
+        let capability = tables[sender].capability(source, Rights::GRANT)?;
+        capabilities[index] = Some(capability);
+        if !moved[index]
+            && ((capability.node == SHARED_FRAME_NODE && capability.object == SHARED_FRAME_OBJECT)
+                || (capability.node == FILESYSTEM_FRAME_NODE
+                    && capability.object == FILESYSTEM_FRAME_OBJECT)
+                || (capability.node == SSH_FILESYSTEM_FRAME_NODE
+                    && capability.object == SSH_FILESYSTEM_FRAME_OBJECT)
+                || (capability.node == WINDOWD_FILESYSTEM_FRAME_NODE
+                    && capability.object == WINDOWD_FILESYSTEM_FRAME_OBJECT)
+                || (capability.node == TERMINAL_FILESYSTEM_FRAME_NODE
+                    && capability.object == TERMINAL_FILESYSTEM_FRAME_OBJECT))
+        {
+            if let Some(handle) = tables[receiver].handle_for_object_with_rights(
+                capability.object,
+                capability.object_type,
+                capability.rights,
+            ) {
+                destinations[index] = handle;
+                continue;
+            }
+        }
+        required_slots += 1;
+    }
+    for (index, capability) in capabilities.iter().enumerate() {
+        let Some(capability) = capability else {
+            continue;
+        };
+        if !moved[index]
+            || capability.object_type != ObjectType::Frame
+            || !task_runtime_frame_is_mapped(sender, capability.object)
+        {
+            continue;
+        }
+        let retains_mapping_authority = tables[sender].capabilities().any(|other| {
+            other.object == capability.object
+                && other.object_type == ObjectType::Frame
+                && other.rights.contains(Rights::MAP)
+                && !capabilities
+                    .iter()
+                    .enumerate()
+                    .any(|(moved_index, moved_cap)| {
+                        moved[moved_index]
+                            && moved_cap.is_some_and(|moved_cap| moved_cap.node == other.node)
+                    })
+        });
+        if !retains_mapping_authority {
+            return Err(Status::Busy);
+        }
+    }
+    if tables[receiver].free_slots() < required_slots {
+        return Err(Status::NoMemory);
+    }
+
+    for index in 0..MESSAGE_CAPS {
+        let Some(capability) = capabilities[index] else {
+            continue;
+        };
+        if destinations[index] != CapHandle::INVALID {
+            continue;
+        }
+        let destination = if moved[index] {
+            tables[receiver].import_move(capability)
+        } else {
+            tables[receiver].import_copy(capability, allocate_derivation())
+        };
+        match destination {
+            Ok(handle) => {
+                destinations[index] = handle;
+                inserted[index] = true;
+            }
+            Err(status) => {
+                for rollback in 0..index {
+                    if inserted[rollback] {
+                        let _ = tables[receiver].delete(destinations[rollback]);
+                    }
+                }
+                return Err(status);
+            }
+        }
+    }
+
+    let mut delivered = message;
+    delivered.flags &= !MESSAGE_CAP_MOVE_MASK;
+    delivered.caps = destinations;
+    Ok(CapTransfer {
+        message: delivered,
+        sender,
+        receiver,
+        sources: message.caps,
+        destinations,
+        inserted,
+        moved,
+    })
+}
+
+impl CapTransfer {
+    fn commit(self) {
+        let tables = unsafe { &mut *CAPS.0.get() };
+        for index in 0..MESSAGE_CAPS {
+            if self.moved[index] && self.sources[index] != CapHandle::INVALID {
+                let _ = tables[self.sender].delete(self.sources[index]);
+            }
+        }
+    }
+
+    fn rollback(self) {
+        let tables = unsafe { &mut *CAPS.0.get() };
+        for index in 0..MESSAGE_CAPS {
+            if self.inserted[index] {
+                let _ = tables[self.receiver].delete(self.destinations[index]);
+            }
+        }
+    }
+}
+
+fn revoke_global(task: usize, handle: CapHandle) -> Result<usize, Status> {
+    let tables = unsafe { &mut *CAPS.0.get() };
+    let root = tables[task].capability(handle, Rights::MANAGE)?;
+    let mut nodes = [0u32; TASK_COUNT * MAX_CAPABILITIES];
+    nodes[0] = root.node;
+    let mut count = 1usize;
+    loop {
+        let mut changed = false;
+        for table in tables.iter() {
+            changed |= table.collect_child_nodes(&mut nodes, &mut count);
+        }
+        if !changed {
+            break;
+        }
+    }
+    let descendants = &nodes[1..count];
+    let mut deleted = 0usize;
+    for (task, table) in tables.iter_mut().enumerate() {
+        let mut frames = [0u32; MAX_CAPABILITIES];
+        let mut frame_count = 0usize;
+        for capability in table.capabilities() {
+            if matches!(
+                capability.object_type,
+                ObjectType::Frame | ObjectType::FrameRegion
+            ) && descendants.contains(&capability.node)
+                && !frames[..frame_count].contains(&capability.object)
+            {
+                frames[frame_count] = capability.object;
+                frame_count += 1;
+            }
+        }
+        deleted += table.delete_nodes(descendants);
+        for object in frames[..frame_count].iter().copied() {
+            let object_type = if frame_region(object).is_some() {
+                ObjectType::FrameRegion
+            } else {
+                ObjectType::Frame
+            };
+            let retains_mapping_authority = table.capabilities().any(|capability| {
+                capability.object == object
+                    && capability.object_type == object_type
+                    && capability.rights.contains(Rights::MAP)
+            });
+            if !retains_mapping_authority {
+                if let Some(region) = frame_region(object) {
+                    for frame in &region.frames[..region.pages as usize] {
+                        clear_task_runtime_frame_mappings(task, *frame);
+                    }
+                } else {
+                    clear_task_runtime_frame_mappings(task, object);
+                }
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+fn reclaim_task_capabilities(task: usize) -> ResourceCleanup {
+    let mut frame_objects = [0u32; MAX_CAPABILITIES];
+    let mut frame_count = 0usize;
+    let mut pool_objects = [0u32; MAX_CAPABILITIES];
+    let mut pool_count = 0usize;
+    let mut notification_objects = [0u32; MAX_CAPABILITIES];
+    let mut notification_count = 0usize;
+    let tables = unsafe { &mut *CAPS.0.get() };
+    for capability in tables[task].capabilities() {
+        let (objects, count) = match capability.object_type {
+            ObjectType::Frame | ObjectType::FrameRegion => (&mut frame_objects, &mut frame_count),
+            ObjectType::MemoryPool => (&mut pool_objects, &mut pool_count),
+            ObjectType::Notification => (&mut notification_objects, &mut notification_count),
+            _ => continue,
+        };
+        if !objects[..*count].contains(&capability.object) {
+            objects[*count] = capability.object;
+            *count += 1;
+        }
+    }
+
+    let mut cleanup = ResourceCleanup {
+        mappings: clear_task_runtime_mappings(task),
+        ..ResourceCleanup::default()
+    };
+    tables[task] = CapabilityTable::new();
+
+    for object in frame_objects[..frame_count].iter().copied() {
+        let region = frame_region(object);
+        let object_type = if region.is_some() {
+            ObjectType::FrameRegion
+        } else {
+            ObjectType::Frame
+        };
+        let references = tables
+            .iter()
+            .map(|table| table.object_references(object, object_type))
+            .sum::<usize>();
+        if references == 0 {
+            let pool = region
+                .map(|region| region.pool)
+                .or_else(|| runtime_frame_pool_owner(object));
+            if let Some(region) = region {
+                for frame in &region.frames[..region.pages as usize] {
+                    cleanup.mappings = cleanup
+                        .mappings
+                        .saturating_add(clear_runtime_frame_mappings(*frame));
+                }
+                release_frame_region(object);
+                cleanup.frames = cleanup.frames.saturating_add(region.pages as u32);
+            } else {
+                cleanup.mappings = cleanup
+                    .mappings
+                    .saturating_add(clear_runtime_frame_mappings(object));
+                release_runtime_frame(object);
+                cleanup.frames = cleanup.frames.saturating_add(1);
+            }
+            if pool.is_some_and(|pool| unregister_unused_memory_pool(tables, pool)) {
+                cleanup.pools = cleanup.pools.saturating_add(1);
+            }
+        }
+    }
+    for object in pool_objects[..pool_count].iter().copied() {
+        if unregister_unused_memory_pool(tables, object) {
+            cleanup.pools = cleanup.pools.saturating_add(1);
+        }
+    }
+    for object in notification_objects[..notification_count].iter().copied() {
+        if tables
+            .iter()
+            .all(|table| table.object_references(object, ObjectType::Notification) == 0)
+        {
+            unregister_notification(object);
+        }
+    }
+    cleanup
+}
+
+fn task_live_resources(task: usize) -> (u32, u32, u32) {
+    let tables = unsafe { &*CAPS.0.get() };
+    let mut frame_objects = [0u32; MAX_CAPABILITIES];
+    let mut frame_count = 0usize;
+    let mut pool_objects = [0u32; MAX_CAPABILITIES];
+    let mut pool_count = 0usize;
+    for capability in tables[task].capabilities() {
+        let (objects, count) = match capability.object_type {
+            ObjectType::Frame | ObjectType::FrameRegion => (&mut frame_objects, &mut frame_count),
+            ObjectType::MemoryPool => (&mut pool_objects, &mut pool_count),
+            _ => continue,
+        };
+        if !objects[..*count].contains(&capability.object) {
+            objects[*count] = capability.object;
+            *count += 1;
+        }
+    }
+    (
+        frame_count as u32,
+        pool_count as u32,
+        task_runtime_mapping_count(task),
+    )
+}
+
+fn delete_capability(task: usize, handle: CapHandle) -> Result<(), Status> {
+    let tables = unsafe { &mut *CAPS.0.get() };
+    let capability = tables[task].capability(handle, Rights(0))?;
+    let references = tables
+        .iter()
+        .map(|table| table.object_references(capability.object, capability.object_type))
+        .sum::<usize>();
+    let last_reference = references == 1;
+    if capability.object_type == ObjectType::Frame
+        && last_reference
+        && (runtime_frame_is_mapped(capability.object)
+            || runtime_frame_is_dma_mapped(capability.object))
+    {
+        return Err(Status::Busy);
+    }
+    if capability.object_type == ObjectType::MemoryPool
+        && last_reference
+        && allocated_pool_frames(capability.object) != 0
+    {
+        return Err(Status::Busy);
+    }
+    if capability.object_type == ObjectType::FrameRegion
+        && last_reference
+        && frame_region_is_mapped(capability.object)
+    {
+        return Err(Status::Busy);
+    }
+    let frame_pool = (capability.object_type == ObjectType::Frame && last_reference)
+        .then(|| runtime_frame_pool_owner(capability.object))
+        .flatten();
+    tables[task].delete(handle)?;
+    if last_reference {
+        match capability.object_type {
+            ObjectType::Frame => {
+                release_runtime_frame(capability.object);
+                if let Some(pool) = frame_pool {
+                    // A task teardown may remove the last pool cap while a shared Frame
+                    // keeps the pool alive. The last Frame release closes that registry slot.
+                    unregister_unused_memory_pool(tables, pool);
+                }
+            }
+            ObjectType::FrameRegion => release_frame_region(capability.object),
+            ObjectType::MemoryPool => unregister_memory_pool(capability.object),
+            ObjectType::Notification => unregister_notification(capability.object),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn object_type(value: u64) -> Result<ObjectType, Status> {
+    match value {
+        1 => Ok(ObjectType::Task),
+        2 => Ok(ObjectType::Thread),
+        3 => Ok(ObjectType::Frame),
+        4 => Ok(ObjectType::Endpoint),
+        5 => Ok(ObjectType::Notification),
+        6 => Ok(ObjectType::Irq),
+        7 => Ok(ObjectType::MmioRegion),
+        8 => Ok(ObjectType::MemoryPool),
+        9 => Ok(ObjectType::DmaDomain),
+        10 => Ok(ObjectType::SystemControl),
+        11 => Ok(ObjectType::FrameRegion),
+        12 => Ok(ObjectType::SystemInfo),
+        _ => Err(Status::Invalid),
+    }
+}
+
+fn application_slot(pid: u64) -> Result<(usize, usize), Status> {
+    let task = pid.checked_sub(1).ok_or(Status::NotFound)? as usize;
+    let index = task
+        .checked_sub(APPLICATION_START)
+        .filter(|index| *index < APPLICATION_COUNT)
+        .ok_or(Status::NotFound)?;
+    Ok((task, index))
+}
+
+fn create_object(
+    task: usize,
+    raw_type: u64,
+    rights: Rights,
+    argument: u64,
+    extra: u64,
+) -> Result<CapHandle, Status> {
+    let object_type = object_type(raw_type)?;
+    let tables = unsafe { &mut *CAPS.0.get() };
+    if object_type == ObjectType::Frame {
+        let authority = u32::try_from(argument)
+            .map(CapHandle)
+            .map_err(|_| Status::BadCapability)?;
+        let pool = tables[task].capability(authority, Rights::MANAGE)?;
+        if pool.object_type != ObjectType::MemoryPool || memory_pool_quota(pool.object).is_none() {
+            return Err(Status::BadCapability);
+        }
+        let allowed = Rights(
+            Rights::READ.0
+                | Rights::WRITE.0
+                | Rights::EXECUTE.0
+                | Rights::MAP.0
+                | Rights::GRANT.0
+                | Rights::MANAGE.0,
+        );
+        if !rights.contains(Rights::MAP) || rights.0 & !allowed.0 != 0 {
+            return Err(Status::Invalid);
+        }
+        let object = allocate_runtime_frame(pool.object)?;
+        return match tables[task].insert_root_with_node(
+            object,
+            ObjectType::Frame,
+            rights,
+            allocate_derivation(),
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(status) => {
+                release_runtime_frame(object);
+                Err(status)
+            }
+        };
+    }
+    if object_type == ObjectType::FrameRegion {
+        let authority = u32::try_from(argument)
+            .map(CapHandle)
+            .map_err(|_| Status::BadCapability)?;
+        let pool = tables[task].capability(authority, Rights::MANAGE)?;
+        let pages = usize::try_from(extra).map_err(|_| Status::Invalid)?;
+        if pool.object_type != ObjectType::MemoryPool
+            || memory_pool_quota(pool.object).is_none()
+            || pages == 0
+            || pages > FRAME_REGION_MAX_PAGES
+        {
+            return Err(Status::Invalid);
+        }
+        let allowed = Rights(
+            Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0 | Rights::MANAGE.0,
+        );
+        if !rights.contains(Rights::MAP) || rights.0 & !allowed.0 != 0 {
+            return Err(Status::Invalid);
+        }
+        let object = NEXT_OBJECT.fetch_add(1, Ordering::Relaxed);
+        allocate_frame_region(object, pool.object, pages)?;
+        return match tables[task].insert_root_with_node(
+            object,
+            ObjectType::FrameRegion,
+            rights,
+            allocate_derivation(),
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(status) => {
+                release_frame_region(object);
+                Err(status)
+            }
+        };
+    }
+    if object_type == ObjectType::MemoryPool {
+        let allowed = Rights(Rights::MANAGE.0 | Rights::GRANT.0);
+        let quota = usize::try_from(argument).map_err(|_| Status::Invalid)?;
+        if !rights.contains(Rights::MANAGE) || rights.0 & !allowed.0 != 0 {
+            return Err(Status::Invalid);
+        }
+        let object = NEXT_OBJECT.fetch_add(1, Ordering::Relaxed);
+        register_memory_pool(object, quota)?;
+        return match tables[task].insert_root_with_node(
+            object,
+            object_type,
+            rights,
+            allocate_derivation(),
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(status) => {
+                unregister_memory_pool(object);
+                Err(status)
+            }
+        };
+    }
+    if object_type == ObjectType::Notification {
+        let allowed = Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::GRANT.0 | Rights::MANAGE.0);
+        if argument != 0
+            || rights.0 & !allowed.0 != 0
+            || !rights.contains(Rights::READ) && !rights.contains(Rights::WRITE)
+        {
+            return Err(Status::Invalid);
+        }
+        let object = NEXT_OBJECT.fetch_add(1, Ordering::Relaxed);
+        register_notification(object)?;
+        return match tables[task].insert_root_with_node(
+            object,
+            object_type,
+            rights,
+            allocate_derivation(),
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(status) => {
+                unregister_notification(object);
+                Err(status)
+            }
+        };
+    }
+    let object = NEXT_OBJECT.fetch_add(1, Ordering::Relaxed);
+    tables[task].insert_root_with_node(object, object_type, rights, allocate_derivation())
+}
+
+fn fixed_memory_pool_bit(object: u32) -> Option<u32> {
+    match object {
+        ROOT_MEMORY_POOL_OBJECT => Some(1),
+        DRIVER_MEMORY_POOL_OBJECT => Some(2),
+        GUI_MEMORY_POOL_OBJECT => Some(4),
+        SCRIPT_MEMORY_POOL_OBJECT => Some(8),
+        NETWORK_MEMORY_POOL_OBJECT => Some(16),
+        _ => None,
+    }
+}
+
+fn reset_memory_pools() -> Result<(), Status> {
+    for (object, quota) in MEMORY_POOL_OBJECTS.iter().zip(&MEMORY_POOL_QUOTAS) {
+        object.store(0, Ordering::Release);
+        quota.store(0, Ordering::Release);
+    }
+    register_memory_pool(ROOT_MEMORY_POOL_OBJECT, MEMORY_POOL_QUOTA)?;
+    register_memory_pool(DRIVER_MEMORY_POOL_OBJECT, MEMORY_POOL_QUOTA)?;
+    register_memory_pool(GUI_MEMORY_POOL_OBJECT, GUI_MEMORY_POOL_QUOTA)?;
+    register_memory_pool(SCRIPT_MEMORY_POOL_OBJECT, SCRIPT_MEMORY_POOL_QUOTA)?;
+    register_memory_pool(NETWORK_MEMORY_POOL_OBJECT, NETWORK_MEMORY_POOL_QUOTA)
+}
+
+fn register_memory_pool(object: u32, quota: usize) -> Result<(), Status> {
+    if object == 0 || quota == 0 || quota > MAX_MEMORY_POOL_QUOTA {
+        return Err(Status::Invalid);
+    }
+    if memory_pool_quota(object).is_some() {
+        return Err(Status::Busy);
+    }
+    let reserved = MEMORY_POOL_QUOTAS
+        .iter()
+        .map(|quota| quota.load(Ordering::Acquire) as usize)
+        .sum::<usize>();
+    if reserved
+        .checked_add(quota)
+        .is_none_or(|sum| sum > RUNTIME_FRAME_COUNT)
+    {
+        return Err(Status::NoMemory);
+    }
+    let Some(slot) = MEMORY_POOL_OBJECTS
+        .iter()
+        .position(|registered| registered.load(Ordering::Acquire) == 0)
+    else {
+        return Err(Status::NoMemory);
+    };
+    MEMORY_POOL_QUOTAS[slot].store(quota as u32, Ordering::Release);
+    MEMORY_POOL_OBJECTS[slot].store(object, Ordering::Release);
+    Ok(())
+}
+
+fn unregister_memory_pool(object: u32) {
+    if fixed_memory_pool_bit(object).is_some() {
+        return;
+    }
+    if let Some(slot) = MEMORY_POOL_OBJECTS
+        .iter()
+        .position(|registered| registered.load(Ordering::Acquire) == object)
+    {
+        MEMORY_POOL_OBJECTS[slot].store(0, Ordering::Release);
+        MEMORY_POOL_QUOTAS[slot].store(0, Ordering::Release);
+    }
+}
+
+fn memory_pool_quota(object: u32) -> Option<usize> {
+    MEMORY_POOL_OBJECTS
+        .iter()
+        .position(|registered| registered.load(Ordering::Acquire) == object)
+        .map(|slot| MEMORY_POOL_QUOTAS[slot].load(Ordering::Acquire) as usize)
+        .filter(|quota| *quota != 0)
+}
+
+fn allocated_pool_frames(object: u32) -> usize {
+    RUNTIME_FRAME_POOL
+        .iter()
+        .filter(|owner| owner.load(Ordering::Acquire) == object)
+        .count()
+}
+
+fn unregister_unused_memory_pool(tables: &[CapabilityTable; TASK_COUNT], object: u32) -> bool {
+    if fixed_memory_pool_bit(object).is_some()
+        || memory_pool_quota(object).is_none()
+        || allocated_pool_frames(object) != 0
+        || tables
+            .iter()
+            .any(|table| table.object_references(object, ObjectType::MemoryPool) != 0)
+    {
+        return false;
+    }
+    unregister_memory_pool(object);
+    true
+}
+
+fn reset_notifications() {
+    for (object, bits) in NOTIFICATION_OBJECTS.iter().zip(&NOTIFICATION_BITS) {
+        object.store(0, Ordering::Release);
+        bits.store(0, Ordering::Release);
+    }
+}
+
+fn register_notification(object: u32) -> Result<(), Status> {
+    if object == 0 || object == DEVICE_NOTIFICATION_OBJECT {
+        return Err(Status::Invalid);
+    }
+    if notification_slot(object).is_some() {
+        return Err(Status::Busy);
+    }
+    let Some(slot) = NOTIFICATION_OBJECTS
+        .iter()
+        .position(|registered| registered.load(Ordering::Acquire) == 0)
+    else {
+        return Err(Status::NoMemory);
+    };
+    NOTIFICATION_BITS[slot].store(0, Ordering::Release);
+    NOTIFICATION_OBJECTS[slot].store(object, Ordering::Release);
+    Ok(())
+}
+
+fn unregister_notification(object: u32) {
+    if let Some(slot) = notification_slot(object) {
+        NOTIFICATION_OBJECTS[slot].store(0, Ordering::Release);
+        NOTIFICATION_BITS[slot].store(0, Ordering::Release);
+    }
+}
+
+fn notification_slot(object: u32) -> Option<usize> {
+    NOTIFICATION_OBJECTS
+        .iter()
+        .position(|registered| registered.load(Ordering::Acquire) == object)
+}
+
+fn signal_notification(object: u32, bits: u64) -> Option<bool> {
+    let slot = notification_slot(object)?;
+    NOTIFICATION_BITS[slot].fetch_or(bits, Ordering::AcqRel);
+    let woke = wake_notification_object(object);
+    if woke {
+        aarch64::send_reschedule(0);
+        aarch64::send_reschedule(1);
+        aarch64::send_event();
+    }
+    Some(woke)
+}
+
+fn take_notification_bits(object: u32) -> Option<u64> {
+    if object == DEVICE_NOTIFICATION_OBJECT {
+        return Some(DEVICE_NOTIFICATION.swap(0, Ordering::AcqRel));
+    }
+    notification_slot(object).map(|slot| NOTIFICATION_BITS[slot].swap(0, Ordering::AcqRel))
+}
+
+fn allocate_runtime_frame(pool_object: u32) -> Result<u32, Status> {
+    let quota = memory_pool_quota(pool_object).ok_or(Status::BadCapability)?;
+    let allocated = allocated_pool_frames(pool_object);
+    if allocated >= quota {
+        return Err(Status::NoMemory);
+    }
+    for index in 0..RUNTIME_FRAME_COUNT {
+        if RUNTIME_FRAME_PHYSICAL[index]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        match physical_memory::allocate_zeroed() {
+            Ok(physical) => {
+                RUNTIME_FRAME_POOL[index].store(pool_object, Ordering::Release);
+                RUNTIME_FRAME_PHYSICAL[index].store(physical, Ordering::Release);
+                if !DTB_FRAME_REPORTED.swap(true, Ordering::AcqRel) {
+                    crate::kprintln!("[mm] MemoryPool DTB frame allocator active quota=4");
+                }
+                if let Some(pool_bit) = fixed_memory_pool_bit(pool_object) {
+                    let seen = MEMORY_POOLS_SEEN.fetch_or(pool_bit, Ordering::AcqRel) | pool_bit;
+                    if seen == 3 && !MEMORY_POOLS_REPORTED.swap(true, Ordering::AcqRel) {
+                        crate::kprintln!(
+                            "[mm] MemoryPool independent pools=2 quotas=[4,4] root=true driver=true"
+                        );
+                    }
+                }
+                return Ok(RUNTIME_FRAME_OBJECT_BASE + index as u32);
+            }
+            Err(status) => {
+                RUNTIME_FRAME_POOL[index].store(0, Ordering::Release);
+                RUNTIME_FRAME_PHYSICAL[index].store(0, Ordering::Release);
+                return Err(status);
+            }
+        }
+    }
+    Err(Status::NoMemory)
+}
+
+fn release_runtime_frame(object: u32) {
+    let Some(index) = object
+        .checked_sub(RUNTIME_FRAME_OBJECT_BASE)
+        .map(|index| index as usize)
+        .filter(|index| *index < RUNTIME_FRAME_COUNT)
+    else {
+        return;
+    };
+    let physical = RUNTIME_FRAME_PHYSICAL[index].swap(0, Ordering::AcqRel);
+    RUNTIME_FRAME_POOL[index].store(0, Ordering::Release);
+    if physical != 0 && physical != u64::MAX {
+        let _ = physical_memory::release(physical);
+    }
+}
+
+fn allocate_frame_region(object: u32, pool: u32, pages: usize) -> Result<(), Status> {
+    let regions = unsafe { &mut *FRAME_REGIONS.0.get() };
+    let Some(slot) = regions.iter_mut().find(|region| region.object == 0) else {
+        return Err(Status::NoMemory);
+    };
+    let mut allocated = 0usize;
+    while allocated < pages {
+        match allocate_runtime_frame(pool) {
+            Ok(frame) => {
+                slot.frames[allocated] = frame;
+                allocated += 1;
+            }
+            Err(status) => {
+                for frame in &mut slot.frames[..allocated] {
+                    release_runtime_frame(*frame);
+                    *frame = 0;
+                }
+                return Err(status);
+            }
+        }
+    }
+    slot.object = object;
+    slot.pool = pool;
+    slot.pages = pages as u16;
+    Ok(())
+}
+
+fn frame_region(object: u32) -> Option<FrameRegion> {
+    unsafe { &*FRAME_REGIONS.0.get() }
+        .iter()
+        .find(|region| region.object == object)
+        .copied()
+}
+
+fn release_frame_region(object: u32) {
+    let regions = unsafe { &mut *FRAME_REGIONS.0.get() };
+    let Some(region) = regions.iter_mut().find(|region| region.object == object) else {
+        return;
+    };
+    for frame in &region.frames[..region.pages as usize] {
+        release_runtime_frame(*frame);
+    }
+    *region = FrameRegion::EMPTY;
+}
+
+fn frame_region_is_mapped(object: u32) -> bool {
+    let Some(region) = frame_region(object) else {
+        return false;
+    };
+    region.frames[..region.pages as usize]
+        .iter()
+        .any(|frame| runtime_frame_is_mapped(*frame) || runtime_frame_is_dma_mapped(*frame))
+}
+
+fn runtime_frame_pool_owner(object: u32) -> Option<u32> {
+    let index = object.checked_sub(RUNTIME_FRAME_OBJECT_BASE)? as usize;
+    if index >= RUNTIME_FRAME_COUNT {
+        return None;
+    }
+    match RUNTIME_FRAME_POOL[index].load(Ordering::Acquire) {
+        0 => None,
+        pool => Some(pool),
+    }
+}
+
+fn runtime_frame_physical(object: u32) -> Option<u64> {
+    let index = object.checked_sub(RUNTIME_FRAME_OBJECT_BASE)? as usize;
+    if index >= RUNTIME_FRAME_COUNT {
+        return None;
+    }
+    match RUNTIME_FRAME_PHYSICAL[index].load(Ordering::Acquire) {
+        0 | u64::MAX => None,
+        physical => Some(physical),
+    }
+}
+
+fn reset_runtime_frames() {
+    for (physical, pool) in RUNTIME_FRAME_PHYSICAL.iter().zip(&RUNTIME_FRAME_POOL) {
+        let address = physical.swap(0, Ordering::AcqRel);
+        pool.store(0, Ordering::Release);
+        if address != 0 && address != u64::MAX {
+            let _ = physical_memory::release(address);
+        }
+    }
+}
+
+fn reset_filesystem_frame() {
+    let address = FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        let _ = physical_memory::release(address);
+    }
+    let address = SSH_FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        let _ = physical_memory::release(address);
+    }
+    let address = WINDOWD_FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        let _ = physical_memory::release(address);
+    }
+    let address = TERMINAL_FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        let _ = physical_memory::release(address);
+    }
+}
+
+fn runtime_frame_is_mapped(object: u32) -> bool {
+    let Some(frame_physical) = runtime_frame_physical(object) else {
+        return false;
+    };
+    unsafe { &*MEMORY.0.get() }.iter().any(|pointer| {
+        unsafe { pointer.as_ref() }.is_some_and(|memory| {
+            memory
+                .level3
+                .iter()
+                .chain(memory.level3_high.iter())
+                .chain(memory.large_heap_level3.iter().flatten())
+                .any(|descriptor| {
+                    descriptor & 0b11 != 0 && descriptor & 0x0000_ffff_ffff_f000 == frame_physical
+                })
+        })
+    })
+}
+
+fn task_runtime_frame_is_mapped(task: usize, object: u32) -> bool {
+    let Some(frame_physical) = runtime_frame_physical(object) else {
+        return false;
+    };
+    let Some(memory) = task_memory(task) else {
+        return false;
+    };
+    memory
+        .level3
+        .iter()
+        .chain(memory.level3_high.iter())
+        .chain(memory.large_heap_level3.iter().flatten())
+        .any(|descriptor| {
+            descriptor & 0b11 != 0 && descriptor & 0x0000_ffff_ffff_f000 == frame_physical
+        })
+}
+
+fn runtime_frame_is_dma_mapped(object: u32) -> bool {
+    DMA_FRAME_OBJECTS
+        .iter()
+        .any(|mapped| mapped.load(Ordering::Acquire) == object)
+}
+
+fn clear_task_runtime_mappings(task: usize) -> u32 {
+    let Some(memory) = task_memory_mut(task) else {
+        return 0;
+    };
+    let first = ((DYNAMIC_MAP_START >> 12) & 0x1ff) as usize;
+    let last = (((DYNAMIC_MAP_END - 1) >> 12) & 0x1ff) as usize;
+    let mut cleared = 0u32;
+    for descriptor in &mut memory.level3[first..=last] {
+        if *descriptor & 0b11 != 0 {
+            *descriptor = 0;
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    if cleared != 0 {
+        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+    }
+    cleared
+}
+
+fn task_runtime_mapping_count(task: usize) -> u32 {
+    let Some(memory) = task_memory(task) else {
+        return 0;
+    };
+    let first = ((DYNAMIC_MAP_START >> 12) & 0x1ff) as usize;
+    let last = (((DYNAMIC_MAP_END - 1) >> 12) & 0x1ff) as usize;
+    memory.level3[first..=last]
+        .iter()
+        .filter(|descriptor| **descriptor & 0b11 != 0)
+        .count() as u32
+}
+
+fn clear_runtime_frame_mappings(object: u32) -> u32 {
+    (0..TASK_COUNT)
+        .map(|task| clear_task_runtime_frame_mappings(task, object))
+        .sum()
+}
+
+fn clear_task_runtime_frame_mappings(task: usize, object: u32) -> u32 {
+    let Some(physical) = runtime_frame_physical(object) else {
+        return 0;
+    };
+    let mut cleared = 0u32;
+    let Some(memory) = task_memory_mut(task) else {
+        return 0;
+    };
+    for descriptor in memory
+        .level3
+        .iter_mut()
+        .chain(memory.level3_high.iter_mut())
+        .chain(memory.large_heap_level3.iter_mut().flatten())
+    {
+        if *descriptor & 0b11 != 0 && *descriptor & 0x0000_ffff_ffff_f000 == physical {
+            *descriptor = 0;
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    if cleared != 0 {
+        // Revoke commits cap deletion and mapping removal under the scheduler lock.
+        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+    }
+    cleared
+}
+
+fn next_runnable(state: &State, after: usize, cpu: usize) -> Option<usize> {
+    (1..=TASK_COUNT)
+        .map(|offset| (after + offset) % TASK_COUNT)
+        .find(|task| !is_idle_task(*task) && matches!(state.threads[*task], ThreadState::Runnable))
+        .or_else(|| {
+            let idle = idle_task(cpu);
+            matches!(state.threads[idle], ThreadState::Runnable).then_some(idle)
+        })
+}
+
+fn next_other_runnable(state: &State, after: usize, cpu: usize) -> Option<usize> {
+    (1..TASK_COUNT)
+        .map(|offset| (after + offset) % TASK_COUNT)
+        .find(|task| !is_idle_task(*task) && matches!(state.threads[*task], ThreadState::Runnable))
+        .or_else(|| {
+            let idle = idle_task(cpu);
+            (after != idle && matches!(state.threads[idle], ThreadState::Runnable)).then_some(idle)
+        })
+}
+
+fn record_switch(cpu: usize) {
+    SWITCHES.fetch_add(1, Ordering::Relaxed);
+    CPU_SWITCHES[cpu].fetch_add(1, Ordering::Relaxed);
+    let counts = [
+        CPU_SWITCHES[0].load(Ordering::Relaxed),
+        CPU_SWITCHES[1].load(Ordering::Relaxed),
+    ];
+    let non_idle = [
+        CPU_NON_IDLE_RUNS[0].load(Ordering::Relaxed),
+        CPU_NON_IDLE_RUNS[1].load(Ordering::Relaxed),
+    ];
+    if counts[0] >= 20
+        && counts[1] >= 20
+        && non_idle[0] != 0
+        && non_idle[1] != 0
+        && SMP_REPORTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        crate::kprintln!(
+            "[sched] resident shared-ready-queue cpus=2 ticket-lock=true idle-tasks=2 switches=[{},{}] non-idle=[{},{}]",
+            counts[0],
+            counts[1],
+            non_idle[0],
+            non_idle[1]
+        );
+    }
+}
+
+fn expire_deadlines() {
+    let now = aarch64::clock_nanos();
+    let state = unsafe { &mut *STATE.0.get() };
+    for task in 0..TASK_COUNT {
+        let deadline = match state.threads[task] {
+            ThreadState::Runnable
+            | ThreadState::Running { .. }
+            | ThreadState::Exited
+            | ThreadState::Terminating { .. } => 0,
+            ThreadState::Sending { deadline, .. }
+            | ThreadState::Receiving { deadline, .. }
+            | ThreadState::WaitingReply { deadline, .. }
+            | ThreadState::WaitingNotification { deadline, .. } => deadline,
+        };
+        if deadline == 0 || deadline > now {
+            continue;
+        }
+        match state.threads[task] {
+            ThreadState::Sending { endpoint, .. } => {
+                if let Some(index) = endpoint.checked_sub(1) {
+                    if state.endpoints[index].pending == Some(task) {
+                        state.endpoints[index].pending = None;
+                    }
+                }
+            }
+            ThreadState::WaitingReply { server, .. } => {
+                if state.reply_to[server] == Some(task) {
+                    state.reply_to[server] = None;
+                }
+            }
+            ThreadState::WaitingNotification { .. } => {}
+            _ => {}
+        }
+        state.threads[task] = ThreadState::Runnable;
+        state.contexts[task].registers[0] = Status::TimedOut as i64 as u64;
+    }
+}
+
+fn wake_notifications() {
+    wake_notification_object(DEVICE_NOTIFICATION_OBJECT);
+    for object in &NOTIFICATION_OBJECTS {
+        let object = object.load(Ordering::Acquire);
+        if object != 0 {
+            wake_notification_object(object);
+        }
+    }
+}
+
+fn wake_notification_object(object: u32) -> bool {
+    let state = unsafe { &mut *STATE.0.get() };
+    let Some(task) = state.threads.iter().position(
+        |thread| matches!(thread, ThreadState::WaitingNotification { object: waiting, .. } if *waiting == object),
+    ) else {
+        return false;
+    };
+    let Some(bits) = take_notification_bits(object) else {
+        return false;
+    };
+    if bits == 0 {
+        return false;
+    }
+    state.threads[task] = ThreadState::Runnable;
+    state.contexts[task].registers[0] = bits;
+    true
+}
+
+fn deadline_elapsed(deadline: u64) -> bool {
+    deadline != 0 && deadline <= aarch64::clock_nanos()
+}
+
+fn fail(frame: &mut ExceptionFrame, status: Status) -> u64 {
+    frame.registers[0] = status as i64 as u64;
+    0
+}
+
+fn read_message(task: usize, pointer: u64) -> Option<Message> {
+    if !validate_user_range(task, pointer, core::mem::size_of::<Message>() as u64, false) {
+        return None;
+    }
+    let mut message = Message::new(0, 0);
+    copy_from_user(
+        task,
+        pointer,
+        (&mut message as *mut Message).cast::<u8>(),
+        core::mem::size_of::<Message>(),
+    )?;
+    Some(message)
+}
+
+fn write_message(task: usize, pointer: u64, message: &Message) -> bool {
+    if !validate_user_range(task, pointer, core::mem::size_of::<Message>() as u64, true) {
+        return false;
+    }
+    copy_to_user(
+        task,
+        pointer,
+        (message as *const Message).cast::<u8>(),
+        core::mem::size_of::<Message>(),
+    )
+    .is_some()
+}
+
+fn validate_user_range(task: usize, pointer: u64, bytes: u64, write: bool) -> bool {
+    if task >= TASK_COUNT || bytes > 4096 {
+        return false;
+    }
+    let Some(end) = pointer.checked_add(bytes) else {
+        return false;
+    };
+    let low_range = pointer >= USER_MIN && end <= STACK_TOP;
+    let large_heap_range =
+        uses_large_window(task) && pointer >= LARGE_HEAP_START && end <= LARGE_HEAP_END;
+    if !low_range && !large_heap_range {
+        return false;
+    }
+    if bytes == 0 {
+        return true;
+    }
+    let Some(memory) = task_memory(task) else {
+        return false;
+    };
+    let mut page = pointer & !0xfff;
+    let last = (end - 1) & !0xfff;
+    loop {
+        let Some(descriptor) = user_descriptor(memory, page) else {
+            return false;
+        };
+        if descriptor & 0b11 != 0b11
+            || descriptor & (1 << 6) == 0
+            || write && descriptor & (1 << 7) != 0
+        {
+            return false;
+        }
+        if page == last {
+            break;
+        }
+        page += 4096;
+    }
+    true
+}
+
+fn copy_from_user(task: usize, pointer: u64, destination: *mut u8, bytes: usize) -> Option<()> {
+    for offset in 0..bytes {
+        let source = translated_user_address(task, pointer + offset as u64, false)?;
+        unsafe {
+            destination
+                .add(offset)
+                .write(core::ptr::read_volatile(source as *const u8));
+        }
+    }
+    Some(())
+}
+
+fn copy_to_user(task: usize, pointer: u64, source: *const u8, bytes: usize) -> Option<()> {
+    for offset in 0..bytes {
+        let destination = translated_user_address(task, pointer + offset as u64, true)?;
+        unsafe {
+            core::ptr::write_volatile(destination as *mut u8, source.add(offset).read());
+        }
+    }
+    Some(())
+}
+
+fn translated_user_address(task: usize, pointer: u64, write: bool) -> Option<usize> {
+    if !validate_user_range(task, pointer, 1, write) {
+        return None;
+    }
+    let descriptor = user_descriptor(task_memory(task)?, pointer)?;
+    let physical = descriptor & 0x0000_ffff_ffff_f000;
+    Some(KERNEL_OFFSET + physical as usize + (pointer as usize & 0xfff))
+}
+
+fn user_descriptor(memory: &TaskMemory, virtual_address: u64) -> Option<u64> {
+    if (USER_MIN..0x0060_0000).contains(&virtual_address) {
+        let index = ((virtual_address >> 12) & 0x1ff) as usize;
+        return Some(memory.level3[index]);
+    }
+    if (0x0060_0000..STACK_TOP).contains(&virtual_address) {
+        let index = ((virtual_address >> 12) & 0x1ff) as usize;
+        return Some(memory.level3_high[index]);
+    }
+    if (LARGE_HEAP_START..LARGE_HEAP_END).contains(&virtual_address) {
+        let offset = (virtual_address - LARGE_HEAP_START) as usize;
+        let table = offset / 0x20_0000;
+        let index = (offset >> 12) & 0x1ff;
+        return Some(memory.large_heap_level3[table][index]);
+    }
+    None
+}
+
+fn user_descriptor_mut(memory: &mut TaskMemory, virtual_address: u64) -> Option<&mut u64> {
+    if (USER_MIN..0x0060_0000).contains(&virtual_address) {
+        let index = ((virtual_address >> 12) & 0x1ff) as usize;
+        return Some(&mut memory.level3[index]);
+    }
+    if (0x0060_0000..STACK_TOP).contains(&virtual_address) {
+        let index = ((virtual_address >> 12) & 0x1ff) as usize;
+        return Some(&mut memory.level3_high[index]);
+    }
+    if (LARGE_HEAP_START..LARGE_HEAP_END).contains(&virtual_address) {
+        let offset = (virtual_address - LARGE_HEAP_START) as usize;
+        let table = offset / 0x20_0000;
+        let index = (offset >> 12) & 0x1ff;
+        return Some(&mut memory.large_heap_level3[table][index]);
+    }
+    None
+}
+
+fn uses_large_window(task: usize) -> bool {
+    matches!(task, MFS_TASK | WINDOWD_TASK)
+}
+
+fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
+    let image = ElfImage::parse(bytes).map_err(|_| ())?;
+    let memories = unsafe { &mut *MEMORY.0.get() };
+    let slot = memories.get_mut(task).ok_or(())?;
+    if slot.is_null() {
+        *slot = kernel_heap::allocate_zeroed(core::alloc::Layout::new::<TaskMemory>())
+            .map_err(|_| ())?
+            .cast::<TaskMemory>();
+        if !KERNEL_HEAP_REPORTED.swap(true, Ordering::AcqRel) {
+            crate::kprintln!(
+                "[mm] TaskMemory/page tables allocated from kernel heap slot-bytes={:#x} allocated={:#x}",
+                mem::size_of::<TaskMemory>(),
+                kernel_heap::allocated_bytes()
+            );
+        }
+    }
+    let memory = unsafe { slot.as_mut() }.ok_or(())?;
+    memory.level1.fill(0);
+    memory.level2.fill(0);
+    memory.level3.fill(0);
+    memory.level3_high.fill(0);
+    for table in &mut memory.large_heap_level3 {
+        table.fill(0);
+    }
+    memory.image.fill(0);
+    memory.stack.fill(0);
+    memory.heap.fill(0);
+    if task == MFS_TASK {
+        if memory.large_heap.is_null() {
+            let layout =
+                core::alloc::Layout::from_size_align(LARGE_HEAP_BYTES, 4096).map_err(|_| ())?;
+            memory.large_heap = kernel_heap::allocate_zeroed(layout).map_err(|_| ())?;
+        } else {
+            unsafe { ptr::write_bytes(memory.large_heap, 0, LARGE_HEAP_BYTES) };
+        }
+    }
+
+    let level1_physical = physical(memory.level1.as_ptr() as usize);
+    let level2_physical = physical(memory.level2.as_ptr() as usize);
+    let level3_physical = physical(memory.level3.as_ptr() as usize);
+    let level3_high_physical = physical(memory.level3_high.as_ptr() as usize);
+    let image_physical = physical(memory.image.as_ptr() as usize);
+    let stack_physical = physical(memory.stack.as_ptr() as usize);
+    let heap_physical = physical(memory.heap.as_ptr() as usize);
+    memory.level1[0] = level2_physical | 3;
+    memory.level2[2] = level3_physical | 3;
+    memory.level2[3] = level3_high_physical | 3;
+    if uses_large_window(task) {
+        for (table, entries) in memory.large_heap_level3.iter().enumerate() {
+            let level2 = (LARGE_HEAP_START as usize >> 21) + table;
+            memory.level2[level2] = physical(entries.as_ptr() as usize) | 3;
+        }
+    }
+
+    for segment in image.segments() {
+        let segment = segment.map_err(|_| ())?;
+        let start = segment.virtual_address.checked_sub(USER_MIN).ok_or(())? as usize;
+        let end = start.checked_add(segment.memory_size as usize).ok_or(())?;
+        if end > IMAGE_BYTES {
+            return Err(());
+        }
+        let file_start = segment.file_offset as usize;
+        let file_end = file_start
+            .checked_add(segment.file_size as usize)
+            .ok_or(())?;
+        let destination_end = start.checked_add(segment.file_size as usize).ok_or(())?;
+        memory.image[start..destination_end].copy_from_slice(&bytes[file_start..file_end]);
+        if segment.memory_size == 0 {
+            continue;
+        }
+        let first_page = start & !0xfff;
+        let last_page = (end - 1) & !0xfff;
+        for offset in (first_page..=last_page).step_by(4096) {
+            let index = (((USER_MIN as usize + offset) >> 12) & 0x1ff) as usize;
+            let low = if segment.writable { 0x747 } else { 0x7c7 };
+            let execute = if segment.executable {
+                0x0020u64 << 48
+            } else {
+                0x0060u64 << 48
+            };
+            memory.level3[index] = image_physical + offset as u64 | low | execute;
+        }
+    }
+    for offset in (0..STACK_BYTES).step_by(4096) {
+        map_page(
+            memory,
+            STACK_TOP - STACK_BYTES as u64 + offset as u64,
+            stack_physical + offset as u64,
+            normal_page_flags(),
+        );
+    }
+    for offset in (0..HEAP_BYTES).step_by(4096) {
+        map_page(
+            memory,
+            HEAP_START + offset as u64,
+            heap_physical + offset as u64,
+            normal_page_flags(),
+        );
+    }
+    if task == MFS_TASK {
+        let heap_physical = physical(memory.large_heap as usize);
+        for offset in (0..LARGE_HEAP_BYTES).step_by(4096) {
+            let table = offset / 0x20_0000;
+            let index = (offset >> 12) & 0x1ff;
+            memory.large_heap_level3[table][index] =
+                (heap_physical + offset as u64) | normal_page_flags();
+        }
+    }
+    if task == CONSOLE_TASK {
+        let uart = CONSOLE_UART.load(Ordering::Acquire);
+        if uart == 0 {
+            return Err(());
+        }
+        map_page(memory, CONSOLE_UART_VA, uart & !0xfff, device_page_flags());
+    } else if task == DEVMGR_TASK {
+        let ecam = device_control::ecam_physical().ok_or(())?;
+        for slot in 0..DEVMGR_ECAM_SLOTS {
+            map_page(
+                memory,
+                DEVMGR_ECAM_SCAN_VA + slot as u64 * 4096,
+                ecam + (slot as u64) * 0x8000,
+                device_page_flags(),
+            );
+        }
+    }
+    if matches!(task, MFS_TASK | SHELL_TASK) {
+        let filesystem_physical = FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if filesystem_physical == 0 {
+            return Err(());
+        }
+        map_page(
+            memory,
+            FILESYSTEM_DATA_VA,
+            filesystem_physical,
+            normal_page_flags(),
+        );
+    }
+    if matches!(task, MFS_TASK | SSHD_TASK) {
+        let filesystem_physical = SSH_FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if filesystem_physical == 0 {
+            return Err(());
+        }
+        map_page(
+            memory,
+            if task == MFS_TASK {
+                SSH_FILESYSTEM_DATA_VA
+            } else {
+                FILESYSTEM_DATA_VA
+            },
+            filesystem_physical,
+            normal_page_flags(),
+        );
+    }
+    if matches!(task, MFS_TASK | WINDOWD_TASK) {
+        let filesystem_physical = WINDOWD_FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if filesystem_physical == 0 {
+            return Err(());
+        }
+        map_page(
+            memory,
+            if task == MFS_TASK {
+                WINDOWD_FILESYSTEM_DATA_VA
+            } else {
+                FILESYSTEM_DATA_VA
+            },
+            filesystem_physical,
+            normal_page_flags(),
+        );
+    }
+    if matches!(task, MFS_TASK | WINDOWD_TASK | TERMINAL_TASK) {
+        let filesystem_physical = TERMINAL_FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if filesystem_physical == 0 {
+            return Err(());
+        }
+        map_page(
+            memory,
+            TERMINAL_FILESYSTEM_DATA_VA,
+            filesystem_physical,
+            normal_page_flags(),
+        );
+    }
+
+    let starts = unsafe { &mut *STARTS.0.get() };
+    starts[task] = Start {
+        entry: image.entry(),
+        stack: STACK_TOP,
+        ttbr0: ((ASID_BASE + task as u16) as u64) << 48 | level1_physical,
+    };
+    Ok(())
+}
+
+fn map_page(memory: &mut TaskMemory, virtual_address: u64, physical: u64, flags: u64) {
+    let index = ((virtual_address >> 12) & 0x1ff) as usize;
+    if virtual_address < 0x0060_0000 {
+        memory.level3[index] = (physical & !0xfff) | flags;
+    } else {
+        memory.level3_high[index] = (physical & !0xfff) | flags;
+    }
+}
+
+fn normal_page_flags() -> u64 {
+    0x747 | (0x0060u64 << 48)
+}
+
+fn user_page_flags(writable: bool, executable: bool) -> u64 {
+    let access = if writable { 0x747 } else { 0x7c7 };
+    let execute = if executable {
+        0x0020u64 << 48
+    } else {
+        0x0060u64 << 48
+    };
+    access | execute
+}
+
+fn device_page_flags() -> u64 {
+    0x743 | (0x0060u64 << 48)
+}
+
+fn physical(high: usize) -> u64 {
+    (high - KERNEL_OFFSET) as u64
+}

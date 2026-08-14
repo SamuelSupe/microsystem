@@ -1,0 +1,22 @@
+[package]
+name = "microsystem-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+microsystem-abi = { path = "../../crates/abi" }
+microsystem-block = { path = "../block" }
+microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
+
+[features]
+default = []
+user-bin = ["dep:microsystem-user-rt"]
+
+[[bin]]
+name = "microsystem-init"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["user-bin"]

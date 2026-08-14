@@ -1,0 +1,25 @@
+[package]
+name = "microsystem-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+fdt = { version = "0.1.5", default-features = false }
+microsystem-abi = { path = "../abi" }
+
+[features]
+default = []
+baremetal = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "microsystem-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["baremetal"]

@@ -1,0 +1,4 @@
+--!mica 1
+
+print("hello from Mica")
+print("uptime_ns", time.uptime())

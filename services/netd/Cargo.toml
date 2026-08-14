@@ -1,0 +1,33 @@
+[package]
+name = "microsystem-netd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "../user-build.rs"
+
+[dependencies]
+microsystem-abi = { path = "../../crates/abi" }
+microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dns",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dns",
+    "iface-max-addr-count-1",
+    "iface-max-route-count-1",
+    "iface-neighbor-cache-count-8",
+] }
+
+[features]
+default = []
+user-bin = ["dep:microsystem-user-rt"]
+
+[[bin]]
+name = "microsystem-netd"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["user-bin"]

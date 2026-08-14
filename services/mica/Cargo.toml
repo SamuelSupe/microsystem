@@ -1,0 +1,35 @@
+[package]
+name = "microsystem-mica-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "../user-build.rs"
+
+[dependencies]
+embedded-io = { version = "0.7", default-features = false }
+embedded-tls = { version = "0.19", default-features = false, features = [
+    "alloc",
+    "ed25519",
+    "p384",
+    "rsa",
+    "rustpki",
+] }
+microsystem-abi = { path = "../../crates/abi" }
+microsystem-mica = { path = "../../crates/mica", default-features = false }
+microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+rand_core = { version = "0.6", default-features = false }
+rsa = { version = "0.9.10", default-features = false, features = ["sha2"] }
+sha2 = { version = "0.10", default-features = false }
+
+[features]
+default = []
+user-bin = ["dep:microsystem-user-rt"]
+
+[[bin]]
+name = "microsystem-mica-service"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["user-bin"]

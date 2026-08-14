@@ -1,0 +1,27 @@
+[package]
+name = "microsystem-sshd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "../user-build.rs"
+
+[dependencies]
+embedded-io-async = { version = "0.6", default-features = false }
+microsystem-abi = { path = "../../crates/abi" }
+microsystem-shell = { path = "../shell" }
+microsystem-mica = { path = "../../crates/mica", default-features = false }
+microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
+rand = { version = "0.8", default-features = false }
+zssh = { version = "0.4.2", default-features = false }
+
+[features]
+default = []
+user-bin = ["dep:microsystem-user-rt"]
+
+[[bin]]
+name = "microsystem-sshd"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["user-bin"]

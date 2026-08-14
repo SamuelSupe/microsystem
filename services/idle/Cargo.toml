@@ -1,0 +1,21 @@
+[package]
+name = "microsystem-idle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "../user-build.rs"
+
+[dependencies]
+microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
+
+[features]
+default = []
+user-bin = ["dep:microsystem-user-rt"]
+
+[[bin]]
+name = "microsystem-idle"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["user-bin"]

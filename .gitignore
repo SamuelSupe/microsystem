@@ -1,0 +1,6 @@
+/target/
+/build/
+/.cache/
+*.img
+*.log
+.workflow/**/state.json

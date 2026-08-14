@@ -1,0 +1,17 @@
+--!mica 1
+--!allow fs.read:/data
+--!allow fs.write:/data/output
+
+local json = require("json")
+local status = {
+    generated_at = time.uptime(),
+    source = "/data",
+}
+
+local ok, err = fs.write_file("/data/output/status.json", json.encode(status), {
+    atomic = true,
+    fsync = true,
+})
+if not ok then
+    error(err.message)
+end

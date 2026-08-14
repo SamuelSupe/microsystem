@@ -1,0 +1,13 @@
+[package]
+name = "mfs1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+path = "src/lib.rs"

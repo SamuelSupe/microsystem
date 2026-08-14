@@ -1,0 +1,442 @@
+--!mica 1
+--!allow gui.window
+--!allow net.browse
+
+local gui = require("gui")
+local http = require("http")
+local bytes = require("bytes")
+local string = require("string")
+local table = require("table")
+local args = require("args")
+
+local PAGE_LINES = 18
+local LINE_WIDTH = 64
+local MAX_DOCUMENT_LINES = 96
+local MAX_BODY_BYTES = 98304
+
+local decode_entities = function(value)
+    value = string.replace(value, "&amp;", "&")
+    value = string.replace(value, "&lt;", "<")
+    value = string.replace(value, "&gt;", ">")
+    value = string.replace(value, "&quot;", "\"")
+    value = string.replace(value, "&#39;", "'")
+    value = string.replace(value, "&apos;", "'")
+    value = string.replace(value, "&nbsp;", " ")
+    return value
+end
+
+local append_line = function(lines, links, text, href, prefix, preserve)
+    if preserve then
+        text = string.trim(text)
+    else
+        text = string.collapse_space(text)
+    end
+    if text == "" then return lines, links end
+    text = prefix + text
+    while string.len(text) > LINE_WIDTH and table.len(lines) < MAX_DOCUMENT_LINES do
+        lines = table.insert(lines, string.sub(text, 1, LINE_WIDTH))
+        links = table.insert(links, href)
+        text = string.sub(text, LINE_WIDTH + 1)
+    end
+    if text ~= "" and table.len(lines) < MAX_DOCUMENT_LINES then
+        lines = table.insert(lines, text)
+        links = table.insert(links, href)
+    end
+    return lines, links
+end
+
+local attribute = function(tag, name)
+    local padded = " " + tag
+    local lower = string.lower(padded)
+    local start = string.find(lower, " " + name)
+    if not start then return nil end
+    local equal = string.find(lower, "=", start + string.len(name) + 1)
+    if not equal then return nil end
+    local cursor = equal + 1
+    local character = string.sub(padded, cursor, cursor)
+    while character == " " or character == "\t" do
+        cursor = cursor + 1
+        character = string.sub(padded, cursor, cursor)
+    end
+    if character == "\"" or character == "'" then
+        local finish = string.find(padded, character, cursor + 1)
+        if not finish then return nil end
+        return decode_entities(string.sub(padded, cursor + 1, finish - 1))
+    end
+    local finish = string.find(padded, " ", cursor)
+    if finish then return decode_entities(string.sub(padded, cursor, finish - 1)) end
+    return decode_entities(string.sub(padded, cursor))
+end
+
+local parse_html = function(source)
+    local lines = {}
+    local links = {}
+    local title = "Mica Reader"
+    local lower_source = string.lower(source)
+    local cursor = 1
+    local current = ""
+    local href = ""
+    local prefix = ""
+    local preserve = false
+    local in_title = false
+    local in_head = false
+    local source_length = string.len(source)
+
+    while cursor <= source_length and table.len(lines) < MAX_DOCUMENT_LINES do
+        local open = string.find(source, "<", cursor)
+        if not open then
+            local text = decode_entities(string.sub(source, cursor))
+            if in_title then title = string.collapse_space(title + " " + text)
+            elseif not in_head then current = current + " " + text end
+            break
+        end
+        local text = decode_entities(string.sub(source, cursor, open - 1))
+        if in_title then title = string.collapse_space(title + " " + text)
+        elseif not in_head then current = current + " " + text end
+
+        if string.starts_with(string.sub(source, open), "<!--") then
+            local comment_end = string.find(source, "-->", open + 4)
+            if not comment_end then break end
+            cursor = comment_end + 3
+        else
+            local close = string.find(source, ">", open + 1)
+            if not close then break end
+            local raw = string.trim(string.sub(source, open + 1, close - 1))
+            local lower = string.lower(raw)
+            local closing = string.starts_with(lower, "/")
+            if closing then lower = string.trim(string.sub(lower, 2)) end
+            local space = string.find(lower, " ")
+            local name = lower
+            if space then name = string.sub(lower, 1, space - 1) end
+            if string.ends_with(name, "/") then
+                name = string.sub(name, 1, string.len(name) - 1)
+            end
+
+            if not closing and (name == "script" or name == "style") then
+                local ending = string.find(lower_source, "</" + name, close + 1)
+                if not ending then break end
+                local ending_close = string.find(source, ">", ending + string.len(name) + 2)
+                if not ending_close then break end
+                cursor = ending_close + 1
+            else
+                if name == "head" then
+                    in_head = not closing
+                elseif name == "title" then
+                    in_title = not closing
+                    if not closing then title = "" end
+                elseif not in_head then
+                    if not closing and (name == "p" or name == "div" or name == "h1" or name == "h2" or name == "h3" or name == "li" or name == "pre") then
+                        lines, links = append_line(lines, links, current, href, prefix, preserve)
+                        current = ""
+                        href = ""
+                        prefix = ""
+                        preserve = name == "pre"
+                        if name == "h1" then prefix = "# "
+                        elseif name == "h2" then prefix = "## "
+                        elseif name == "h3" then prefix = "### "
+                        elseif name == "li" then prefix = "• " end
+                    elseif name == "a" and not closing then
+                        lines, links = append_line(lines, links, current, href, prefix, preserve)
+                        current = ""
+                        prefix = "→ "
+                        href = attribute(raw, "href") or ""
+                    elseif name == "br" then
+                        lines, links = append_line(lines, links, current, href, prefix, preserve)
+                        current = ""
+                        prefix = ""
+                    elseif closing and (name == "a" or name == "p" or name == "div" or name == "h1" or name == "h2" or name == "h3" or name == "li" or name == "pre") then
+                        lines, links = append_line(lines, links, current, href, prefix, preserve)
+                        current = ""
+                        href = ""
+                        prefix = ""
+                        preserve = false
+                    end
+                end
+                cursor = close + 1
+            end
+        end
+    end
+    lines, links = append_line(lines, links, current, href, prefix, preserve)
+    if table.len(lines) == 0 then
+        lines = {"(empty document)"}
+        links = {""}
+    end
+    if table.len(lines) >= MAX_DOCUMENT_LINES then
+        lines = table.remove(lines, MAX_DOCUMENT_LINES)
+        links = table.remove(links, MAX_DOCUMENT_LINES)
+        lines = table.insert(lines, "[document truncated]")
+        links = table.insert(links, "")
+    end
+    if title == "" then title = "Mica Reader" end
+    return {title = title, lines = lines, links = links}
+end
+
+local parse_url = function(url)
+    url = string.trim(url)
+    local scheme_end = string.find(url, "://")
+    if not scheme_end then return nil, "URL must use http:// or https://" end
+    local scheme = string.lower(string.sub(url, 1, scheme_end - 1))
+    if scheme ~= "http" and scheme ~= "https" then
+        return nil, "URL scheme is not supported"
+    end
+    local authority_start = scheme_end + 3
+    local slash = string.find(url, "/", authority_start)
+    local query = string.find(url, "?", authority_start)
+    local hash = string.find(url, "#", authority_start)
+    if query and (not slash or query < slash) then slash = query end
+    if hash and (not slash or hash < slash) then slash = hash end
+    local authority = string.sub(url, authority_start)
+    local path = "/"
+    if slash then
+        authority = string.sub(url, authority_start, slash - 1)
+        path = string.sub(url, slash)
+        if string.starts_with(path, "?") then path = "/" + path end
+        if string.starts_with(path, "#") then path = "/" end
+    end
+    if authority == "" or string.find(authority, "@") or string.find(authority, "*") then
+        return nil, "URL authority is invalid"
+    end
+    local fragment = string.find(path, "#")
+    if fragment then path = string.sub(path, 1, fragment - 1) end
+    return {
+        scheme = scheme,
+        authority = string.lower(authority),
+        origin = scheme + "://" + string.lower(authority),
+        path = path,
+        url = scheme + "://" + string.lower(authority) + path,
+    }, nil
+end
+
+local last_slash = function(value)
+    local last = nil
+    local cursor = 1
+    while true do
+        local found = string.find(value, "/", cursor)
+        if not found then break end
+        last = found
+        cursor = found + 1
+    end
+    return last
+end
+
+local resolve_url = function(base, reference)
+    reference = string.trim(decode_entities(reference))
+    if reference == "" or string.starts_with(reference, "#") then return base, nil end
+    local base_parts, base_error = parse_url(base)
+    if not base_parts then return nil, base_error end
+    local target = nil
+    if string.starts_with(reference, "http://") or string.starts_with(reference, "https://") then
+        target = reference
+    elseif string.starts_with(reference, "//") then
+        target = base_parts.scheme + ":" + reference
+    elseif string.starts_with(reference, "/") then
+        target = base_parts.origin + reference
+    elseif string.find(reference, ":") then
+        return nil, "link scheme is not supported"
+    else
+        local directory = base_parts.path
+        local slash = last_slash(directory)
+        if slash then directory = string.sub(directory, 1, slash) else directory = "/" end
+        while string.starts_with(reference, "../") do
+            reference = string.sub(reference, 4)
+            local trimmed = directory
+            if string.ends_with(trimmed, "/") then
+                trimmed = string.sub(trimmed, 1, string.len(trimmed) - 1)
+            end
+            local parent = last_slash(trimmed)
+            if parent then directory = string.sub(trimmed, 1, parent) else directory = "/" end
+        end
+        if string.starts_with(reference, "./") then reference = string.sub(reference, 3) end
+        target = base_parts.origin + directory + reference
+    end
+    local target_parts, target_error = parse_url(target)
+    if not target_parts then return nil, target_error end
+    if target_parts.origin ~= base_parts.origin then
+        return nil, "cross-origin navigation is not allowed"
+    end
+    return target_parts.url, nil
+end
+
+local render_page = function(lines, links, page, list_widget, page_widget)
+    local items = {}
+    local visible_links = {}
+    local total = table.len(lines)
+    local pages = (total + PAGE_LINES - 1) // PAGE_LINES
+    if pages < 1 then pages = 1 end
+    if page < 1 then page = 1 end
+    if page > pages then page = pages end
+    local first = (page - 1) * PAGE_LINES + 1
+    local last = first + PAGE_LINES - 1
+    if last > total then last = total end
+    for index = first, last do
+        items = table.insert(items, lines[index])
+        visible_links = table.insert(visible_links, links[index] or "")
+    end
+    list_widget:set_items(items)
+    page_widget:set_text("Page " + tostring(page) + "/" + tostring(pages))
+    return visible_links, page, pages
+end
+
+local initial_url = args.get(1) or "https://example.com/"
+local back_button = gui.button {text = "Back", width = 62}
+local forward_button = gui.button {text = "Forward", width = 72}
+local reload_button = gui.button {text = "Reload", width = 68}
+local address = gui.text_input {text = initial_url, grow = 1}
+local go_button = gui.button {text = "Go", width = 48}
+local status = gui.label {text = "Ready", height = 24}
+local document = gui.list {items = {"Ready"}, grow = 1}
+local previous_page = gui.button {text = "Previous page", width = 116}
+local page_label = gui.label {text = "Page 1/1", grow = 1}
+local next_page = gui.button {text = "Next page", width = 100}
+local app, window_error = gui.window {title = "Mica Reader", width = 760, height = 620}
+if not app then error(window_error.message) end
+
+app:set_root(gui.column {
+    padding = 10,
+    gap = 8,
+    children = {
+        gui.row {height = 38, gap = 6, children = {back_button, forward_button, reload_button, address, go_button}},
+        status,
+        document,
+        gui.row {height = 34, gap = 8, children = {previous_page, page_label, next_page}},
+    },
+})
+
+local make_controller = function()
+    local address_value = initial_url
+    local current_url = initial_url
+    local history = {}
+    local history_index = 0
+    local page = 1
+    local page_count = 1
+    local lines = {"Ready"}
+    local links = {""}
+    local visible_links = {""}
+    return function(action, value)
+    if action == "address" then
+        address_value = value
+        return
+    elseif action == "previous_page" then
+        page = page - 1
+        visible_links, page, page_count = render_page(lines, links, page, document, page_label)
+        app:invalidate()
+        return
+    elseif action == "next_page" then
+        page = page + 1
+        visible_links, page, page_count = render_page(lines, links, page, document, page_label)
+        app:invalidate()
+        return
+    elseif action == "select" then
+        local reference = visible_links[value]
+        if not reference or reference == "" then return end
+        local resolved, resolve_error = resolve_url(current_url, reference)
+        if not resolved then
+            status:set_text(resolve_error)
+            app:invalidate()
+            return
+        end
+        value = resolved
+        action = "navigate"
+    elseif action == "back" then
+        if history_index <= 1 then return end
+        history_index = history_index - 1
+        value = history[history_index]
+        action = "history"
+    elseif action == "forward" then
+        if history_index >= table.len(history) then return end
+        history_index = history_index + 1
+        value = history[history_index]
+        action = "history"
+    elseif action == "reload" then
+        value = current_url
+        action = "history"
+    end
+
+    if action ~= "navigate" and action ~= "history" then return end
+    if not value then value = address_value end
+    local parsed, parse_error = parse_url(value)
+    if not parsed then
+        status:set_text(parse_error)
+        app:invalidate()
+        return
+    end
+    status:set_text("Loading " + parsed.origin)
+    app:invalidate()
+    app:present()
+    local response, request_error = http.get(parsed.url)
+    if not response then
+        status:set_text(request_error.message)
+        lines = {"Request failed", request_error.message}
+        links = {"", ""}
+        page = 1
+        visible_links, page, page_count = render_page(lines, links, page, document, page_label)
+        app:invalidate()
+        return
+    end
+
+    if response.status >= 300 and response.status <= 399 and response.location then
+        response:read_all(MAX_BODY_BYTES)
+        lines = {"HTTP " + tostring(response.status) + " redirect", "→ " + response.location}
+        links = {"", response.location}
+        status:set_text("Redirect returned; select the link to follow")
+    else
+        local body, body_error = response:read_all(MAX_BODY_BYTES)
+        if not body then
+            status:set_text(body_error.message)
+            lines = {"Response read failed", body_error.message}
+            links = {"", ""}
+        else
+            local source, utf8_error = bytes.to_string(body)
+            if not source then
+                status:set_text(utf8_error.message)
+                lines = {"Response is not UTF-8"}
+                links = {""}
+            elseif response.content_type and string.starts_with(string.lower(response.content_type), "text/plain") then
+                lines, links = append_line({}, {}, source, "", "", true)
+                status:set_text("HTTP " + tostring(response.status) + " text/plain")
+                app:set_title("Mica Reader — text")
+            elseif response.content_type and not string.starts_with(string.lower(response.content_type), "text/html") then
+                lines = {"Unsupported content type", response.content_type}
+                links = {"", ""}
+                status:set_text("HTTP " + tostring(response.status) + " unsupported content")
+            else
+                local parsed_document = parse_html(source)
+                lines = parsed_document.lines
+                links = parsed_document.links
+                app:set_title(parsed_document.title)
+                status:set_text("HTTP " + tostring(response.status) + " — " + parsed.origin)
+            end
+        end
+    end
+
+    current_url = parsed.url
+    address_value = parsed.url
+    address:set_text(parsed.url)
+    if action == "navigate" then
+        while table.len(history) > history_index do
+            history = table.remove(history, table.len(history))
+        end
+        history = table.insert(history, current_url)
+        history_index = table.len(history)
+    end
+    page = 1
+    visible_links, page, page_count = render_page(lines, links, page, document, page_label)
+    app:invalidate()
+    print("mica-reader loaded status=" + tostring(response.status) + " lines=" + tostring(table.len(lines)))
+    end
+end
+
+local controller = make_controller()
+
+back_button:set_callback("click", function() controller("back", "") end)
+forward_button:set_callback("click", function() controller("forward", "") end)
+reload_button:set_callback("click", function() controller("reload", "") end)
+address:set_callback("change", function(text) controller("address", text) end)
+address:set_callback("submit", function(text) controller("navigate", text) end)
+go_button:set_callback("click", function() controller("navigate", nil) end)
+document:set_callback("select", function(index) controller("select", index) end)
+previous_page:set_callback("click", function() controller("previous_page", "") end)
+next_page:set_callback("click", function() controller("next_page", "") end)
+
+controller("navigate", initial_url)
+app:run()

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abi",
+    "crates/gui",
+    "crates/kernel",
+    "crates/mica",
+    "crates/mfs1",
+    "crates/mfsctl",
+    "crates/user-rt",
+    "services/block",
+    "services/badptr",
+    "services/console",
+    "services/counter",
+    "services/crossptr",
+    "services/devmgr",
+    "services/fs",
+    "services/init",
+    "services/idle",
+    "services/windowd",
+    "services/terminal",
+    "services/files",
+    "services/monitor",
+    "services/mica",
+    "services/netd",
+    "services/sshd",
+    "services/pageprobe",
+    "services/privprobe",
+    "services/resourceprobe",
+    "services/resourcefault",
+    "services/resourcekill",
+    "services/shell",
+    "services/spinner",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97.1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1

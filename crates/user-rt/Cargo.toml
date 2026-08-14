@@ -1,0 +1,16 @@
+[package]
+name = "microsystem-user-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+microsystem-abi = { path = "../abi" }
+
+[features]
+default = []
+large-heap = []
+
+[lib]
+path = "src/lib.rs"
