@@ -120,4 +120,6 @@ The answer is still being explored. Contributions, criticism, and reproducible e
 
 ## License
 
-The Rust workspace declares `MIT OR Apache-2.0`. See the individual source headers and package metadata for the applicable license terms.
+MicroSystem is released under the [MIT License](LICENSE). Third-party assets
+retain their own license terms; see the notices in [`assets/`](assets/),
+including the bundled font and certificate materials.

@@ -121,4 +121,5 @@ MicroSystem 刻意保持足够小，便于阅读；同时保持足够完整，�
 
 ## 许可证
 
-Rust workspace 声明许可证为 `MIT OR Apache-2.0`。具体适用条款以源文件头部与 package metadata 为准。
+MicroSystem 采用 [MIT 开源许可证](LICENSE)。第三方素材仍遵循各自的许可
+条款，详见 [`assets/`](assets/) 中的说明，包括随仓库提供的字体和证书材料。
