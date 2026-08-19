@@ -105,6 +105,8 @@ xtask/             镜像生成与 QEMU 编排
 
 - [系统架构](docs/architecture.md) — 启动、地址空间、IPC、capability、存储与 GUI 边界。
 - [GUI profile](docs/gui.md) — windowd、保留式 Present、输入、启动策略与 VNC/QEMU 路径。
+- [Mica 编程说明（中文）](docs/mica-programming.zh-CN.md) — 从第一个脚本到权限、文件、HTTP 和 GUI 示例。
+- [Mica Programming Guide](docs/mica-programming.md) — English guide for language basics and broker APIs.
 - [Mica runtime contract](docs/mica.md) — 语言、VM 限制、权限与 broker API。
 - [MFS1](docs/mfs1.md) — 事务格式、恢复、故障模型、fsck 与修复边界。
 - [网络与 `netd`](docs/network.md) — 端点策略与有界网络能力。
