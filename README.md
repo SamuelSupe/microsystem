@@ -106,7 +106,6 @@ xtask/             Image generation and QEMU orchestration
 - [Architecture](docs/architecture.md) — boot, address spaces, IPC, capabilities, storage, and GUI boundaries.
 - [GUI profile](docs/gui.md) — windowd, retained Present, input, launch policy, and the VNC/QEMU path.
 - [Mica Programming Guide](docs/mica-programming.md) — language basics, permissions, filesystem, HTTP, and GUI examples.
-- [Mica 编程说明（中文）](docs/mica-programming.zh-CN.md) — 从第一个脚本到 capability-broker API。
 - [Mica runtime contract](docs/mica.md) — language, VM limits, permissions, and broker APIs.
 - [MFS1](docs/mfs1.md) — transaction format, recovery, fault model, fsck, and repair boundary.
 - [Network and `netd`](docs/network.md) — endpoint policy and bounded networking.
