@@ -221,6 +221,8 @@ fn parse_command(command: &str) -> SshCommand {
         Ok(ShellCommand::Help) => SshCommand::Help,
         Ok(ShellCommand::Uptime) => SshCommand::Uptime,
         Ok(ShellCommand::Ps) => SshCommand::Ps,
+        Ok(ShellCommand::Echo(_)) => SshCommand::Echo,
+        Ok(ShellCommand::Clear) => SshCommand::Clear,
         Ok(ShellCommand::MicaEval(source)) if source.len() <= 256 => {
             let mut bytes = [0u8; 256];
             bytes[..source.len()].copy_from_slice(source.as_bytes());
@@ -483,7 +485,7 @@ fn filesystem_request(
     }
     unsafe {
         core::ptr::copy_nonoverlapping(path.as_ptr(), FILESYSTEM_SHARED_VA as *mut u8, path.len());
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     let mut request = Message::new(protocol::FILESYSTEM, operation as u16);
     request.words[0] = path.len() as u64;
@@ -495,7 +497,7 @@ fn filesystem_request(
     if status != Status::Ok {
         return Err(status);
     }
-    unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+    microsystem_user_rt::fence();
     Ok(reply)
 }
 
@@ -689,7 +691,7 @@ fn send_ssh_repl_input(
             (SCRIPT_SESSION_VA as *mut u8).add(script::STDIN_OFFSET),
             input.len(),
         );
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     };
     microsystem_user_rt::frame_unmap(region, SCRIPT_SESSION_VA)?;
     microsystem_user_rt::notification_signal(notification, script::EVENT_INPUT)
@@ -717,7 +719,7 @@ fn ssh_repl_event(region: microsystem_abi::CapHandle) -> Result<Option<u64>, Sta
         SCRIPT_SESSION_VA,
         Rights(Rights::READ.0 | Rights::WRITE.0),
     )?;
-    unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+    microsystem_user_rt::fence();
     let header = unsafe { &*(SCRIPT_SESSION_VA as *const script::SessionHeaderV1) };
     let flags = header.flags;
     microsystem_user_rt::frame_unmap(region, SCRIPT_SESSION_VA)?;
@@ -1200,7 +1202,7 @@ impl Read for NetdStream {
                         return Err(StreamError);
                     }
                     unsafe {
-                        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+                        microsystem_user_rt::fence();
                         core::ptr::copy_nonoverlapping(
                             NETWORK_SHARED_VA as *const u8,
                             output.as_mut_ptr(),
@@ -1228,7 +1230,7 @@ impl Write for NetdStream {
         let bytes = input.len().min(4096);
         unsafe {
             core::ptr::copy_nonoverlapping(input.as_ptr(), NETWORK_SHARED_VA as *mut u8, bytes);
-            core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+            microsystem_user_rt::fence();
         }
         loop {
             let mut request = Message::new(protocol::NETWORK, network::Operation::SshSend as u16);

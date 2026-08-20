@@ -4,7 +4,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::dtb::PlatformInfo;
 use crate::{pci, smmu};
 
-const KERNEL_OFFSET: usize = 0xffff_ff80_0000_0000;
 const RX_QUEUE_SIZE: u16 = 2;
 const TX_QUEUE_SIZE: u16 = 1;
 const DESC_OFFSET: usize = 0;
@@ -122,9 +121,8 @@ pub fn receive(output: &mut [u8]) -> Result<usize, ()> {
     if payload > output.len() || packet_offset + bytes > queue.len() {
         return Err(());
     }
-    output[..payload].copy_from_slice(
-        &queue[packet_offset + VIRTIO_NET_HEADER..packet_offset + bytes],
-    );
+    output[..payload]
+        .copy_from_slice(&queue[packet_offset + VIRTIO_NET_HEADER..packet_offset + bytes]);
     if payload >= 14 && !FIRST_RX_REPORTED.swap(true, Ordering::AcqRel) {
         crate::kprintln!(
             "[net] first-rx bytes={} virtio={:02x}{:02x} ethernet={:02x}{:02x}{:02x}{:02x}{:02x}{:02x} ether-type={:02x}{:02x}",
@@ -260,7 +258,11 @@ fn configure_queue(
             if receive { VRING_DESC_F_WRITE } else { 0 },
         );
         if receive {
-            put16(queue, AVAIL_OFFSET + 4 + descriptor as usize * 2, descriptor);
+            put16(
+                queue,
+                AVAIL_OFFSET + 4 + descriptor as usize * 2,
+                descriptor,
+            );
         }
     }
     if receive {
@@ -280,7 +282,7 @@ fn notify(transport: pci::VirtioTransport, offset: usize, queue: u16) {
 }
 
 fn physical<T>(pointer: *mut T) -> u64 {
-    pointer as usize as u64 - KERNEL_OFFSET as u64
+    crate::arch::virt_to_phys(pointer as usize as u64).unwrap_or(0)
 }
 fn read8(address: usize) -> u8 {
     unsafe { core::ptr::read_volatile(address as *const u8) }
@@ -320,7 +322,5 @@ fn put64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 fn dma_barrier() {
-    unsafe {
-        core::arch::asm!("dmb osh", options(nostack, preserves_flags));
-    }
+    crate::arch::dma_barrier();
 }

@@ -1,9 +1,10 @@
 # Runbook and acceptance model
 
-This runbook describes the current OrbStack/QEMU path. The evidence below is the
-final run recorded in `target/unified-mfs1-resilience-final.log` and
-`target/unified-mfs1-resilience-fsck.log` on 2026-08-14; this documentation pass
-does not rerun the tests.
+This runbook describes the current AArch64 and RV64GC OrbStack/QEMU paths. The
+recorded evidence includes AArch64 build and serial shutdown, and a RISC-V QEMU
+`virt` run through serial shutdown and the IOMMU/device gates below. This
+documentation pass does not rerun the end-to-end tests. The exact full test
+matrices remain `validation in progress`.
 
 ## Build and run
 
@@ -19,6 +20,8 @@ make fsck
 make run                 # serial shell; SSH host port defaults to 2222
 make gui                 # GUI profile, VNC/QMP as printed by xtask
 make ssh                 # SSH acceptance client
+ARCH=aarch64 make test   # validation in progress
+ARCH=riscv64 make test   # validation in progress
 ```
 
 `make test` is the unified gate. It builds the image, runs host tests and then
@@ -26,23 +29,69 @@ the normal, power-cut, fault-injection/recovery, MFS1 crash campaign, GUI, SSH,
 and Mica stages. The test harness uses the repository's OrbStack image and QEMU
 configuration; a host KVM accelerator is not required.
 
+## Target matrix and current RISC-V validation
+
+| Target | Current status | Evidence boundary |
+| --- | --- | --- |
+| AArch64 + QEMU `virt-7.2` | Build and serial run reach shutdown | `make test` built-in host suites `81/81`; separate shell parser `6/6`; `87/87` combined recorded checks. |
+| RV64GC + QEMU `virt` | Serial run reaches shutdown | OpenSBI M-mode → S-mode, Sv39, two harts, PLIC/SBI, PCI VirtIO and RISC-V IOMMU gates are verified below. |
+
+The Makefile and `xtask` select the target, QEMU binary, default OpenSBI firmware
+and `iommu-sys=on` from `ARCH`. The validated RISC-V chain is RV64GC → QEMU
+`virt` → OpenSBI M-mode → S-mode → Sv39 → two harts → PLIC/SBI → PCI VirtIO →
+RISC-V IOMMU.
+
+```sh
+ARCH=riscv64 make build
+ARCH=riscv64 make run
+```
+
+The RISC-V serial run records `[system] shutdown` and the IOMMU fault gate:
+
+```text
+[iommu] fault-probe blocked=true sentinel=true event=0xf stream-id=0x10 completion-error=false
+```
+
+The same run verifies DMA map/unmap, RNG first-fill, MFS recovery with clean
+`fsck`, the complete serial-shell filesystem command matrix, the Mica 8 KiB
+argument/input path, and network/DNS. The exact `make ARCH=aarch64 test` and
+`make ARCH=riscv64 test` full matrices are still `validation in progress` and
+must not be recorded as PASS.
+
+The corresponding low-level command shape is:
+
+```sh
+ARCH=riscv64 cargo build --release \
+  --target riscv64gc-unknown-none-elf \
+  -p microsystem-kernel --features baremetal
+ARCH=riscv64 qemu-system-riscv64 \
+  -machine virt,iommu-sys=on -bios default -cpu rv64 \
+  -kernel target/riscv64gc-unknown-none-elf/release/microsystem-kernel \
+  -nographic
+```
+
+For this command, QEMU `virt` loads its default OpenSBI firmware. OpenSBI owns
+M-mode and hands the kernel an S-mode entry and DTB; the kernel uses SBI for
+firmware-owned hart, timer/IPI and reset services. The repository does not ship
+a checked-in OpenSBI image. The current run validates the default firmware path;
+the full architecture matrices remain in progress.
+
 ## Final gate
 
-The recorded unified gate exited zero with these host suites:
+| Evidence | Result |
+| --- | --- |
+| AArch64 build | passed |
+| AArch64 serial run | reached `[system] shutdown` |
+| RV64GC QEMU `virt` serial run | reached `[system] shutdown` |
+| RISC-V IOMMU fault probe | `blocked=true sentinel=true event=0xf stream-id=0x10 completion-error=false` |
+| `make test` built-in host suites | `81/81` (`22+9+6+9+11+24`) |
+| Separate shell-parser run | `6/6` |
+| Combined recorded host checks | `87/87` |
+| `make ARCH=aarch64 test` | `validation in progress` |
+| `make ARCH=riscv64 test` | `validation in progress` |
 
-| Suite | Result |
-| --- | ---: |
-| MFS1 | 22/22 |
-| ABI capability_abi | 9/9 |
-| GUI command-stream + Desktop | 6/6 + 9/9 |
-| GUI Desktop | 9/9 |
-| kernel | 11/11 |
-| Mica | 24/24 |
-
-Total host tests: 81/81.
-
-All normal, power-cut, fault-cut plus GC, GUI, SSH, and Mica stages passed.
-The final `make fsck` also exited zero:
+The retained AArch64 normal, power-cut, fault-cut plus GC, GUI, SSH, and Mica
+stages passed. Its final `make fsck` also exited zero:
 
 ```text
 MFS1 clean generation=2544 transactions=2381 entries=24 used_blocks=11898
@@ -73,16 +122,48 @@ navigation, and cross-origin rejection. Evidence is retained in
 `target/unified-browser-public-internet-fsck.log`, `target/gui-browser-fixture.log`,
 and `target/mica-dns-fixture.log`.
 
-The GUI Terminal accepts `ls [path]`, `cat`, `stat`, `write`, `mkdir`, `mv`,
-`rm` and `sync` with absolute paths and no working directory. It uses the
+The serial shell help surface is:
+
+```text
+shell: help pwd cd echo clear history ps kill wait uptime sleep date free sysinfo
+files: ls cat head tail wc hexdump xxd grep find tree du df stat touch cp write
+       mkdir rmdir mv rm fsync sync (also available through fs <command>)
+network: curl nslookup netstat
+programs: run mica
+system: exit shutdown poweroff reboot
+```
+
+Filesystem aliases include `ls/list`, `cat/read`, `touch/create`, `mv/rename`,
+and `rm/remove/unlink`; bounded options are `head/tail -n N`, `mkdir -p`,
+`cp -r`, and `rm -r`. The GUI Terminal accepts `ls/list [path]`, `cat/read`,
+`stat`, `touch/create`, `cp`, `write`, `mkdir`, `rmdir`, `mv/rename`,
+`rm/remove/unlink`, `fsync` and `sync` with absolute paths and no working
+directory. It uses the
 dedicated `TERMINAL_FILESYSTEM_ENDPOINT` plus the `GUI_TERMINAL_COMMANDS`
 4 KiB shared frame; the MFS broker keeps this path separate from block DMA and
 other filesystem payload frames. Input commands are capped at 512 bytes and
 output/replies at 4 KiB, with the viewport following the newest lines. The
-serial shell parser's `stat`/`mv`/`rm` targeted tests passed 2/2.
+serial shell and GUI terminal share the filesystem parser and aliases.
 
-The unified GUI marker sequence was `mkdir`, `write`, `stat`, `mv`, `cat`, `ls`,
-`rm`, `rm`, `sync`, each with `status=ok`. The Terminal help screenshot had
+The serial shell also has a bounded curl-like GET command:
+
+```text
+curl [-s|--silent] [-i|--include] [-o|--output <absolute-path>] <http[s]://url>
+curl -i https://example.com/
+curl -s -o /data/response https://example.com/
+```
+
+`-i` prints the HTTP status; without `-o`, the response body must be UTF-8 and
+is printed to serial; `-o` writes the body atomically to MFS with fsync. The
+request is GET only through `net.browse`, accepts HTTP or HTTPS URLs, and reads
+at most 32 KiB. HTTP is plaintext; HTTPS uses trusted TLS certificate, hostname
+and time validation. Raw TCP/UDP, POST/PUT/PATCH/DELETE, and low-level TLS are
+outside this command boundary. Process, network, Mica, and power commands
+remain serial-shell commands rather than GUI Terminal commands.
+
+The unified GUI marker sequence was `mkdir`, `touch`, `write`, `cp`, `stat`,
+`mv`, `cat`, `ls`, `fsync`, `rm`, `rm`, `rm`, `rmdir`, `sync`, each with
+`status=ok`. The Terminal help screenshot had
 140 foreground rows and CRC `b3c61c67`, confirming shared-frame output instead
 of the legacy 40-byte inline reply.
 

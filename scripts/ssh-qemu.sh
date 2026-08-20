@@ -3,6 +3,7 @@ set -Ee -o pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/qemu-arch.sh"
 
 timeout_seconds="$MICROSYSTEM_SSH_QEMU_TIMEOUT"
 [[ -n "$timeout_seconds" ]] || timeout_seconds=45
@@ -84,6 +85,7 @@ if (( inside_container == 0 )); then
   inner_qmp="/workspace/target/$(basename "$qmp_socket")"
   inner_qmp_log="/workspace/target/$(basename "$qmp_log")"
   exec docker run --rm -i --init \
+    -e ARCH="$MICROSYSTEM_ARCH" \
     -e RUSTUP_TOOLCHAIN=1.97.1 -e MICROSYSTEM_IN_CONTAINER=1 \
     -e SSH_PORT="$ssh_port" -e GUI_PORT="$gui_port" \
     -e MICROSYSTEM_SSH_QEMU_TIMEOUT="$timeout_seconds" \
@@ -106,13 +108,13 @@ if (( inside_container == 0 )); then
     -v "$repo_root:/workspace" -w /workspace "$image" bash scripts/ssh-qemu.sh
 fi
 
-for command_name in qemu-system-aarch64 ssh ssh-keygen timeout python3; do
+for command_name in "$MICROSYSTEM_QEMU_BINARY" ssh ssh-keygen timeout python3; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "ssh-qemu: $command_name is required inside the OrbStack container" >&2
     exit 2
   fi
 done
-if [[ ! -f target/aarch64-unknown-none-softfloat/release/microsystem-kernel ||
+if [[ ! -f "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" ||
       ! -f build/microsystem.img || ! -f build/ssh/id_ed25519 ||
       ! -x target/release/mfsctl ]]; then
   echo "ssh-qemu: build artifacts are missing; run make build first" >&2
@@ -184,20 +186,20 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-setsid qemu-system-aarch64 \
-  -machine virt-7.2,virtualization=on,gic-version=3,iommu=smmuv3 \
-  -cpu cortex-a72 -accel tcg,thread=multi -smp 2 -m 256M -nographic \
-  -L /usr/lib/ipxe/qemu -no-reboot -semihosting-config enable=on,target=native \
-  -kernel target/aarch64-unknown-none-softfloat/release/microsystem-kernel \
+setsid "$MICROSYSTEM_QEMU_BINARY" \
+  "${MICROSYSTEM_QEMU_PLATFORM_ARGS[@]}" \
+  -accel tcg,thread=multi -smp 2 -m 256M -nographic \
+  "${MICROSYSTEM_QEMU_BOOT_ARGS[@]}" \
+  -kernel "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
   -drive "if=none,file=$repo_root/build/microsystem.img,format=raw,cache=writeback,id=disk0" \
-  -device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on,romfile=,addr=2 \
+  -device "virtio-blk-pci,drive=disk0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=2" \
   -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:$ssh_port-10.0.2.15:22" \
-  -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on,romfile=,addr=6,mac=52:54:00:12:34:56 \
+  -device "virtio-net-pci,netdev=net0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=6,mac=52:54:00:12:34:56" \
   -object "filter-dump,id=netdump,netdev=net0,file=$pcap_file" \
   -trace "events=$trace_events,file=$trace_file" \
   -qmp "unix:$qmp_socket,server=on,wait=off" \
   -object rng-random,filename=/dev/urandom,id=rng0 \
-  -device virtio-rng-pci,rng=rng0,disable-legacy=on,romfile=,addr=7 \
+  -device "virtio-rng-pci,rng=rng0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=7" \
   >"$log_file" 2>&1 &
 qemu_pid=$!
 

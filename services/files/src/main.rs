@@ -40,4 +40,6 @@ fn wait_for_events(endpoint: microsystem_abi::CapHandle) -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! { microsystem_user_rt::exit(1) }
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    microsystem_user_rt::exit(1)
+}

@@ -1,37 +1,70 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const KERNEL_OFFSET: usize = 0xffffff8000000000;
-static PL011_BASE: AtomicUsize = AtomicUsize::new(KERNEL_OFFSET + 0x0900_0000);
+#[cfg(target_arch = "aarch64")]
+static UART_BASE: AtomicUsize = AtomicUsize::new(0xffff_ff80_0900_0000);
+#[cfg(target_arch = "riscv64")]
+static UART_BASE: AtomicUsize = AtomicUsize::new(0xffff_ffc0_1000_0000);
 static PRINT_NEXT: AtomicUsize = AtomicUsize::new(0);
 static PRINT_SERVING: AtomicUsize = AtomicUsize::new(0);
-const DR: usize = 0x00;
-const FR: usize = 0x18;
-const FR_TXFF: u32 = 1 << 5;
+#[cfg(target_arch = "aarch64")]
+const TX_OFFSET: usize = 0x00;
+#[cfg(target_arch = "aarch64")]
+const READY_OFFSET: usize = 0x18;
+#[cfg(target_arch = "aarch64")]
+const READY_MASK: u32 = 1 << 5;
+#[cfg(target_arch = "riscv64")]
+const TX_OFFSET: usize = 0x00;
+#[cfg(target_arch = "riscv64")]
+const READY_OFFSET: usize = 0x05;
+#[cfg(target_arch = "riscv64")]
+const READY_MASK: u32 = 1 << 5;
 
 pub struct Uart;
 
 impl Uart {
     fn read_reg(offset: usize) -> u32 {
-        let base = PL011_BASE.load(Ordering::Relaxed);
-        unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
+        let base = UART_BASE.load(Ordering::Relaxed);
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::ptr::read_volatile((base + offset) as *const u8) as u32
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::ptr::read_volatile((base + offset) as *const u32)
+        }
     }
     fn write_reg(offset: usize, value: u32) {
-        let base = PL011_BASE.load(Ordering::Relaxed);
-        unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) }
+        let base = UART_BASE.load(Ordering::Relaxed);
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::ptr::write_volatile((base + offset) as *mut u8, value as u8)
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::ptr::write_volatile((base + offset) as *mut u32, value)
+        }
     }
 
     pub fn put(byte: u8) {
-        while Self::read_reg(FR) & FR_TXFF != 0 {
+        #[cfg(target_arch = "aarch64")]
+        while Self::read_reg(READY_OFFSET) & READY_MASK != 0 {
             core::hint::spin_loop();
         }
-        Self::write_reg(DR, byte as u32);
+        #[cfg(target_arch = "riscv64")]
+        while Self::read_reg(READY_OFFSET) & READY_MASK == 0 {
+            core::hint::spin_loop();
+        }
+        Self::write_reg(TX_OFFSET, byte as u32);
     }
 }
 
 pub fn set_physical_base(physical: usize) {
     if physical != 0 {
-        PL011_BASE.store(KERNEL_OFFSET + physical, Ordering::Relaxed);
+        UART_BASE.store(
+            crate::arch::phys_to_virt(physical as u64),
+            Ordering::Relaxed,
+        );
     }
 }
 

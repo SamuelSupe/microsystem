@@ -7,19 +7,59 @@ use std::process::{Command, ExitCode};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
-const TARGET: &str = "aarch64-unknown-none-softfloat";
+#[derive(Clone, Copy)]
+enum Architecture {
+    Aarch64,
+    Riscv64,
+}
+
+impl Architecture {
+    fn from_env() -> Result<Self, String> {
+        match env::var("ARCH")
+            .unwrap_or_else(|_| "aarch64".into())
+            .as_str()
+        {
+            "aarch64" => Ok(Self::Aarch64),
+            "riscv64" => Ok(Self::Riscv64),
+            arch => Err(format!("ARCH must be aarch64 or riscv64 (got {arch})")),
+        }
+    }
+
+    fn target(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "aarch64-unknown-none-softfloat",
+            Self::Riscv64 => "riscv64gc-unknown-none-elf",
+        }
+    }
+
+    fn qemu_binary(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "qemu-system-aarch64",
+            Self::Riscv64 => "qemu-system-riscv64",
+        }
+    }
+
+    fn virtio_pci_options(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "disable-legacy=on,iommu_platform=on,romfile=",
+            Self::Riscv64 => "disable-legacy=on,iommu_platform=on,romfile=",
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let command = env::args().nth(1).unwrap_or_else(|| "help".into());
     let result = match command.as_str() {
-        "build" => build(),
-        "run" => build().and_then(|_| run_qemu()),
-        "gui" => run_qemu_gui(),
-        "qemu" => run_qemu(),
+        "build" => Architecture::from_env().and_then(build),
+        "run" => Architecture::from_env().and_then(|arch| build(arch).and_then(|_| run_qemu(arch))),
+        "gui" => Architecture::from_env().and_then(run_qemu_gui),
+        "qemu" => Architecture::from_env().and_then(run_qemu),
         "test" => test(),
         "fsck" => fsck(),
         _ => {
-            eprintln!("usage: cargo run -p xtask -- <build|run|qemu|gui|test|fsck>");
+            eprintln!(
+                "usage: ARCH=aarch64|riscv64 cargo run -p xtask -- <build|run|qemu|gui|test|fsck>"
+            );
             Ok(())
         }
     };
@@ -32,7 +72,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn build() -> Result<(), String> {
+fn build(arch: Architecture) -> Result<(), String> {
     fs::create_dir_all("build").map_err(|e| e.to_string())?;
     ensure_ssh_material()?;
     let ca_bundle_hash = build_ca_bundle()?;
@@ -40,7 +80,7 @@ fn build() -> Result<(), String> {
         "build",
         "--release",
         "--target",
-        TARGET,
+        arch.target(),
         "-p",
         "microsystem-init",
         "--features",
@@ -75,7 +115,7 @@ fn build() -> Result<(), String> {
             "build",
             "--release",
             "--target",
-            TARGET,
+            arch.target(),
             "-p",
             package,
             "--features",
@@ -86,12 +126,12 @@ fn build() -> Result<(), String> {
         }
         run(&mut command)?;
     }
-    create_bootfs()?;
+    create_bootfs(arch)?;
     run(Command::new("cargo").args([
         "build",
         "--release",
         "--target",
-        TARGET,
+        arch.target(),
         "-p",
         "microsystem-kernel",
         "--features",
@@ -424,7 +464,7 @@ fn ssh_string(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(value);
 }
 
-fn create_bootfs() -> Result<(), String> {
+fn create_bootfs(arch: Architecture) -> Result<(), String> {
     let mut archive = Vec::new();
     let services = [
         ("init", "microsystem-init"),
@@ -454,7 +494,7 @@ fn create_bootfs() -> Result<(), String> {
     for (index, (service, binary)) in services.iter().enumerate() {
         let image = fs::read(
             PathBuf::from("target")
-                .join(TARGET)
+                .join(arch.target())
                 .join("release")
                 .join(binary),
         )
@@ -508,46 +548,125 @@ fn append_newc(out: &mut Vec<u8>, inode: u32, name: &str, mode: u32, data: &[u8]
     }
 }
 
-fn run_qemu() -> Result<(), String> {
-    let netdev = network_backend();
-    run(Command::new("qemu-system-aarch64").args([
-        "-machine",
-        "virt-7.2,virtualization=on,gic-version=3,iommu=smmuv3",
-        "-cpu",
-        "cortex-a72",
-        "-accel",
-        "tcg,thread=multi",
-        "-smp",
-        "2",
-        "-m",
-        "256M",
-        "-nographic",
-        "-L",
-        "/usr/lib/ipxe/qemu",
-        "-no-reboot",
-        "-semihosting-config",
-        "enable=on,target=native",
-        "-kernel",
-        kernel_path().to_str().ok_or("invalid kernel path")?,
-        "-drive",
-        &format!(
-            "if=none,file={},format=raw,cache=writeback,id=disk0",
-            disk_path().display()
-        ),
-        "-device",
-        "virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on,romfile=,addr=2",
-        "-netdev",
-        &netdev,
-        "-device",
-        "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on,romfile=,addr=6,mac=52:54:00:12:34:56",
-        "-object",
-        "rng-random,filename=/dev/urandom,id=rng0",
-        "-device",
-        "virtio-rng-pci,rng=rng0,disable-legacy=on,romfile=,addr=7",
-    ]))
+fn qemu_command(arch: Architecture, gui: bool) -> Command {
+    let mut command = Command::new(arch.qemu_binary());
+    match arch {
+        Architecture::Aarch64 => {
+            command.args([
+                "-machine",
+                "virt-7.2,virtualization=on,gic-version=3,iommu=smmuv3",
+                "-cpu",
+                "cortex-a72",
+                "-accel",
+                "tcg,thread=multi",
+                "-smp",
+                "2",
+                "-m",
+                "256M",
+            ]);
+            if gui {
+                command.args([
+                    "-display",
+                    "none",
+                    "-vnc",
+                    "0.0.0.0:0",
+                    "-serial",
+                    "stdio",
+                    "-monitor",
+                    "none",
+                    "-qmp",
+                    "unix:target/gui-qmp.sock,server=on,wait=off",
+                ]);
+            } else {
+                command.arg("-nographic");
+            }
+            command.args([
+                "-L",
+                "/usr/lib/ipxe/qemu",
+                "-no-reboot",
+                "-semihosting-config",
+                "enable=on,target=native",
+            ]);
+        }
+        Architecture::Riscv64 => {
+            command.args([
+                "-machine",
+                "virt,iommu-sys=on",
+                "-bios",
+                "default",
+                "-cpu",
+                "rv64",
+                "-accel",
+                "tcg,thread=multi",
+                "-smp",
+                "2",
+                "-m",
+                "256M",
+            ]);
+            if gui {
+                command.args([
+                    "-display",
+                    "none",
+                    "-vnc",
+                    "0.0.0.0:0",
+                    "-serial",
+                    "stdio",
+                    "-monitor",
+                    "none",
+                    "-qmp",
+                    "unix:target/gui-qmp.sock,server=on,wait=off",
+                ]);
+            } else {
+                command.arg("-nographic");
+            }
+            command.arg("-no-reboot");
+        }
+    }
+    command
 }
 
-fn run_qemu_gui() -> Result<(), String> {
+fn run_qemu(arch: Architecture) -> Result<(), String> {
+    let netdev = network_backend();
+    let kernel = kernel_path(arch);
+    let kernel = kernel.to_str().ok_or("invalid kernel path")?;
+    let drive = format!(
+        "if=none,file={},format=raw,cache=writeback,id=disk0",
+        disk_path().display()
+    );
+    let block_device = format!(
+        "virtio-blk-pci,drive=disk0,{},addr=2",
+        arch.virtio_pci_options()
+    );
+    let net_device = format!(
+        "virtio-net-pci,netdev=net0,{},addr=6,mac=52:54:00:12:34:56",
+        arch.virtio_pci_options()
+    );
+    let rng_device = format!(
+        "virtio-rng-pci,rng=rng0,{},addr=7",
+        arch.virtio_pci_options()
+    );
+    let mut command = qemu_command(arch, false);
+    command
+        .arg("-kernel")
+        .arg(kernel)
+        .arg("-drive")
+        .arg(drive)
+        .arg("-device")
+        .arg(block_device)
+        .arg("-netdev")
+        .arg(netdev)
+        .arg("-device")
+        .arg(net_device)
+        .args([
+            "-object",
+            "rng-random,filename=/dev/urandom,id=rng0",
+            "-device",
+        ])
+        .arg(rng_device);
+    run(&mut command)
+}
+
+fn run_qemu_gui(arch: Architecture) -> Result<(), String> {
     let port = env::var("GUI_PORT").unwrap_or_else(|_| "5900".into());
     let ssh_port = env::var("SSH_PORT").unwrap_or_else(|_| "2222".into());
     eprintln!("MicroSystem GUI: vnc://127.0.0.1:{port}");
@@ -559,56 +678,52 @@ fn run_qemu_gui() -> Result<(), String> {
     if qmp_socket.exists() {
         fs::remove_file(qmp_socket).map_err(|error| error.to_string())?;
     }
-    run(Command::new("qemu-system-aarch64").args([
-        "-machine",
-        "virt-7.2,virtualization=on,gic-version=3,iommu=smmuv3",
-        "-cpu",
-        "cortex-a72",
-        "-accel",
-        "tcg,thread=multi",
-        "-smp",
-        "2",
-        "-m",
-        "256M",
-        "-display",
-        "none",
-        "-vnc",
-        "0.0.0.0:0",
-        "-serial",
-        "stdio",
-        "-monitor",
-        "none",
-        "-qmp",
-        "unix:target/gui-qmp.sock,server=on,wait=off",
-        "-L",
-        "/usr/lib/ipxe/qemu",
-        "-no-reboot",
-        "-semihosting-config",
-        "enable=on,target=native",
-        "-kernel",
-        kernel_path().to_str().ok_or("invalid kernel path")?,
-        "-drive",
-        &format!(
-            "if=none,file={},format=raw,cache=writeback,id=disk0",
-            disk_path().display()
-        ),
-        "-device",
-        "virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on,romfile=,addr=2",
-        "-device",
-        "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,romfile=,addr=3",
-        "-device",
-        "virtio-keyboard-pci,disable-legacy=on,iommu_platform=on,romfile=,addr=4",
-        "-device",
-        "virtio-tablet-pci,disable-legacy=on,iommu_platform=on,romfile=,addr=5",
-        "-netdev",
-        &netdev,
-        "-device",
-        "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on,romfile=,addr=6,mac=52:54:00:12:34:56",
-        "-object",
-        "rng-random,filename=/dev/urandom,id=rng0",
-        "-device",
-        "virtio-rng-pci,rng=rng0,disable-legacy=on,romfile=,addr=7",
-    ]))
+    let kernel = kernel_path(arch);
+    let kernel = kernel.to_str().ok_or("invalid kernel path")?;
+    let drive = format!(
+        "if=none,file={},format=raw,cache=writeback,id=disk0",
+        disk_path().display()
+    );
+    let block_device = format!(
+        "virtio-blk-pci,drive=disk0,{},addr=2",
+        arch.virtio_pci_options()
+    );
+    let gpu_device = format!("virtio-gpu-pci,{},addr=3", arch.virtio_pci_options());
+    let keyboard_device = format!("virtio-keyboard-pci,{},addr=4", arch.virtio_pci_options());
+    let tablet_device = format!("virtio-tablet-pci,{},addr=5", arch.virtio_pci_options());
+    let net_device = format!(
+        "virtio-net-pci,netdev=net0,{},addr=6,mac=52:54:00:12:34:56",
+        arch.virtio_pci_options()
+    );
+    let rng_device = format!(
+        "virtio-rng-pci,rng=rng0,{},addr=7",
+        arch.virtio_pci_options()
+    );
+    let mut command = qemu_command(arch, true);
+    command
+        .arg("-kernel")
+        .arg(kernel)
+        .arg("-drive")
+        .arg(drive)
+        .arg("-device")
+        .arg(block_device)
+        .arg("-device")
+        .arg(gpu_device)
+        .arg("-device")
+        .arg(keyboard_device)
+        .arg("-device")
+        .arg(tablet_device)
+        .arg("-netdev")
+        .arg(netdev)
+        .arg("-device")
+        .arg(net_device)
+        .args([
+            "-object",
+            "rng-random,filename=/dev/urandom,id=rng0",
+            "-device",
+        ])
+        .arg(rng_device);
+    run(&mut command)
 }
 
 fn network_backend() -> String {
@@ -621,6 +736,7 @@ fn network_backend() -> String {
 }
 
 fn test() -> Result<(), String> {
+    Architecture::from_env()?;
     run(Command::new("cargo").args([
         "test",
         "-p",
@@ -662,8 +778,9 @@ fn test() -> Result<(), String> {
 }
 
 fn fsck() -> Result<(), String> {
+    let arch = Architecture::from_env()?;
     if !disk_path().exists() {
-        build()?;
+        build(arch)?;
     }
     run(Command::new("cargo").args([
         "run",
@@ -676,9 +793,9 @@ fn fsck() -> Result<(), String> {
     ]))
 }
 
-fn kernel_path() -> PathBuf {
+fn kernel_path(arch: Architecture) -> PathBuf {
     PathBuf::from("target")
-        .join(TARGET)
+        .join(arch.target())
         .join("release")
         .join("microsystem-kernel")
 }

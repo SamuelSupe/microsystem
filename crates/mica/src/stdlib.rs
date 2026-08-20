@@ -122,9 +122,9 @@ pub fn call(name: &str, arguments: &[Value]) -> Option<Result<Vec<Value>, ErrorV
         "string.trim" => unary_string(arguments, |value| {
             Ok(Value::String(value.trim().to_string()))
         }),
-        "string.starts_with" => string_predicate(arguments, |value, needle| {
-            value.starts_with(needle)
-        }),
+        "string.starts_with" => {
+            string_predicate(arguments, |value, needle| value.starts_with(needle))
+        }
         "string.ends_with" => string_predicate(arguments, |value, needle| value.ends_with(needle)),
         "string.replace" => string_replace(arguments),
         "string.collapse_space" => unary_string(arguments, |value| {
@@ -329,9 +329,9 @@ fn string_find(arguments: &[Value]) -> Result<Vec<Value>, ErrorValue> {
         .nth(start.saturating_sub(1))
         .map(|(index, _)| index)
         .unwrap_or(value.len());
-    let found = value[byte_start..].find(needle).map(|offset| {
-        value[..byte_start + offset].chars().count() as i64 + 1
-    });
+    let found = value[byte_start..]
+        .find(needle)
+        .map(|offset| value[..byte_start + offset].chars().count() as i64 + 1);
     Ok(alloc::vec![found.map(Value::Integer).unwrap_or(Value::Nil)])
 }
 fn string_predicate(
@@ -357,9 +357,14 @@ fn string_replace(arguments: &[Value]) -> Result<Vec<Value>, ErrorValue> {
         .and_then(|bytes| bytes.checked_add(matches.saturating_mul(replacement.len())))
         .ok_or_else(|| ErrorValue::new("limit", "replacement result is too large"))?;
     if bytes > MAX_RESULT_BYTES {
-        return Err(ErrorValue::new("limit", "replacement result exceeds 256 KiB"));
+        return Err(ErrorValue::new(
+            "limit",
+            "replacement result exceeds 256 KiB",
+        ));
     }
-    Ok(alloc::vec![Value::String(value.replace(needle, replacement))])
+    Ok(alloc::vec![Value::String(
+        value.replace(needle, replacement)
+    )])
 }
 fn table_insert(arguments: &[Value]) -> Result<Vec<Value>, ErrorValue> {
     let Some(Value::Table(entries)) = arguments.first() else {

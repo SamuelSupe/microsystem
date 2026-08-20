@@ -1,7 +1,7 @@
 use microsystem_abi::{Status, gui};
 use microsystem_gui::{
-    desktop_icon_at, Desktop, DESKTOP_ICON_SIZE, DESKTOP_ICON_TOP, DESKTOP_ICONS, MIN_HEIGHT,
-    MIN_WIDTH, TASKBAR_HEIGHT, WindowState,
+    DESKTOP_ICON_SIZE, DESKTOP_ICON_TOP, DESKTOP_ICONS, Desktop, MIN_HEIGHT, MIN_WIDTH,
+    TASKBAR_HEIGHT, WindowState, desktop_icon_at,
 };
 
 fn rect(x: i32, y: i32, width: u32, height: u32) -> gui::Rect {
@@ -184,7 +184,10 @@ fn desktop_icons_hit_only_inside_their_fixed_bounds() {
     for icon in DESKTOP_ICONS {
         let right = icon.rect.x + DESKTOP_ICON_SIZE - 1;
         let bottom = icon.rect.y + DESKTOP_ICON_SIZE - 1;
-        assert_eq!(desktop_icon_at(icon.rect.x, icon.rect.y), Some(icon.application));
+        assert_eq!(
+            desktop_icon_at(icon.rect.x, icon.rect.y),
+            Some(icon.application)
+        );
         assert_eq!(desktop_icon_at(right, bottom), Some(icon.application));
         assert_eq!(desktop_icon_at(icon.rect.x - 1, icon.rect.y), None);
         assert_eq!(desktop_icon_at(right + 1, icon.rect.y), None);
@@ -196,5 +199,8 @@ fn desktop_icons_hit_only_inside_their_fixed_bounds() {
         None,
         "the four-pixel gap between icons must not launch a neighboring app"
     );
-    assert_eq!(desktop_icon_at(16, DESKTOP_ICON_TOP + DESKTOP_ICON_SIZE), None);
+    assert_eq!(
+        desktop_icon_at(16, DESKTOP_ICON_TOP + DESKTOP_ICON_SIZE),
+        None
+    );
 }

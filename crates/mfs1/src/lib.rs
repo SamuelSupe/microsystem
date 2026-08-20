@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -37,6 +37,8 @@ const FEATURE_SEGMENT_LAYOUT: u32 = 1 << 0;
 const FEATURE_SEGMENT_DIRECTORY: u32 = 1 << 1;
 const KNOWN_FEATURES: u32 = FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY;
 const MAX_SEGMENTS: usize = 128;
+const MAX_PATH_BYTES: usize = 255;
+const MAX_MATERIALIZED_PATHS: usize = 4096;
 const DIRECTORY_OFFSET: usize = 64;
 const DIRECTORY_ENTRY_OFFSET: usize = DIRECTORY_OFFSET + 4;
 const DIRECTORY_CRC_OFFSET: usize = BLOCK_SIZE - 4;
@@ -521,7 +523,13 @@ impl<D: BlockDevice> FileSystem<D> {
         if matches!(self.view(&path), Some(NodeView::Directory)) {
             return Err(Error::IsDirectory);
         }
-        self.dirty.push(Mutation::Put(path, data.to_vec()));
+        let mut contents = Vec::new();
+        contents
+            .try_reserve_exact(data.len())
+            .map_err(|_| Error::NoSpace)?;
+        contents.extend_from_slice(data);
+        self.dirty.try_reserve(1).map_err(|_| Error::NoSpace)?;
+        self.dirty.push(Mutation::Put(path, contents));
         Ok(())
     }
 
@@ -538,7 +546,20 @@ impl<D: BlockDevice> FileSystem<D> {
     pub fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
         let path = normalize(path)?;
         match self.view(&path) {
-            Some(NodeView::File(data)) => Ok(data.to_vec()),
+            Some(NodeView::File(data)) => copy_bytes(data),
+            Some(NodeView::Directory) => Err(Error::IsDirectory),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    pub fn read_range(&self, path: &str, offset: usize, maximum: usize) -> Result<Vec<u8>, Error> {
+        let path = normalize(path)?;
+        match self.view(&path) {
+            Some(NodeView::File(data)) => {
+                let start = offset.min(data.len());
+                let end = start.saturating_add(maximum).min(data.len());
+                copy_bytes(&data[start..end])
+            }
             Some(NodeView::Directory) => Err(Error::IsDirectory),
             None => Err(Error::NotFound),
         }
@@ -558,7 +579,10 @@ impl<D: BlockDevice> FileSystem<D> {
         if !matches!(self.view(&path), Some(NodeView::Directory)) {
             return Err(Error::NotDirectory);
         }
-        let paths = self.materialized_paths();
+        if self.entries.len().saturating_add(self.dirty.len()) > MAX_MATERIALIZED_PATHS {
+            return Err(Error::NoSpace);
+        }
+        let paths = self.materialized_paths()?;
         let prefix = if path == "/" {
             "/".to_string()
         } else {
@@ -571,7 +595,8 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             let rest = &candidate[prefix.len()..];
             if !rest.is_empty() && !rest.contains('/') {
-                result.push(candidate.clone());
+                result.try_reserve(1).map_err(|_| Error::NoSpace)?;
+                result.push(copy_string(candidate)?);
             }
         }
         Ok(result)
@@ -586,11 +611,7 @@ impl<D: BlockDevice> FileSystem<D> {
             && to
                 .strip_prefix(&from)
                 .is_some_and(|suffix| suffix.starts_with('/'));
-        if from == "/"
-            || source.is_none()
-            || self.view(&to).is_some()
-            || moves_into_self
-        {
+        if from == "/" || source.is_none() || self.view(&to).is_some() || moves_into_self {
             return Err(Error::Invalid);
         }
         self.require_parent(&to)?;
@@ -999,35 +1020,49 @@ impl<D: BlockDevice> FileSystem<D> {
         })
     }
 
-    fn materialized_paths(&self) -> BTreeSet<String> {
-        let mut paths = self.entries.keys().cloned().collect::<BTreeSet<_>>();
+    fn materialized_paths(&self) -> Result<Vec<String>, Error> {
+        if self.entries.len() > MAX_MATERIALIZED_PATHS {
+            return Err(Error::NoSpace);
+        }
+        let mut paths = Vec::new();
+        paths
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::NoSpace)?;
+        for path in self.entries.keys() {
+            paths.push(copy_string(path)?);
+        }
         for mutation in &self.dirty {
             match mutation {
                 Mutation::Put(path, _) | Mutation::Mkdir(path) => {
-                    paths.insert(path.clone());
+                    if !paths.contains(path) {
+                        if paths.len() == MAX_MATERIALIZED_PATHS {
+                            return Err(Error::NoSpace);
+                        }
+                        paths.try_reserve(1).map_err(|_| Error::NoSpace)?;
+                        paths.push(copy_string(path)?);
+                    }
                 }
                 Mutation::Remove(path) => {
                     paths.retain(|candidate| subtree_suffix(candidate, path).is_none());
                 }
                 Mutation::Rename(from, to) => {
-                    let moved = paths
-                        .iter()
-                        .filter_map(|candidate| {
-                            subtree_suffix(candidate, from).map(|suffix| {
-                                let mut destination = to.clone();
-                                destination.push_str(suffix);
-                                (candidate.clone(), destination)
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    for (source, destination) in moved {
-                        paths.remove(&source);
-                        paths.insert(destination);
+                    for candidate in &mut paths {
+                        let Some(suffix) = subtree_suffix(candidate, from) else {
+                            continue;
+                        };
+                        let mut destination = copy_string(to)?;
+                        destination
+                            .try_reserve_exact(suffix.len())
+                            .map_err(|_| Error::NoSpace)?;
+                        destination.push_str(suffix);
+                        *candidate = destination;
                     }
+                    paths.sort_unstable();
+                    paths.dedup();
                 }
             }
         }
-        paths
+        Ok(paths)
     }
 }
 
@@ -1796,6 +1831,24 @@ fn subtree_suffix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
         .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
+fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| Error::NoSpace)?;
+    output.extend_from_slice(bytes);
+    Ok(output)
+}
+
+fn copy_string(value: &str) -> Result<String, Error> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| Error::NoSpace)?;
+    output.push_str(value);
+    Ok(output)
+}
+
 fn normalize(path: &str) -> Result<String, Error> {
     if !path.starts_with('/') || path.as_bytes().contains(&0) {
         return Err(Error::Invalid);
@@ -1809,6 +1862,13 @@ fn normalize(path: &str) -> Result<String, Error> {
             return Err(Error::Invalid);
         }
         if component.len() > 255 {
+            return Err(Error::NameTooLong);
+        }
+        if result
+            .len()
+            .checked_add(component.len() + 1)
+            .is_none_or(|length| length > MAX_PATH_BYTES)
+        {
             return Err(Error::NameTooLong);
         }
         result.push('/');

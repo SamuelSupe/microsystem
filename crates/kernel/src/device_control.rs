@@ -63,13 +63,20 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     let irq = platform
         .intx_irq(device.slot, pin)
         .ok_or(Status::NotFound)?;
-    arch::aarch64::bind_device_irq(platform.gicd_base, irq, transport.isr)
-        .map_err(|_| Status::Io)?;
+    #[cfg(target_arch = "aarch64")]
+    let irq_result = arch::selected::bind_device_irq(platform.gicd_base, irq, transport.isr);
+    #[cfg(target_arch = "riscv64")]
+    let irq_result = arch::selected::bind_device_irq(platform.plic_base, irq, transport.isr);
+    irq_result.map_err(|_| Status::Io)?;
 
     let requester_id = device.requester_id();
     let stream_id = platform.stream_id(requester_id).ok_or(Status::NotFound)?;
+    #[cfg(target_arch = "aarch64")]
+    let iommu_base = platform.smmu_base;
+    #[cfg(target_arch = "riscv64")]
+    let iommu_base = platform.riscv_iommu_base;
     let domain = smmu::create_domain(
-        platform.smmu_base,
+        iommu_base,
         stream_id,
         transport.queue_physical(),
         transport.data_physical(),
@@ -86,8 +93,13 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
         crate::input::activate(platform).map_err(|_| Status::Io)?;
         crate::service_runtime::enable_gui_services();
     }
+    #[cfg(target_arch = "aarch64")]
+    let iommu_name = "SMMUv3";
+    #[cfg(target_arch = "riscv64")]
+    let iommu_name = "RISC-V";
     kprintln!(
-        "[iommu] SMMUv3 domain stream-id={:#x} iova={:#x} idr0={:#x} idr5={:#x} gerror={:#x} cmdq=true",
+        "[iommu] {} domain stream-id={:#x} iova={:#x} idr0={:#x} idr5={:#x} gerror={:#x} cmdq=true",
+        iommu_name,
         domain.stream_id,
         domain.iova,
         domain.idr0,
@@ -101,9 +113,37 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
         .map_err(|_| Status::Io)?;
     kprintln!("[virtio] EL1 isolation queue armed; block data I/O delegated to EL0");
     let probe = transport.probe_dma_fault(domain.probe_iova());
-    let event = domain.take_fault().ok_or(Status::Io)?;
-    let blocked =
-        event.event_type == 0x10 && event.address == probe.attempted_iova && probe.sentinel_intact;
+    let mut event = domain.take_fault();
+    for _ in 0..100_000 {
+        if event.is_some() {
+            break;
+        }
+        core::hint::spin_loop();
+        event = domain.take_fault();
+    }
+    #[cfg(target_arch = "riscv64")]
+    if event.is_none() {
+        let diagnostics = domain.fault_diagnostics();
+        kprintln!(
+            "[iommu] fault-probe missing sentinel={} iova={:#x} completion-error={} fqh={:#x} fqt={:#x} fqcsr={:#x} ipsr={:#x} ddtp={:#x}",
+            probe.sentinel_intact,
+            probe.attempted_iova,
+            probe.completion_error,
+            diagnostics.head,
+            diagnostics.tail,
+            diagnostics.csr,
+            diagnostics.ipsr,
+            diagnostics.ddtp
+        );
+    }
+    let event = event.ok_or(Status::Io)?;
+    #[cfg(target_arch = "aarch64")]
+    let expected_fault = 0x10;
+    #[cfg(target_arch = "riscv64")]
+    let expected_fault = 0x0f;
+    let blocked = event.event_type == expected_fault
+        && event.address == probe.attempted_iova
+        && probe.sentinel_intact;
     kprintln!(
         "[iommu] fault-probe blocked={} sentinel={} event={:#x} stream-id={:#x} iova={:#x} completion-error={}",
         blocked,
@@ -116,12 +156,24 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     if !blocked {
         return Err(Status::Io);
     }
+    transport.reset_for_user(platform.pcie_base, device);
+    #[cfg(target_arch = "riscv64")]
+    {
+        let drained = domain.drain_faults();
+        kprintln!("[iommu] fault queue residual-drained={}", drained);
+    }
+    #[cfg(target_arch = "aarch64")]
     kprintln!(
         "[irq] virtio-blk INTx pin={} gic-id={} bound cpu0",
         pin,
         irq
     );
-    transport.reset_for_user(platform.pcie_base, device);
+    #[cfg(target_arch = "riscv64")]
+    kprintln!(
+        "[irq] virtio-blk INTx pin={} plic-id={} bound cpu0",
+        pin,
+        irq
+    );
     kprintln!("[virtio] boot probe reset; EL0 devmgr owns PCI discovery, BARs and features");
 
     Ok(transport.user_grant(domain.iova, device.config_physical(platform.pcie_base)))

@@ -298,7 +298,7 @@ fn read_font_range(offset: u64, output: &mut [u8]) -> Result<(), Status> {
             FILESYSTEM_SHARED_VA as *mut u8,
             UNIFONT_PATH.len(),
         );
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     let mut request = Message::new(
         protocol::FILESYSTEM,
@@ -313,7 +313,7 @@ fn read_font_range(offset: u64, output: &mut [u8]) -> Result<(), Status> {
         return Err(Status::Io);
     }
     unsafe {
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
         core::ptr::copy_nonoverlapping(
             FILESYSTEM_SHARED_VA as *const u8,
             output.as_mut_ptr(),
@@ -1191,7 +1191,7 @@ fn snapshot_display_list(
     };
     let snapshot = &mut display_staging[..bytes];
     snapshot.copy_from_slice(source);
-    unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+    microsystem_user_rt::fence();
     let second = dynamic_present_header(index);
     if first != second || display_hash(snapshot) != first.payload_hash {
         return Err(Status::Busy);
@@ -1382,7 +1382,7 @@ fn write_event(
         + slot as usize * core::mem::size_of::<gui::Event>()) as *mut gui::Event;
     unsafe {
         core::ptr::write_volatile(pointer, event);
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     header.head = header.head.wrapping_add(1);
     microsystem_user_rt::notification_signal(clients[index].notification, script::EVENT_GUI)
@@ -2805,7 +2805,7 @@ fn pack_terminal_text(message: &mut Message, text: &[u8]) {
     let length = text.len().min(TERMINAL_SHARED_BYTES);
     unsafe {
         core::ptr::copy_nonoverlapping(text.as_ptr(), TERMINAL_SHARED_VA as *mut u8, length);
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     message.words[0] = length as u64;
     message.words[4] = TERMINAL_SHARED_MAGIC;
@@ -2817,7 +2817,7 @@ fn unpack_terminal_text(message: &Message) -> Option<&[u8]> {
         if length > TERMINAL_SHARED_BYTES {
             return None;
         }
-        unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+        microsystem_user_rt::fence();
         return Some(unsafe {
             core::slice::from_raw_parts(TERMINAL_SHARED_VA as *const u8, length)
         });

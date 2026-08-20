@@ -8,9 +8,18 @@ use microsystem_abi::{
 use microsystem_console::{INLINE_BYTES, Operation};
 
 const DATA: usize = 0x00;
+#[cfg(target_arch = "aarch64")]
 const FLAGS: usize = 0x18;
+#[cfg(target_arch = "aarch64")]
 const RX_EMPTY: u32 = 1 << 4;
+#[cfg(target_arch = "aarch64")]
 const TX_FULL: u32 = 1 << 5;
+#[cfg(target_arch = "riscv64")]
+const LINE_STATUS: usize = 0x05;
+#[cfg(target_arch = "riscv64")]
+const RX_READY: u8 = 1 << 0;
+#[cfg(target_arch = "riscv64")]
+const TX_READY: u8 = 1 << 5;
 const REVOCATION_PROBE_VA: u64 = 0x0058_0000;
 
 #[unsafe(no_mangle)]
@@ -185,22 +194,40 @@ fn words_as_bytes(words: &[u64]) -> &[u8] {
 }
 
 fn put(uart: usize, byte: u8) {
+    #[cfg(target_arch = "aarch64")]
     while read32(uart + FLAGS) & TX_FULL != 0 {
+        core::hint::spin_loop();
+    }
+    #[cfg(target_arch = "riscv64")]
+    while read8(uart + LINE_STATUS) & TX_READY == 0 {
         core::hint::spin_loop();
     }
     unsafe { core::ptr::write_volatile((uart + DATA) as *mut u8, byte) };
 }
 
 fn get(uart: usize) -> Option<u8> {
+    #[cfg(target_arch = "aarch64")]
     if read32(uart + FLAGS) & RX_EMPTY != 0 {
         None
     } else {
         Some(unsafe { core::ptr::read_volatile((uart + DATA) as *const u8) })
     }
+    #[cfg(target_arch = "riscv64")]
+    if read8(uart + LINE_STATUS) & RX_READY == 0 {
+        None
+    } else {
+        Some(read8(uart + DATA))
+    }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn read32(address: usize) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn read8(address: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(address as *const u8) }
 }
 
 #[panic_handler]

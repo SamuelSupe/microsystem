@@ -68,16 +68,18 @@ accent outline, while selected list rows use the dark accent fill. These are
 renderer-level visuals only; the GUI ABI, launch endpoint, capability boundary
 and validated display-list commands remain unchanged.
 
-The Terminal command surface is `ls [path]`, `cat <path>`, `stat <path>`,
-`write <path> <text>`, `mkdir <path>`, `mv <source> <destination>`,
-`rm <path>` and `sync`. Paths are absolute and there is no working-directory
+The Terminal command surface is `ls/list [path]`, `cat/read <path>`,
+`stat <path>`, `touch/create <path>`, `cp <source> <destination>`,
+`write <path> <text>`, `mkdir <path>`, `rmdir <path>`,
+`mv/rename <source> <destination>`, `rm/remove/unlink <path>`, `fsync <path>`
+and `sync`. Paths are absolute and there is no working-directory
 state. Terminal sends filesystem requests through its dedicated
 `TERMINAL_FILESYSTEM_ENDPOINT` and the `GUI_TERMINAL_COMMANDS` 4 KiB shared
 frame; the MFS broker maps that frame at a terminal-only path boundary, separate
 from block DMA and other filesystem payload frames. Each command is limited to
 512 bytes and replies/output to 4 KiB, with the console viewport following the
-newest lines. The serial shell parser covers the same `stat`, `mv` and `rm`
-forms; its targeted parser suite passed 2/2.
+newest lines. The serial shell and GUI terminal share the same filesystem
+parser and aliases.
 
 The materialized-paths review also tightened redraw and event behavior without
 changing the GUI wire contract: windowd dirty-region culling skips

@@ -429,7 +429,7 @@ fn verify_p384_signature(
     transcript: HandshakeHash,
     verify: CertificateVerifyRef<'_>,
 ) -> Result<(), TlsError> {
-    use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
     let public_key = VerifyingKey::from_sec1_bytes(certificate_public_key(certificate)?)
         .map_err(|_| TlsError::DecodeError)?;
@@ -448,7 +448,7 @@ fn verify_rsa_signature(
     transcript: HandshakeHash,
     verify: CertificateVerifyRef<'_>,
 ) -> Result<(), TlsError> {
-    use rsa::{pkcs1::DecodeRsaPublicKey, signature::Verifier, RsaPublicKey};
+    use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, signature::Verifier};
 
     let public_key = RsaPublicKey::from_pkcs1_der(certificate_public_key(certificate)?)
         .map_err(|_| TlsError::DecodeError)?;

@@ -388,9 +388,28 @@ fn handle_time(request: &Message, reply: &mut Message) -> Status {
 }
 
 fn start_service(name: &str, expected_pid: u64) {
-    if microsystem_user_rt::thread_start(program_id(name)).ok() != Some(expected_pid) {
-        microsystem_user_rt::exit(20);
+    match microsystem_user_rt::thread_start(program_id(name)) {
+        Ok(pid) if pid == expected_pid => return,
+        Ok(pid) => {
+            let _ = microsystem_user_rt::debug_write(b"[service] start failed name=");
+            let _ = microsystem_user_rt::debug_write(name.as_bytes());
+            let _ = microsystem_user_rt::debug_write_u64(
+                b" expected-pid=",
+                expected_pid,
+                b" actual-pid=",
+            );
+            let _ = microsystem_user_rt::debug_write_u64(b"", pid, b"\n");
+        }
+        Err(status) => {
+            let _ = microsystem_user_rt::debug_write(b"[service] start failed name=");
+            let _ = microsystem_user_rt::debug_write(name.as_bytes());
+            let _ =
+                microsystem_user_rt::debug_write_u64(b" expected-pid=", expected_pid, b" status=-");
+            let _ =
+                microsystem_user_rt::debug_write_u64(b"", (status as i64).unsigned_abs(), b"\n");
+        }
     }
+    microsystem_user_rt::exit(20);
 }
 
 fn verify_process_kill() {
@@ -877,7 +896,7 @@ fn handle_script(request: &Message, reply: &mut Message) -> Status {
                                         .cast::<microsystem_abi::ProcessInfoV2>(),
                                     info,
                                 );
-                                core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+                                microsystem_user_rt::fence();
                             }
                             reply.words[0] =
                                 core::mem::size_of::<microsystem_abi::ProcessInfoV2>() as u64;
@@ -1531,7 +1550,7 @@ fn reap_script_sessions() {
         let close_requested =
             microsystem_user_rt::frame_map(events, script::GUI_EVENT_VA, Rights::READ).is_ok_and(
                 |()| {
-                    unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+                    microsystem_user_rt::fence();
                     let header =
                         unsafe { &*(script::GUI_EVENT_VA as *const gui::EventRingHeaderV1) };
                     let requested = header.magic == gui::EVENT_MAGIC

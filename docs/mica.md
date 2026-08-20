@@ -425,8 +425,24 @@ mica --gui --timeout 86400s --allow gui.window /mica/gui-counter.mica
 
 The Mica file command must name an existing MFS path and its manifest is
 intersected with the launcher policy. `run mica` prints `run: mica: not found`.
-The serial shell itself also exposes `help`, `ps`, `uptime`, `ls`, `cat`,
-`write`, `mkdir`, `run`, `sync` and `shutdown`.
+The serial shell itself also exposes `help`, `ps`, `uptime`, the complete
+filesystem command set (`ls/list`, `cat/read`, `stat`, `touch/create`, `cp`,
+`write`, `mkdir`, `rmdir`, `mv/rename`, `rm/remove/unlink`, `fsync`, `sync`),
+`run`, `mica` and `shutdown`. Filesystem commands accept the same forms under
+the explicit `fs` namespace, such as `fs stat /data/file`.
+
+The serial shell also exposes a bounded curl-like GET client:
+
+```text
+curl -i https://example.com/
+curl -s -o /data/response https://example.com/
+```
+
+It accepts HTTP/HTTPS URLs, reuses Mica's `net.browse` and TLS policy path, and
+can atomically save a response with `-o`/`--output`. Responses are limited to
+32 KiB; console output is UTF-8 only. This is intentionally a shell GET tool,
+not a full POSIX `curl` implementation (no POST, redirects, or arbitrary
+headers).
 
 SSH uses the generated Ed25519 key and the fixed user `micro`:
 

@@ -3,11 +3,12 @@ set -Eeuo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/qemu-arch.sh"
 
-timeout_seconds="${MICROSYSTEM_MICA_QEMU_TIMEOUT:-90}"
+timeout_seconds="${MICROSYSTEM_MICA_QEMU_TIMEOUT:-180}"
 input_settle="${MICROSYSTEM_MICA_INPUT_SETTLE:-0.15}"
-stage_timeout="${MICROSYSTEM_MICA_STAGE_TIMEOUT:-25}"
-combo_timeout="${MICROSYSTEM_MICA_COMBO_TIMEOUT:-45}"
+stage_timeout="${MICROSYSTEM_MICA_STAGE_TIMEOUT:-60}"
+combo_timeout="${MICROSYSTEM_MICA_COMBO_TIMEOUT:-90}"
 log_file="${MICROSYSTEM_MICA_QEMU_LOG:-$repo_root/target/mica-qemu.log}"
 fixture_http_port="${MICROSYSTEM_MICA_HTTP_PORT:-18080}"
 fixture_tcp_port="${MICROSYSTEM_MICA_TCP_PORT:-18082}"
@@ -38,6 +39,7 @@ if [[ ! -f /.dockerenv && "${MICROSYSTEM_IN_CONTAINER:-0}" != "1" ]]; then
   image="${IMAGE:-microsystem-dev:rust-1.97.1}"
   inner_log="/workspace/target/$(basename -- "$log_file")"
   exec docker run --rm -i --init \
+    -e ARCH="$MICROSYSTEM_ARCH" \
     -e RUSTUP_TOOLCHAIN=1.97.1 \
     -e MICROSYSTEM_IN_CONTAINER=1 \
     -e MICROSYSTEM_MICA_QEMU_TIMEOUT="$timeout_seconds" \
@@ -49,7 +51,7 @@ if [[ ! -f /.dockerenv && "${MICROSYSTEM_IN_CONTAINER:-0}" != "1" ]]; then
     -v "$repo_root:/workspace" -w /workspace "$image" bash scripts/mica-qemu.sh
 fi
 
-for command_name in cargo qemu-system-aarch64 timeout python3; do
+for command_name in cargo "$MICROSYSTEM_QEMU_BINARY" timeout python3; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "mica-qemu: $command_name is required inside the OrbStack container" >&2
     exit 2
@@ -63,7 +65,7 @@ if [[ "$tls_fixture" == 1 ]]; then
     fi
   done
 fi
-if [[ ! -f target/aarch64-unknown-none-softfloat/release/microsystem-kernel ||
+if [[ ! -f "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" ||
       ! -f build/microsystem.img || ! -x target/release/mfsctl ]]; then
   echo "mica-qemu: build artifacts are missing; run make build first" >&2
   exit 2
@@ -111,8 +113,8 @@ cleanup() {
   fi
   if [[ "$artifact_backed_up" == 1 && -d "$artifact_backup_dir" ]]; then
     for artifact in \
-      target/aarch64-unknown-none-softfloat/release/microsystem-mica-service \
-      target/aarch64-unknown-none-softfloat/release/microsystem-kernel \
+      "target/$MICROSYSTEM_TARGET/release/microsystem-mica-service" \
+      "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
       build/bootfs.cpio \
       build/ca-bundle.derpack; do
       backup="$artifact_backup_dir/$(basename -- "$artifact")"
@@ -152,8 +154,8 @@ if [[ "$tls_fixture" == 1 ]]; then
   fi
   mkdir -p "$artifact_backup_dir"
   for artifact in \
-    target/aarch64-unknown-none-softfloat/release/microsystem-mica-service \
-    target/aarch64-unknown-none-softfloat/release/microsystem-kernel \
+    "target/$MICROSYSTEM_TARGET/release/microsystem-mica-service" \
+    "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
     build/bootfs.cpio \
     build/ca-bundle.derpack; do
     cp "$artifact" "$artifact_backup_dir/$(basename -- "$artifact")"
@@ -274,7 +276,7 @@ PY
     exit 1
   fi
   if ! python3 - \
-    target/aarch64-unknown-none-softfloat/release/microsystem-kernel \
+    "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
     "$production_bundle_hash" "$test_bundle_hash" <<'PY'
 from pathlib import Path
 import sys
@@ -614,7 +616,7 @@ fi
 send_input() {
   log_count() {
     local pattern="$1"
-    grep -Eo -- "$pattern" "$log_file" 2>/dev/null | wc -l | tr -d ' '
+    { grep -Eo -- "$pattern" "$log_file" 2>/dev/null || true; } | wc -l | tr -d ' '
   }
   standalone_42_count() {
     tr -d '\r' <"$log_file" | awk '$0 == "42" { count += 1 } END { print count + 0 }'
@@ -678,9 +680,21 @@ send_input() {
   wait_for_count 'mica:[[:space:]]+pid=[0-9]+[[:space:]]+status=0' 3 combo-status || return 1
   wait_for_count 'micro>[[:space:]]' 4 combo-prompt || return 1
 
+  send_line "curl -i http://10.0.2.2:$fixture_http_port/index.txt?curl=stdout"
+  wait_for_count 'HTTP status=200' 1 curl-status || return 1
+  wait_for_count 'mica-http-ok' 1 curl-body || return 1
+  wait_for_count 'micro>[[:space:]]' 5 curl-prompt || return 1
+
+  send_line "curl -s -o /mica/curl.txt http://10.0.2.2:$fixture_http_port/index.txt?curl=file"
+  wait_for_count 'curl:[[:space:]]+saved[[:space:]]+/mica/curl.txt' 1 curl-save || return 1
+  wait_for_count 'micro>[[:space:]]' 6 curl-save-prompt || return 1
+  send_line 'cat /mica/curl.txt'
+  wait_for_count 'mica-http-ok' 2 curl-file-body || return 1
+  wait_for_count 'micro>[[:space:]]' 7 curl-file-prompt || return 1
+
   send_line 'run mica'
   wait_for_count 'run:[[:space:]]+mica:[[:space:]]+not[[:space:]]+found' 1 run-rejection || return 1
-  wait_for_count 'micro>[[:space:]]' 5 run-prompt || return 1
+  wait_for_count 'micro>[[:space:]]' 8 run-prompt || return 1
   send_line 'shutdown'
   wait_for_count '\[system\][[:space:]]+shutdown' 1 shutdown || return 1
 }
@@ -717,6 +731,8 @@ required_markers=(
   "mica>[[:space:]]+"
   "print\(6[[:space:]]+\*[[:space:]]+7\)"
   "run:[[:space:]]+mica:[[:space:]]+not[[:space:]]+found"
+  "HTTP[[:space:]]+status=200"
+  "curl:[[:space:]]+saved[[:space:]]+/mica/curl.txt"
   "mica-combo[[:space:]]+args=alpha,beta[[:space:]]+module-cache=true[[:space:]]+fs-permission-denied=true[[:space:]]+fs-atomic=true[[:space:]]+dns=true[[:space:]]+tcp=true[[:space:]]+udp=true[[:space:]]+http=true[[:space:]]+browse=true[[:space:]]+browse-resolve-denied=true[[:space:]]+browse-raw-denied=true[[:space:]]+browse-udp-denied=true[[:space:]]+browse-post-denied=true"
 )
 if [[ "$tls_fixture" == 1 ]]; then
@@ -753,6 +769,12 @@ if ((${#missing[@]} != 0)); then
 fi
 if ! grep -Fq -- "http GET /index.txt?browse=1" "$fixture_log"; then
   echo "mica-qemu: browse GET query/fragment contract missing from HTTP fixture log" >&2
+  tail -n 80 "$fixture_log" >&2 || true
+  exit 1
+fi
+if ! grep -Fq -- "http GET /index.txt?curl=stdout" "$fixture_log" \
+  || ! grep -Fq -- "http GET /index.txt?curl=file" "$fixture_log"; then
+  echo "mica-qemu: curl GET fixture requests missing" >&2
   tail -n 80 "$fixture_log" >&2 || true
   exit 1
 fi

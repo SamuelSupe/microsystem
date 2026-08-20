@@ -1,17 +1,71 @@
 # Architecture
 
-MicroSystem targets the QEMU `virt-7.2` AArch64 machine used by the OrbStack
-gates: two CPUs, 4 KiB pages and 256 MiB RAM. The kernel consumes the DTB for
-UART, GICv3, PCIe, SMMUv3, VirtIO and PL031 addresses; device policy is not
-encoded as a portable Linux device model.
+MicroSystem targets QEMU `virt` profiles on AArch64 and RV64GC. The AArch64
+profile uses `virt-7.2`, two CPUs, 4 KiB pages and 256 MiB RAM; the RISC-V
+profile uses RV64GC, two harts and QEMU `virt`. Each kernel consumes the DTB for
+its UART, interrupt controller, PCIe/VirtIO and IOMMU resources; device policy
+is not encoded as a portable Linux device model.
+
+## Target status and validation
+
+The RV64GC path is implemented and has current QEMU `virt` serial evidence. Its
+validated chain is RV64GC → QEMU `virt` → OpenSBI M-mode → S-mode → Sv39 → two
+harts → PLIC/SBI timer and interrupt services → PCI VirtIO → RISC-V IOMMU. The
+serial run reaches `[system] shutdown`.
+
+The IOMMU fault gate records
+`blocked=true sentinel=true event=0xf stream-id=0x10 completion-error=false`.
+The same run verifies DMA map/unmap, RNG first-fill, MFS recovery with clean
+`fsck`, the complete serial-shell filesystem command matrix, the Mica 8 KiB
+argument/input path, and network/DNS. The AArch64 build and serial run also
+reach shutdown. The `make test` log's built-in host suites total `81/81`
+(`22+9+6+9+11+24`); a separate shell-parser run adds `6/6`, for `87/87`
+combined recorded host checks. `make test` itself is not being described as
+`87`.
+
+`ARCH=riscv64` selects this validated RISC-V target/QEMU path. The command shape
+is:
+
+```sh
+ARCH=riscv64 cargo build --release \
+  --target riscv64gc-unknown-none-elf \
+  -p microsystem-kernel --features baremetal
+ARCH=riscv64 qemu-system-riscv64 \
+  -machine virt,iommu-sys=on -bios default -cpu rv64 \
+  -kernel target/riscv64gc-unknown-none-elf/release/microsystem-kernel \
+  -nographic
+```
+
+This is a guest run with serial and IOMMU evidence, not a build-only result.
+
+### QEMU virt/OpenSBI/S-mode contract
+
+For a RISC-V `virt` bring-up, `-bios default` means that QEMU selects its
+default OpenSBI firmware; no OpenSBI binary is checked into this repository.
+OpenSBI owns M-mode and hands the kernel an S-mode entry plus the machine DTB.
+The kernel uses SBI services where firmware owns hart start, timer/IPI or reset
+operations and does not assume direct M-mode control or an AArch64 EL1 entry
+contract. The validated run uses the default firmware path.
+
+The RISC-V path has separate DTB-discovered NS16550/Goldfish RTC,
+CLINT/ACLINT, PLIC, Sv39, supervisor-trap, SBI, dual-hart context-switch,
+PCI VirtIO, and RISC-V IOMMU command/device/fault queue code. The IOMMU
+fault-probe marker above confirms blocked DMA reaches the expected sentinel
+without a completion error.
+
+Evidence remains profile-specific: the listed RISC-V gates are current QEMU
+evidence, while the exact `make ARCH=aarch64 test` and
+`make ARCH=riscv64 test` full matrices remain `validation in progress`.
 
 ## Boot and address spaces
 
-EL1 validates the DTB, installs the high-half/MMU mappings, initializes the
-GICv3 timer (5 ms slice), discovers VirtIO PCI and creates the bounded SMMUv3
-domain. It prepares init/root and one idle task per CPU. Init then starts
-resident EL0 services by bootfs name; each service is re-parsed as a static
-ELF64 `ET_EXEC` image with page-granular W^X checks.
+On AArch64, EL1 validates the DTB, installs the high-half/MMU mappings,
+initializes the GICv3 timer (5 ms slice), discovers VirtIO PCI and creates the
+bounded SMMUv3 domain. On RISC-V, S-mode performs the corresponding DTB,
+Sv39, PLIC/SBI, PCI VirtIO and RISC-V IOMMU setup. Both paths prepare init/root
+and one idle task per CPU/hart; init then starts resident EL0 services by bootfs
+name, and each service is re-parsed as a static ELF64 `ET_EXEC` image with
+page-granular W^X checks.
 
 The bootfs has 24 entries (23 static ELF files and `etc/services`).
 `SERVICE_COUNT=12` and the service order is:
@@ -159,9 +213,12 @@ unified smoke marker was:
 [sched] fp-simd context-isolation=true tasks=2 context-switches=20 checks=[603697,686002] mismatches=[0,0] q-regs=q0-q31 fpcr-fpsr=true signatures=[0x11,0x22]
 ```
 
-The marker and the host 81/81 result are from
+The marker is from the retained AArch64 run. The `make test` log contains
+`81/81` built-in host suites; the separate shell-parser run is `6/6`, for
+`87/87` combined recorded host checks. The evidence is from
 `target/unified-mfs1-resilience-final.log`; the corresponding `make fsck`
-result is in `target/unified-mfs1-resilience-fsck.log`.
+result is in `target/unified-mfs1-resilience-fsck.log`. The architecture-specific
+full `make test` matrices remain `validation in progress`.
 
 ## GUI profile
 
@@ -194,9 +251,10 @@ script receives no framebuffer, GPU/BAR, input, DMA or IRQ capability. Terminal
 supports the tested keyboard/editing and command subset; Files and Monitor
 remain fixed-window business clients.
 
-The final unified acceptance passed host MFS1 22/22, ABI capability 9/9, GUI
-command 6/6 and Desktop 9/9, kernel 11/11 and Mica 24/24 (81/81 total).
-All smoke, powercut, fault, GUI, SSH and Mica/TLS gates passed. The GUI gate passed
+The retained AArch64 GUI gate passed. Its `make test` log contains `81/81`
+built-in host suites; a separate shell-parser run contributes `6/6`, for
+`87/87` combined recorded host checks. The exact AArch64 and RISC-V `make test`
+matrices remain `validation in progress`.
 plus dynamic registration/Present, Unicode, resize/maximize/restore/minimize,
 taskbar, close, endpoint reclaim and slot reuse. Unicode accumulators
 `4/78/1250/20013` were delivered/rendered. The current GUI markers include
@@ -222,12 +280,24 @@ finished new+no-temp. Directory descendant renames are rejected without dirty
 mutation. The GUI partial-Present path remains bounded across user-rt, kernel,
 GPU and windowd, with pointer damage carried through to redraw.
 
-The built-in Terminal has a bounded command surface (`ls`, `cat`, `stat`,
-`write`, `mkdir`, `mv`, `rm`, `sync`) over absolute paths only. Its commands use
+The built-in Terminal has a bounded command surface (`ls/list`, `cat/read`,
+`stat`, `touch/create`, `cp`, `write`, `mkdir`, `rmdir`, `mv/rename`,
+`rm/remove/unlink`, `fsync`, `sync`) over absolute paths only. Its commands use
 the dedicated `TERMINAL_FILESYSTEM_ENDPOINT` and terminal-only
 `GUI_TERMINAL_COMMANDS` 4 KiB shared frame; the MFS broker keeps this frame
 separate from block-DMA and other filesystem payload frames. Command input is
 limited to 512 bytes and replies/output to 4 KiB, with the terminal viewport
-following newest output. The serial shell parser covers `stat`, `mv` and `rm`
-(targeted 2/2); the final GUI marker sequence is
-`mkdir/write/stat/mv/cat/ls/rm/rm/sync`, each `status=ok`.
+following newest output. The serial shell and GUI terminal share the parser
+and filesystem command aliases; the final GUI marker sequence is
+`mkdir/touch/write/cp/stat/mv/cat/ls/fsync/rm/rm/rm/rmdir/sync`, each
+`status=ok`.
+
+The serial shell additionally exposes `help`, `pwd`, `cd`, `echo`, `clear`,
+`history`, `ps`, `kill`, `wait`, `uptime`, `sleep`, `date`, `free`, `sysinfo`,
+`head`, `tail`, `wc`, `hexdump/xxd`, `grep`, `find`, `tree`, `du`, `df`,
+`curl`, `nslookup`, `netstat`, `run`, `mica`, `exit`, `shutdown`, `poweroff`,
+and `reboot`. `fs <command>` exposes the filesystem commands and aliases;
+`head/tail -n N`, `mkdir -p`, `cp -r`, and `rm -r` are supported bounded forms.
+The serial shell and GUI Terminal share the filesystem parser, aliases, absolute
+path semantics and MFS broker; process/network/Mica/power commands are serial
+only.

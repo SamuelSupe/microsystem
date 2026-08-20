@@ -6,7 +6,6 @@ use microsystem_kernel::memory::{FrameAllocator, PAGE_SIZE};
 
 use crate::kernel_heap;
 
-const KERNEL_OFFSET: u64 = 0xffff_ff80_0000_0000;
 const KERNEL_HEAP_BYTES: u64 = 128 * 1024 * 1024;
 
 unsafe extern "C" {
@@ -51,8 +50,7 @@ pub fn initialize(ram_base: u64, ram_bytes: u64) -> Result<MemoryLayout, Status>
         return Err(Status::Busy);
     }
     let ram_end = ram_base.checked_add(ram_bytes).ok_or(Status::Invalid)?;
-    let kernel_end = (core::ptr::addr_of!(__kernel_end) as u64)
-        .checked_sub(KERNEL_OFFSET)
+    let kernel_end = crate::arch::virt_to_phys(core::ptr::addr_of!(__kernel_end) as usize as u64)
         .ok_or(Status::Invalid)?;
     let kernel_heap_base = align_up(kernel_end.max(ram_base), PAGE_SIZE).ok_or(Status::Invalid)?;
     let allocator_base = kernel_heap_base
@@ -110,7 +108,11 @@ pub const fn kernel_heap_bytes() -> usize {
 
 fn zero_page(address: u64) {
     unsafe {
-        core::ptr::write_bytes((KERNEL_OFFSET + address) as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(
+            crate::arch::phys_to_virt(address) as *mut u8,
+            0,
+            PAGE_SIZE as usize,
+        );
     }
 }
 

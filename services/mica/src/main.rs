@@ -979,7 +979,7 @@ impl KernelHost {
                 self.output.base.add(script::BROKER_OFFSET),
                 data.len(),
             );
-            core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+            microsystem_user_rt::fence();
         }
         let mut request = Message::new(protocol::NETWORK, operation as u16);
         request.words[0] = self.token;
@@ -1369,7 +1369,7 @@ impl KernelHost {
             let broker = self.output.base.add(script::BROKER_OFFSET);
             core::ptr::copy_nonoverlapping(path.as_ptr(), broker, path.len());
             core::ptr::copy_nonoverlapping(data.as_ptr(), broker.add(path.len()), data.len());
-            core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+            microsystem_user_rt::fence();
         }
         let mut request = Message::new(protocol::FILESYSTEM, operation as u16);
         request.words[0] = path.len() as u64;
@@ -1396,7 +1396,18 @@ impl KernelHost {
             .map_err(|status| host_status("fs", status))
             .and_then(|()| reply_status(reply.words[5]))
             .and_then(|()| {
-                let bytes = reply.words[0] as usize;
+                let returns_broker_bytes = matches!(
+                    operation,
+                    filesystem::Operation::List
+                        | filesystem::Operation::Read
+                        | filesystem::Operation::ReadRange
+                        | filesystem::Operation::Stats
+                );
+                let bytes = if returns_broker_bytes {
+                    reply.words[0] as usize
+                } else {
+                    0
+                };
                 if bytes > script::BROKER_BYTES {
                     return Err(ErrorValue::new("fault", "invalid filesystem reply length"));
                 }
@@ -1722,7 +1733,7 @@ fn run_repl(
     host.output.write(b"Mica 0.1\n");
     unsafe {
         (*base.cast::<script::SessionHeaderV1>()).flags |= script::FLAG_OUTPUT_READY;
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     if notification == CapHandle::INVALID
         || microsystem_user_rt::notification_signal(notification, script::EVENT_OUTPUT).is_err()
@@ -1737,7 +1748,7 @@ fn run_repl(
         if bits & script::EVENT_INPUT == 0 {
             continue;
         }
-        unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+        microsystem_user_rt::fence();
         let session = unsafe { &mut *base.cast::<script::SessionHeaderV1>() };
         let bytes = (session.stdin_head as usize).min(script::STDIN_BYTES);
         let input = unsafe { core::slice::from_raw_parts(base.add(script::STDIN_OFFSET), bytes) };
@@ -1752,7 +1763,7 @@ fn run_repl(
         if source == "exit" {
             session.exit_status = 0;
             session.flags |= script::FLAG_EXIT_READY;
-            unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+            microsystem_user_rt::fence();
             let _ = microsystem_user_rt::notification_signal(notification, script::EVENT_EXIT);
             microsystem_user_rt::exit(0);
         }
@@ -1792,7 +1803,7 @@ fn run_repl(
         }
         unsafe {
             (*base.cast::<script::SessionHeaderV1>()).flags |= script::FLAG_OUTPUT_READY;
-            core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+            microsystem_user_rt::fence();
         }
         if microsystem_user_rt::notification_signal(notification, script::EVENT_OUTPUT).is_err() {
             microsystem_user_rt::exit(1);

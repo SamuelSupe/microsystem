@@ -10,9 +10,7 @@ pub extern "C" fn _start(pid: u64) -> ! {
         pid,
         b" entered EL0\n",
     );
-    unsafe {
-        core::arch::asm!("msr ttbr0_el1, xzr", options(nostack));
-    }
+    unsafe { microsystem_user_rt::privileged_probe() };
     microsystem_user_rt::exit(1)
 }
 

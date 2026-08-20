@@ -1,6 +1,6 @@
 # MicroSystem
 
-![AArch64](https://img.shields.io/badge/target-AArch64%20%2B%20QEMU-2563eb)
+![Targets](https://img.shields.io/badge/targets-AArch64%20%7C%20RV64GC%20%2B%20QEMU-2563eb)
 ![Rust](https://img.shields.io/badge/implementation-Rust%202024-f97316)
 ![Status](https://img.shields.io/badge/status-research%20prototype-7c3aed)
 
@@ -9,6 +9,25 @@
 **简体中文** · [English](README.md)
 
 MicroSystem 是一个小型、明确、端到端的操作系统实验。它并不是把 Linux 缩小重写，而是尝试回答一个更具体的问题：AI 能否帮助我们把一致的系统设计，从启动代码与硬件隔离一路推进到用户可操作的应用生态。
+
+## 当前目标与实现状态
+
+两个启动 profile 都已有真实 QEMU 串口证据。当前已验证的 RISC-V 链路是
+RV64GC、QEMU `virt`、默认 OpenSBI 的 M-mode → S-mode 交接、Sv39、双 hart、
+PLIC/SBI 定时器与中断服务、PCI VirtIO，以及 RISC-V IOMMU；串口完整到达
+`[system] shutdown`。
+
+RISC-V IOMMU gate 记录为
+`blocked=true sentinel=true event=0xf stream-id=0x10 completion-error=false`。
+同一运行还验证了 DMA map/unmap、RNG first-fill、MFS recovery 与 clean
+`fsck`、串口 shell 完整文件系统命令矩阵、Mica 8 KiB 参数/输入路径，以及
+network/DNS。AArch64 build 和串口运行也到达 shutdown。`make test` 日志内建
+host suites 合计 `81/81`（`22+9+6+9+11+24`）；另行运行的 shell parser 为
+`6/6`，因此合并记录的 host checks 是 `87/87`，不能写成 `make test` 自带
+`87`。
+
+精确的 `make ARCH=aarch64 test` 与 `make ARCH=riscv64 test` 完整矩阵仍是
+`validation in progress`；执行中的状态不得写成 PASS。
 
 ## 运行画面
 
@@ -20,7 +39,9 @@ MicroSystem 是一个小型、明确、端到端的操作系统实验。它并�
 
 ## 系统架构
 
-设计将必须接触硬件的机制保留在 EL1，并把设备策略放到相互隔离的 EL0 服务中。应用通过 broker IPC 与 capability 使用资源，不直接获得原始 framebuffer、块设备、网络、DMA 或 IRQ 权限。
+设计将必须接触硬件的机制保留在 AArch64 EL1 或 RISC-V S-mode，并把设备
+策略放到相互隔离的 EL0/U-mode 服务中。应用通过 broker IPC 与 capability
+使用资源，不直接获得原始 framebuffer、块设备、网络、DMA 或 IRQ 权限。
 
 ![MicroSystem 系统架构图](docs/assets/microsystem-architecture.svg)
 
@@ -40,14 +61,16 @@ Mica 脚本与 GUI 应用：Counter · Reader · Editor · Terminal
 
 | 层次 | 当前实验内容 |
 | --- | --- |
-| 内核 | AArch64 EL1 启动、高半区 MMU、GICv3 定时器/中断、调度、ASID、带 W^X 校验的 ELF 加载、capability 派生/撤销与有界资源回收 |
-| 隔离 | 基于 DTB 的 VirtIO 发现、SMMUv3 域设置、设备授予，以及严格的 EL1 机制 / EL0 策略边界 |
+| 内核 | AArch64 EL1 与 RV64GC S-mode 启动、MMU/Sv39、GICv3 或 PLIC/SBI 定时器/中断、调度、ASID、带 W^X 校验的 ELF 加载、capability 派生/撤销与有界资源回收 |
+| 隔离 | 基于 DTB 的 PCI VirtIO 发现、SMMUv3 或 RISC-V IOMMU 域设置、设备授予，以及严格的特权机制 / 用户策略边界 |
 | 存储 | MFS1 事务文件系统、元数据镜像、fsck、受限离线修复，以及断电和确定性故障注入路径 |
 | 网络与访问 | EL0 `netd`、端点 broker 网络、有限 HTTP/HTTPS 访问、SSH 会话，以及脚本权限交集策略 |
 | 桌面 | VirtIO-GPU/输入设备 profile、代码绘制的 1024×768 桌面、保留式 GUI 命令流、窗口管理、输入批处理、damage culling，以及 Terminal、Files、Monitor、Reader、Editor |
 | 运行时 | Mica 词法器/编译器/VM、能力感知权限、文件系统/网络/GUI broker，以及有界应用槽位 |
 
-当前仓库面向 QEMU `virt-7.2` AArch64 机器：双 CPU、4 KiB 页、256 MiB 内存。它是研究型原型，不是 Linux/POSIX 发行版、通用桌面系统，也不承诺任意真实硬件或 ELF 兼容性。
+当前仓库面向 QEMU `virt-7.2` AArch64 与 RV64GC QEMU `virt` profile。它是
+研究型原型，不是 Linux/POSIX 发行版、通用桌面系统，也不承诺任意真实硬件
+或 ELF 兼容性。
 
 ## 快速开始
 
@@ -60,11 +83,60 @@ make test
 make fsck
 ```
 
+上面的命令是 AArch64 路径。`ARCH=riscv64 make build` 和
+`ARCH=riscv64 make run` 会选择当前已验证的 RISC-V target/QEMU 路径。下面
+是实际的低层命令形状：
+
+```sh
+ARCH=riscv64 cargo build --release \
+  --target riscv64gc-unknown-none-elf \
+  -p microsystem-kernel --features baremetal
+ARCH=riscv64 qemu-system-riscv64 \
+  -machine virt,iommu-sys=on -bios default -cpu rv64 \
+  -kernel target/riscv64gc-unknown-none-elf/release/microsystem-kernel \
+  -nographic
+```
+
+该 RISC-V 命令使用 QEMU 的默认 OpenSBI 固件：OpenSBI 运行在 M-mode，并把
+带 DTB 的 S-mode 入口交给内核；仓库不内置 OpenSBI 镜像。profile 证据与完整
+矩阵状态见[系统架构](docs/architecture.md)和[运行手册](docs/runbook.md)。
+
 运行串口 shell：
 
 ```sh
 make run
 ```
+
+shell 文件系统命令使用绝对路径，同时支持简写和显式 `fs` 命名空间：
+`ls/list`、`cat/read`、`stat`、`touch/create`、`cp`、`write`、`mkdir`、
+`rmdir`、`mv/rename`、`rm/remove/unlink`、`fsync` 和 `sync`。文件传输受
+4 KiB 文件系统共享帧限制。
+
+串口 shell 的完整命令面还包括 `help`、`pwd`、`cd`、`echo`、`clear`、
+`history`、`ps`、`kill`、`wait`、`uptime`、`sleep`、`date`、`free`、
+`sysinfo`，以及 `head`、`tail`、`wc`、`hexdump/xxd`、`grep`、`find`、
+`tree`、`du`、`df`；网络命令为 `curl`、`nslookup`、`netstat`，程序命令为
+`run`、`mica`，系统命令为 `exit`、`shutdown`、`poweroff`、`reboot`。
+`fs <command>` 暴露相同的文件系统命名空间和别名；支持有界选项
+`head/tail -n N`、`mkdir -p`、`cp -r`、`rm -r`。
+
+串口 shell 还提供一个有界的 curl 风格 HTTP 客户端，支持 HTTP/HTTPS
+GET、`-i`/`--include`、`-s`/`--silent`，以及写入绝对 MFS 路径的原子
+`-o`/`--output`：
+
+```text
+curl -i https://example.com/
+curl -s -o /data/response https://example.com/
+```
+
+它只通过 `net.browse` broker 执行 GET：HTTP 是明文路径，HTTPS 使用带证书、
+主机名和时间校验的受信任 TLS 路径。响应上限为 32 KiB；串口输出要求正文
+是 UTF-8，`-o` 会把响应原子写入绝对 MFS 路径并 fsync。原始 TCP/UDP、
+POST/PUT/PATCH/DELETE 以及低层 TLS broker 不属于该命令边界。
+
+GUI Terminal 与串口 shell 共享文件系统 parser、别名、绝对路径语义和 MFS
+broker 行为。GUI Terminal 通过有界 terminal frame 暴露文件系统子集；进程、
+网络、Mica 和电源命令仍属于串口 shell。
 
 运行 GUI profile。QEMU 命令会打印 VNC/QMP 端点；默认 VNC 端口是 `5900`。
 
@@ -83,9 +155,12 @@ mica --gui --timeout 86400s --allow gui.window --allow net.browse \
 
 ## 已记录的验收证据
 
-仓库保留了详细 runbook 与原始 workflow 结果。已有验收矩阵记录：MFS recovery `22/22`、ABI `9/9`、GUI command stream `6/6`、GUI Desktop `9/9`、kernel boundaries `11/11`、Mica `24/24`，合计 `81/81` 个 host tests；同时覆盖 QEMU smoke、SSH、GUI、TLS、断电与 MFS1 故障/恢复 gate。
-
-这些数字是仓库保留的历史证据。本次 GitHub 发布有意不编译、不重跑系统；证据来源与边界见 [`docs/runbook.md`](docs/runbook.md) 和 [`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md)。
+仓库保留了详细 runbook 与原始 workflow 结果。当前证据包括上面的 RISC-V
+QEMU 串口/IOMMU/设备 gate、AArch64 build 与串口 shutdown、`make test` 内建
+host suites `81/81`，以及另行 shell parser `6/6`（合并记录 `87/87`）。精确的 `make ARCH=aarch64 test` 与
+`make ARCH=riscv64 test` 完整矩阵仍为 `validation in progress`；本次文档
+更新不重跑它们。证据来源与边界见 [`docs/runbook.md`](docs/runbook.md) 和
+[`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md)。
 
 ## 仓库结构
 

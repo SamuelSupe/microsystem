@@ -1,12 +1,20 @@
 use microsystem_abi::Status;
 
 pub const EM_AARCH64: u16 = 183;
+pub const EM_RISCV: u16 = 243;
 pub const ET_EXEC: u16 = 2;
 pub const PT_LOAD: u32 = 1;
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
 pub const USER_MIN: u64 = 0x0040_0000;
 pub const USER_MAX: u64 = 0x0000_007f_ffff_0000;
+
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_MACHINE: u16 = EM_AARCH64;
+#[cfg(target_arch = "riscv64")]
+const EXPECTED_MACHINE: u16 = EM_RISCV;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+const EXPECTED_MACHINE: u16 = EM_AARCH64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadSegment {
@@ -30,7 +38,7 @@ impl<'a> ElfImage<'a> {
         if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 || bytes[5] != 1 {
             return Err(Status::Invalid);
         }
-        if u16_at(bytes, 16)? != ET_EXEC || u16_at(bytes, 18)? != EM_AARCH64 {
+        if u16_at(bytes, 16)? != ET_EXEC || u16_at(bytes, 18)? != EXPECTED_MACHINE {
             return Err(Status::NotSupported);
         }
         let ph_offset = u64_at(bytes, 32)? as usize;

@@ -3,8 +3,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use microsystem_abi::Status;
 
-const KERNEL_OFFSET: usize = 0xffff_ff80_0000_0000;
-
 static READY: AtomicBool = AtomicBool::new(false);
 static START: AtomicUsize = AtomicUsize::new(0);
 static END: AtomicUsize = AtomicUsize::new(0);
@@ -14,9 +12,7 @@ pub fn initialize(physical: u64, bytes: usize) -> Result<(), Status> {
     if READY.load(Ordering::Acquire) || physical % 4096 != 0 || bytes < 4096 {
         return Err(Status::Invalid);
     }
-    let start = KERNEL_OFFSET
-        .checked_add(usize::try_from(physical).map_err(|_| Status::Invalid)?)
-        .ok_or(Status::Invalid)?;
+    let start = crate::arch::phys_to_virt(physical);
     let end = start.checked_add(bytes).ok_or(Status::Invalid)?;
     START.store(start, Ordering::Relaxed);
     END.store(end, Ordering::Relaxed);

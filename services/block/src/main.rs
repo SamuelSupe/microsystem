@@ -190,7 +190,7 @@ fn configure_queue(common: usize, dma_iova: u64) -> Result<(), ()> {
         write16(QUEUE + AVAIL_OFFSET + 2, 0);
         write16(QUEUE + USED_OFFSET, 0);
         write16(QUEUE + USED_OFFSET + 2, 0);
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        microsystem_user_rt::fence_store();
         write16(common + 28, 1);
         write8(common + 20, read8(common + 20) | 4);
     }
@@ -390,14 +390,14 @@ fn submit(
             QUEUE + AVAIL_OFFSET + 4 + (available_index % queue_size) as usize * 2,
             0,
         );
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        microsystem_user_rt::fence_store();
         write16(QUEUE + AVAIL_OFFSET + 2, available_index.wrapping_add(1));
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        microsystem_user_rt::fence_store();
         let queue_notify_offset = read16(common + 30) as usize;
         write16(notify + queue_notify_offset * notify_multiplier, 0);
         for _ in 0..100_000 {
             if read16(QUEUE + USED_OFFSET + 2) != used_index {
-                core::arch::asm!("dmb oshld", options(nostack, preserves_flags));
+                microsystem_user_rt::fence_load();
                 return if read8(QUEUE + STATUS_OFFSET) == 0 {
                     Ok(())
                 } else {

@@ -139,6 +139,14 @@ pub enum Syscall {
     ClockRealtime = 31,
 }
 
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemControlOperation {
+    ActivatePci = 1,
+    Poweroff = 2,
+    Reboot = 3,
+}
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
@@ -207,6 +215,9 @@ pub mod filesystem {
         Close = 11,
         WriteAtomic = 12,
         ReadRange = 13,
+        Stats = 14,
+        WriteRange = 15,
+        Replace = 16,
     }
 }
 
@@ -271,6 +282,7 @@ pub mod network {
         SshSend = 18,
         SshClose = 19,
         SshStatus = 20,
+        Stats = 21,
     }
 }
 
@@ -543,6 +555,26 @@ pub struct SystemStats {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FilesystemStatsV1 {
+    pub version: u16,
+    pub reserved: u16,
+    pub block_size: u32,
+    pub total_blocks: u64,
+    pub used_blocks: u64,
+    pub free_blocks: u64,
+    pub generation: u64,
+    pub transaction: u64,
+    pub entries: u64,
+    pub checkpoint_block: u64,
+    pub segments_since_checkpoint: u64,
+    pub active_arena: u8,
+    pub segment_directory: u8,
+    pub active_segments: u16,
+    pub reserved_tail: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessInfoV2 {
     pub version: u16,
     pub running: u16,
@@ -623,6 +655,7 @@ pub mod boot_cap {
     pub const GUI_DYNAMIC_ENDPOINT_BASE: u16 = 75;
     pub const WINDOWD_FILESYSTEM_FRAME: CapHandle = CapHandle::from_parts(83, 1);
     pub const GUI_LAUNCH_ENDPOINT: CapHandle = CapHandle::from_parts(84, 1);
+    pub const SHELL_SYSTEM_CONTROL: CapHandle = CapHandle::from_parts(85, 1);
 
     pub const fn gui_dynamic_endpoint(index: usize) -> CapHandle {
         CapHandle::from_parts(GUI_DYNAMIC_ENDPOINT_BASE + index as u16, 1)

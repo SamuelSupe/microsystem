@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/qemu-arch.sh"
 
 timeout_seconds="${MICROSYSTEM_QEMU_TIMEOUT:-45}"
 input_delay="${MICROSYSTEM_COMMAND_DELAY:-1}"
@@ -12,13 +13,14 @@ if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
-  echo "powercut-qemu: qemu-system-aarch64 is required" >&2
-  exit 2
+if ! command -v "$MICROSYSTEM_QEMU_BINARY" >/dev/null 2>&1; then
+	echo "powercut-qemu: $MICROSYSTEM_QEMU_BINARY is required" >&2
+	exit 2
 fi
-if [[ ! -f "target/aarch64-unknown-none-softfloat/release/microsystem-kernel" ]]; then
-  echo "powercut-qemu: built kernel ELF is missing" >&2
-  exit 2
+kernel="$repo_root/target/$MICROSYSTEM_TARGET/release/microsystem-kernel"
+if [[ ! -f "$kernel" ]]; then
+	echo "powercut-qemu: built kernel ELF is missing" >&2
+	exit 2
 fi
 if [[ ! -f build/microsystem.img ]]; then
   echo "powercut-qemu: build/microsystem.img is missing" >&2
@@ -31,23 +33,20 @@ second_log="${MICROSYSTEM_POWERCUT_SECOND_LOG:-$repo_root/target/${token}-second
 mkdir -p "$(dirname -- "$first_log")" "$(dirname -- "$second_log")"
 
 qemu_command=(
-  qemu-system-aarch64
-  -machine virt-7.2,virtualization=on,gic-version=3,iommu=smmuv3
-  -cpu cortex-a72
-  -accel tcg,thread=multi
-  -smp 2
-  -m 256M
-  -nographic
-  -L /usr/lib/ipxe/qemu
-  -no-reboot
-  -semihosting-config enable=on,target=native
-  -kernel "$repo_root/target/aarch64-unknown-none-softfloat/release/microsystem-kernel"
-  -drive "if=none,file=$repo_root/build/microsystem.img,format=raw,cache=writeback,id=disk0"
-  -device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on,romfile=,addr=2
-  -netdev user,id=net0,restrict=on
-  -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on,romfile=,addr=6,mac=52:54:00:12:34:56
+	"$MICROSYSTEM_QEMU_BINARY"
+	"${MICROSYSTEM_QEMU_PLATFORM_ARGS[@]}"
+	-accel tcg,thread=multi
+	-smp 2
+	-m 256M
+	-nographic
+	"${MICROSYSTEM_QEMU_BOOT_ARGS[@]}"
+	-kernel "$kernel"
+	-drive "if=none,file=$repo_root/build/microsystem.img,format=raw,cache=writeback,id=disk0"
+	-device "virtio-blk-pci,drive=disk0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=2"
+	-netdev user,id=net0,restrict=on
+	-device "virtio-net-pci,netdev=net0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=6,mac=52:54:00:12:34:56"
   -object rng-random,filename=/dev/urandom,id=rng0
-  -device virtio-rng-pci,rng=rng0,disable-legacy=on,romfile=,addr=7
+	-device "virtio-rng-pci,rng=rng0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=7"
 )
 
 first_pid=""

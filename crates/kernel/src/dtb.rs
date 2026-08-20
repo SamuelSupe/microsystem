@@ -1,4 +1,3 @@
-const KERNEL_OFFSET: usize = 0xffffff8000000000;
 const FDT_MAGIC: u32 = 0xd00d_feed;
 
 #[derive(Clone, Copy)]
@@ -10,9 +9,14 @@ pub struct PlatformInfo {
     pub ram_bytes: usize,
     pub uart_base: usize,
     pub rtc_base: usize,
+    pub clint_base: usize,
+    pub plic_base: usize,
+    pub plic_bytes: usize,
     pub gicd_base: usize,
     pub gicr_base: usize,
     pub smmu_base: usize,
+    pub riscv_iommu_base: usize,
+    pub riscv_iommu_bytes: usize,
     pub pcie_base: usize,
     pub pcie_mmio_base: usize,
     pub pcie_mmio_bytes: usize,
@@ -25,7 +29,7 @@ pub struct PlatformInfo {
 }
 
 pub fn discover(physical: usize) -> PlatformInfo {
-    let pointer = (physical + KERNEL_OFFSET) as *const u8;
+    let pointer = crate::arch::phys_to_virt(physical as u64) as *const u8;
     let header = unsafe { core::slice::from_raw_parts(pointer, 40) };
     if be_u32(header, 0) != FDT_MAGIC {
         return invalid(0);
@@ -36,10 +40,40 @@ pub fn discover(physical: usize) -> PlatformInfo {
         return invalid(bytes);
     };
     let memory = tree.memory().regions().next();
-    let uart_base = first_region(&tree, &["arm,pl011"]);
-    let rtc_base = first_region(&tree, &["arm,pl031"]);
+    let uart_base = first_region(&tree, &["arm,pl011", "ns16550a"]);
+    let rtc_base = first_region(&tree, &["arm,pl031", "google,goldfish-rtc"]);
+    let clint_base = first_region(
+        &tree,
+        &["riscv,clint0", "riscv,aclint-mtimer", "sifive,clint0"],
+    );
+    let plic_node = tree.find_compatible(&["riscv,plic0", "sifive,plic-1.0.0"]);
+    let plic_base = plic_node
+        .as_ref()
+        .and_then(|node| node.reg())
+        .and_then(|mut regions| regions.next())
+        .map(|region| region.starting_address as usize)
+        .unwrap_or(0);
+    let plic_bytes = plic_node
+        .as_ref()
+        .and_then(|node| node.reg())
+        .and_then(|mut regions| regions.next())
+        .and_then(|region| region.size)
+        .unwrap_or(0);
     let (gicd_base, gicr_base) = first_two_regions(&tree, &["arm,gic-v3"]);
     let smmu_base = first_region(&tree, &["arm,smmu-v3"]);
+    let riscv_iommu = tree.find_compatible(&["riscv,pci-iommu", "riscv,iommu"]);
+    let riscv_iommu_base = riscv_iommu
+        .as_ref()
+        .and_then(|node| node.reg())
+        .and_then(|mut regions| regions.next())
+        .map(|region| region.starting_address as usize)
+        .unwrap_or(0);
+    let riscv_iommu_bytes = riscv_iommu
+        .as_ref()
+        .and_then(|node| node.reg())
+        .and_then(|mut regions| regions.next())
+        .and_then(|region| region.size)
+        .unwrap_or(0);
     let pcie_base = first_region(&tree, &["pci-host-ecam-generic"]);
     let (pcie_mmio_base, pcie_mmio_bytes) = pcie_mmio_region(&tree);
     let (iommu_rid_base, iommu_sid_base, iommu_map_length, iommu_map_mask) = pcie_iommu_map(&tree);
@@ -54,9 +88,14 @@ pub fn discover(physical: usize) -> PlatformInfo {
         ram_bytes: memory.and_then(|region| region.size).unwrap_or(0),
         uart_base,
         rtc_base,
+        clint_base,
+        plic_base,
+        plic_bytes,
         gicd_base,
         gicr_base,
         smmu_base,
+        riscv_iommu_base,
+        riscv_iommu_bytes,
         pcie_base,
         pcie_mmio_base,
         pcie_mmio_bytes,
@@ -78,9 +117,14 @@ fn invalid(bytes: usize) -> PlatformInfo {
         ram_bytes: 0,
         uart_base: 0,
         rtc_base: 0,
+        clint_base: 0,
+        plic_base: 0,
+        plic_bytes: 0,
         gicd_base: 0,
         gicr_base: 0,
         smmu_base: 0,
+        riscv_iommu_base: 0,
+        riscv_iommu_bytes: 0,
         pcie_base: 0,
         pcie_mmio_base: 0,
         pcie_mmio_bytes: 0,
@@ -146,12 +190,13 @@ fn pcie_iommu_map(tree: &fdt::Fdt<'_>) -> (u32, u32, u32, u32) {
         .filter(|property| property.value.len() >= 4)
         .map(|property| be_u32(property.value, 0))
         .unwrap_or(u32::MAX);
-    (
-        be_u32(mapping.value, 0),
-        be_u32(mapping.value, 8),
-        be_u32(mapping.value, 12),
-        mask,
-    )
+    for entry in mapping.value.chunks_exact(16) {
+        let length = be_u32(entry, 12);
+        if length != 0 {
+            return (be_u32(entry, 0), be_u32(entry, 8), length, mask);
+        }
+    }
+    (0, 0, 0, mask)
 }
 
 fn pcie_interrupt_map(tree: &fdt::Fdt<'_>) -> [u32; 16] {
@@ -174,15 +219,27 @@ fn pcie_interrupt_map(tree: &fdt::Fdt<'_>) -> [u32; 16] {
             ]
         })
         .unwrap_or([u32::MAX; 4]);
-    for entry in mapping.value.chunks_exact(40) {
+    let (stride, interrupt_type_offset, interrupt_offset, interrupt_base) =
+        if cfg!(target_arch = "riscv64") {
+            // QEMU virt PLIC entries contain PCI address (3 cells), pin,
+            // parent phandle and one PLIC interrupt cell.
+            (24, None, 20, 0)
+        } else {
+            // QEMU Arm virt GIC entries additionally contain the parent
+            // address and the three-cell GIC interrupt specifier.
+            (40, Some(28), 32, 32)
+        };
+    for entry in mapping.value.chunks_exact(stride) {
         let address = be_u32(entry, 0) & mask[0];
         let slot = ((address >> 11) & 0x1f) as usize;
         let pin = be_u32(entry, 12) & mask[3];
-        let interrupt_type = be_u32(entry, 28);
-        if slot >= 4 || !(1..=4).contains(&pin) || interrupt_type != 0 {
+        if slot >= 4
+            || !(1..=4).contains(&pin)
+            || interrupt_type_offset.is_some_and(|offset| be_u32(entry, offset) != 0)
+        {
             continue;
         }
-        result[slot * 4 + pin as usize - 1] = 32 + be_u32(entry, 32);
+        result[slot * 4 + pin as usize - 1] = interrupt_base + be_u32(entry, interrupt_offset);
     }
     result
 }

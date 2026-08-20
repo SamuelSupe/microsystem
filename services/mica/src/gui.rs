@@ -558,7 +558,7 @@ impl GuiHost {
                 self.command_base.add(gui::COMMAND_HEADER_BYTES),
                 bytes.len(),
             );
-            core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+            microsystem_user_rt::fence();
         }
         let request = Message::new(protocol::GUI, gui::Operation::Present as u16);
         self.call_endpoint("gui.present", &request)?;
@@ -599,7 +599,7 @@ impl GuiHost {
         if header.tail == header.head {
             return Ok(None);
         }
-        unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+        microsystem_user_rt::fence();
         let slot = header.tail % header.capacity as u32;
         let pointer = unsafe {
             self.event_base

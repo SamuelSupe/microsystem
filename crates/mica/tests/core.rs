@@ -192,8 +192,7 @@ fn functions_capture_locals_and_preserve_multiple_returns() {
 
 #[test]
 fn closure_state_persists_across_repeated_calls() {
-    let outcome = run(
-        r#"
+    let outcome = run(r#"
         local make_counter = function()
             local count = 0
             return function(step)
@@ -206,8 +205,7 @@ fn closure_state_persists_across_repeated_calls() {
         local second = next(2)
         local third = next(3)
         return first, second, third
-        "#,
-    )
+        "#)
     .expect("closure script completes");
     assert_eq!(
         outcome.values,
@@ -217,13 +215,11 @@ fn closure_state_persists_across_repeated_calls() {
 
 #[test]
 fn boolean_operators_short_circuit_rhs_evaluation() {
-    let outcome = run(
-        r#"
+    let outcome = run(r#"
         local left = false and error("and rhs must not run")
         local right = true or error("or rhs must not run")
         return left, right
-        "#,
-    )
+        "#)
     .expect("short-circuit script completes");
     assert_eq!(outcome.values, vec![Value::Bool(false), Value::Bool(true)]);
 }
@@ -386,8 +382,7 @@ fn host_stdlib_calls_cover_math_and_encoding() {
 
 #[test]
 fn host_stdlib_string_helpers_cover_reader_text_operations() {
-    let outcome = run(
-        r#"
+    let outcome = run(r#"
         local string = require("string")
         local padded = "  héllo   世界  "
         local trimmed = string.trim(padded)
@@ -399,8 +394,7 @@ fn host_stdlib_string_helpers_cover_reader_text_operations() {
         return trimmed, collapsed, found, shifted, missing,
             string.starts_with(trimmed, "hé"),
             string.ends_with(trimmed, "世界"), replaced
-        "#,
-    )
+        "#)
     .expect("string helper script completes");
     assert_eq!(
         outcome.values,
@@ -479,9 +473,11 @@ fn browse_permission_is_unscoped_and_never_grants_raw_network_access() {
 
     let exact_connect = PermissionSet::from_rules(["net.connect:example.com:80"])
         .expect("exact network rule parses");
-    assert!(!declared
-        .intersect(&exact_connect)
-        .allows_unscoped("net", Access::Browse));
+    assert!(
+        !declared
+            .intersect(&exact_connect)
+            .allows_unscoped("net", Access::Browse)
+    );
 }
 
 #[test]

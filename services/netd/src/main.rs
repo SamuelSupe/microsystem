@@ -25,6 +25,8 @@ const CONNECTIONS_PER_SESSION: usize = 8;
 const OUTBOUND_CONNECTIONS: usize = 64;
 const UDP_CONNECTIONS: usize = 8;
 const SOCKET_BYTES: usize = 2048;
+const GUEST_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+const GATEWAY_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 const DNS_PORT: u16 = 53;
 const DNS_LOCAL_PORT: u16 = 53053;
 const DNS_SERVER: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
@@ -121,12 +123,12 @@ pub extern "C" fn _start() -> ! {
     let mut interface = Interface::new(config, &mut device, now());
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+            .push(IpCidr::new(IpAddress::Ipv4(GUEST_IPV4), 24))
             .unwrap();
     });
     interface
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
+        .add_default_ipv4_route(GATEWAY_IPV4)
         .unwrap();
 
     let socket_storage = unsafe { &mut *SOCKET_STORAGE.0.get() };
@@ -437,6 +439,15 @@ fn handle_network(
 ) -> Status {
     if request.protocol != protocol::NETWORK {
         return Status::Invalid;
+    }
+    if request.opcode == network::Operation::Stats as u16 {
+        reply.words[0] = u32::from_be_bytes(GUEST_IPV4.octets()) as u64;
+        reply.words[1] = u32::from_be_bytes(GATEWAY_IPV4.octets()) as u64;
+        reply.words[2] = u32::from_be_bytes(DNS_SERVER.octets()) as u64;
+        reply.words[3] = sessions.iter().filter(|session| session.token != 0).count() as u64;
+        let active_connections = active_connection_count(sessions) as u64;
+        reply.words[4] = (network::MAX_CONNECTIONS as u64) << 32 | active_connections;
+        return Status::Ok;
     }
     if request.opcode == network::Operation::OpenSession as u16 {
         return register_network_session(request, sessions);

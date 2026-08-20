@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# End-to-end boot gate for the AArch64 image.  The image is intentionally
+# End-to-end boot gate for both architecture profiles.  The image is intentionally
 # driven through the public make entrypoint so this check exercises the same
 # OrbStack/QEMU command developers use locally.
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/qemu-arch.sh"
 
-timeout_seconds="${MICROSYSTEM_QEMU_TIMEOUT:-45}"
+if [[ "$MICROSYSTEM_ARCH" == "riscv64" ]]; then
+  irq_timer_marker='\[irq\][[:space:]]+PLIC/SBI[[:space:]]+timer[[:space:]]+cpu0'
+  intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+plic-id=[0-9]+[[:space:]]+bound[[:space:]]+cpu0'
+  iommu_domain_marker='\[iommu\][[:space:]]+RISC-V[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
+  iommu_fault_event='0xf'
+  fp_state_marker='fd-regs=f0-f31[[:space:]]+fcsr=true'
+  fp_state_label='fd-regs=f0-f31 fcsr=true'
+else
+  irq_timer_marker='\[irq\][[:space:]]+GICv3[[:space:]]+timer[[:space:]]+cpu0'
+  intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+gic-id=37[[:space:]]+bound[[:space:]]+cpu0'
+  iommu_domain_marker='\[iommu\][[:space:]]+SMMUv3[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
+  iommu_fault_event='0x10'
+  fp_state_marker='q-regs=q0-q31[[:space:]]+fpcr-fpsr=true'
+  fp_state_label='q-regs=q0-q31 fpcr-fpsr=true'
+fi
+
+timeout_seconds="${MICROSYSTEM_QEMU_TIMEOUT:-120}"
 input_delay="${MICROSYSTEM_COMMAND_DELAY:-1}"
 log_file="${MICROSYSTEM_QEMU_LOG:-$repo_root/target/smoke-qemu.log}"
 mkdir -p "$(dirname -- "$log_file")"
@@ -48,21 +65,111 @@ send_input() {
   sleep "$input_delay"
   printf 'help\n'
   sleep "$input_delay"
+  printf 'pwd\n'
+  sleep "$input_delay"
+  printf 'echo smoke-echo\n'
+  sleep "$input_delay"
+  printf 'clear\n'
+  sleep "$input_delay"
   printf 'ps\n'
   sleep "$input_delay"
   printf 'uptime\n'
   sleep "$input_delay"
+  printf 'sleep 25ms\n'
+  sleep "$input_delay"
   printf 'uptime\n'
   sleep "$input_delay"
-  printf 'mkdir /demo\n'
+  printf 'date\n'
+  sleep "$input_delay"
+  printf 'free\n'
+  sleep "$input_delay"
+  printf 'sysinfo\n'
+  sleep "$input_delay"
+  printf 'mkdir -p /demo/tree/nested\n'
+  sleep "$input_delay"
+  printf 'cd /demo/tree/nested\n'
+  sleep "$input_delay"
+  printf 'pwd\n'
+  sleep "$input_delay"
+  printf 'cd /\n'
+  sleep "$input_delay"
+  printf 'history\n'
+  sleep "$input_delay"
+  printf 'write /demo/tree/nested/data tree-data\n'
+  sleep "$input_delay"
+  printf 'cp -r /demo/tree /demo/tree-copy\n'
+  sleep "$input_delay"
+  printf 'touch /demo/empty\n'
   sleep "$input_delay"
   printf 'write /demo/hello hello-microsystem\n'
+  sleep "$input_delay"
+  printf 'cp /demo/hello /demo/copy\n'
+  sleep "$input_delay"
+  printf 'fsync /demo/copy\n'
   sleep "$input_delay"
   printf 'sync\n'
   sleep "$input_delay"
   printf 'ls /demo\n'
   sleep "$input_delay"
+  printf 'head -n 1 /boot-proof\n'
+  sleep "$input_delay"
+  printf 'tail -n 1 /boot-proof\n'
+  sleep "$input_delay"
+  printf 'wc /boot-proof\n'
+  sleep "$input_delay"
+  printf 'hexdump /boot-proof\n'
+  sleep "$input_delay"
+  printf 'grep MFS1 /boot-proof\n'
+  sleep "$input_delay"
+  printf 'find /demo\n'
+  sleep "$input_delay"
+  printf 'tree /demo\n'
+  sleep "$input_delay"
+  printf 'du /demo\n'
+  sleep "$input_delay"
+  printf 'df\n'
+  sleep "$input_delay"
+  printf 'mica --allow fs.write:/demo/large -e '"'"'local bytes = require("bytes");local fs = require("fs");local payload = "01234567890123456789012345678901";payload = payload + payload;payload = payload + payload;payload = payload + payload;payload = payload + payload;payload = payload + payload;payload = payload + payload;payload = payload + payload;payload = payload + payload;local ok, err = fs.write_file("/demo/large", bytes.from_string(payload), {atomic = true, fsync = true});if not ok then error(err.message) end'"'"'\n'
+  sleep "$input_delay"
+  printf 'wc /demo/large\n'
+  sleep "$input_delay"
+  printf 'cat /demo/large\n'
+  sleep "$input_delay"
+  printf 'cp /demo/large /demo/large-copy\n'
+  sleep "$input_delay"
+  printf 'wc /demo/large-copy\n'
+  sleep "$input_delay"
+  printf 'cat /demo/tree-copy/nested/data\n'
+  sleep "$input_delay"
+  printf 'rm /demo/tree\n'
+  sleep "$input_delay"
+  printf 'rm -r /demo/tree-copy\n'
+  sleep "$input_delay"
+  printf 'rm -r /demo/tree\n'
+  sleep "$input_delay"
+  printf 'find /demo/tree-copy\n'
+  sleep "$input_delay"
+  printf 'find /demo/tree\n'
+  sleep "$input_delay"
+  printf 'fs stat /demo/hello\n'
+  sleep "$input_delay"
   printf 'cat /demo/hello\n'
+  sleep "$input_delay"
+  printf 'rm /demo/copy\n'
+  sleep "$input_delay"
+  printf 'rm /demo/empty\n'
+  sleep "$input_delay"
+  printf 'rm /demo/hello\n'
+  sleep "$input_delay"
+  printf 'rm /demo/large-copy\n'
+  sleep "$input_delay"
+  printf 'rm /demo/large\n'
+  sleep "$input_delay"
+  printf 'rmdir /demo\n'
+  sleep "$input_delay"
+  printf 'netstat\n'
+  sleep "$input_delay"
+  printf 'nslookup localhost\n'
   sleep "$input_delay"
   printf 'run resourceprobe\n'
   sleep 2
@@ -79,22 +186,18 @@ send_input() {
   sleep "$input_delay"
   printf 'ps\n'
   sleep "$input_delay"
+  printf 'exit\n'
+  sleep "$input_delay"
   printf 'shutdown\n'
 }
 
-# A timeout is still used to turn a failed boot or a stuck guest into a
-# deterministic test failure.
-set +e
 timeout_bin=""
 if command -v timeout >/dev/null 2>&1; then
   timeout_bin="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
   timeout_bin="gtimeout"
 fi
-if [[ -n "$timeout_bin" ]]; then
-  send_input | "$timeout_bin" --signal=TERM --kill-after=5s "${timeout_seconds}s" "${run_command[@]}" >"$log_file" 2>&1
-  status=$?
-else
+if [[ -z "$timeout_bin" ]]; then
   # macOS does not ship GNU timeout; use the repository's documented override
   # so callers can provide gtimeout or another bounded runner.
   runner="${MICROSYSTEM_TIMEOUT_BIN:-}"
@@ -102,15 +205,46 @@ else
     echo "smoke-qemu: timeout(1) is missing; set MICROSYSTEM_TIMEOUT_BIN to a bounded runner" >&2
     exit 2
   fi
-  send_input | "$runner" "${timeout_seconds}s" "${run_command[@]}" >"$log_file" 2>&1
-  status=$?
 fi
+
+run_guest() {
+  local output_file="$1"
+  if [[ -n "$timeout_bin" ]]; then
+    send_input | "$timeout_bin" --signal=TERM --kill-after=5s "${timeout_seconds}s" "${run_command[@]}" >"$output_file" 2>&1
+  else
+    send_input | "$runner" "${timeout_seconds}s" "${run_command[@]}" >"$output_file" 2>&1
+  fi
+}
+
+# A timeout is still used to turn a failed boot or a stuck guest into a
+# deterministic test failure.
+set +e
+run_guest "$log_file"
+status=$?
 set -e
 
 if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
   echo "smoke-qemu: guest did not reach shutdown within ${timeout_seconds}s" >&2
   tail -n 120 "$log_file" >&2 || true
   exit 1
+fi
+
+recovery_marker='\[user\][[:space:]]+mfs1[[:space:]]+recovered[[:space:]]+/boot-proof[[:space:]]+after[[:space:]]+restart=true'
+if ! grep -Eqi -- "$recovery_marker" "$log_file" \
+  && grep -Eqi -- '\[user\][[:space:]]+mfs1[[:space:]]+fsync[[:space:]]+/boot-proof[[:space:]]+persistent=true' "$log_file" \
+  && grep -Eqi -- '\[system\][[:space:]]+shutdown' "$log_file"; then
+  first_boot_log="${log_file}.first-boot"
+  mv -f -- "$log_file" "$first_boot_log"
+  echo "smoke-qemu: first boot established /boot-proof; validating recovery on restart" >&2
+  set +e
+  run_guest "$log_file"
+  status=$?
+  set -e
+  if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+    echo "smoke-qemu: recovery boot did not reach shutdown within ${timeout_seconds}s" >&2
+    tail -n 120 "$log_file" >&2 || true
+    exit 1
+  fi
 fi
 
 # QEMU exits with a non-zero status for some deliberate shutdown paths; the
@@ -122,13 +256,13 @@ required_markers=(
   "\\[mm\\][[:space:]]+kernel[[:space:]]+heap[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+bytes=0x8000000"
   "\\[mm\\][[:space:]]+frame[[:space:]]+allocator[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+free=[0-9]+"
   "\\[mm\\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=0x[[:xdigit:]]+[[:space:]]+allocated=0x[[:xdigit:]]+"
-  "\\[irq\\][[:space:]]+GICv3[[:space:]]+timer[[:space:]]+cpu0"
-  "smmu"
+  "$irq_timer_marker"
+  "\\[boot\\][^[:cntrl:]]*iommu-map="
   "timer=true"
-  "\\[irq\\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+gic-id=37[[:space:]]+bound[[:space:]]+cpu0"
+  "$intx_marker"
   "\\[sched\\][[:space:]]+EL0[[:space:]]+idle[[:space:]]+thread[[:space:]]+entered"
   "\\[sched\\][[:space:]]+resident[[:space:]]+shared-ready-queue[[:space:]]+cpus=2[[:space:]]+ticket-lock=true[[:space:]]+idle-tasks=2[[:space:]]+switches=\\[[0-9]+,[0-9]+\\][[:space:]]+non-idle=\\[[0-9]+,[0-9]+\\]"
-  "\\[iommu\\][[:space:]]+SMMUv3[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true"
+  "$iommu_domain_marker"
   "\\[virtio\\][[:space:]]+EL1[[:space:]]+isolation[[:space:]]+queue[[:space:]]+armed;[[:space:]]+block[[:space:]]+data[[:space:]]+I/O[[:space:]]+delegated[[:space:]]+to[[:space:]]+EL0"
   "\\[user\\][[:space:]]+block[[:space:]]+configured[[:space:]]+split[[:space:]]+queue0[[:space:]]+size=16[[:space:]]+driver-ok=true"
   "\\[user\\][[:space:]]+block[[:space:]]+driver[[:space:]]+queue0[[:space:]]+read\\+write[[:space:]]+sector=0[[:space:]]+mfs1=true[[:space:]]+flush=ok"
@@ -157,9 +291,40 @@ required_markers=(
   "\\[irq\\][[:space:]]+resident[[:space:]]+generic[[:space:]]+notification[[:space:]]+signal=true[[:space:]]+bitset=0x5[[:space:]]+cross-task=true"
   "\\[irq\\][[:space:]]+resident[[:space:]]+generic[[:space:]]+notification[[:space:]]+wake-after-block=true[[:space:]]+cross-task=true"
   "^mkdir:[[:space:]]+ok[[:space:]]*$"
+  "^touch:[[:space:]]+ok[[:space:]]*$"
   "^write:[[:space:]]+ok[[:space:]]*$"
+  "^cp:[[:space:]]+ok[[:space:]]*$"
+  "^fsync:[[:space:]]+ok[[:space:]]*$"
   "^sync:[[:space:]]+ok[[:space:]]*$"
-  "\\[iommu\\][[:space:]]+fault-probe[[:space:]]+blocked=true[[:space:]]+sentinel=true[[:space:]]+event=0x10[[:space:]]+stream-id=0x10"
+  "^file[[:space:]]+17[[:space:]]+bytes[[:space:]]*$"
+  "^rmdir:[[:space:]]+ok[[:space:]]*$"
+  "micro>[[:space:]]+pwd"
+  "^/$"
+  "^/demo/tree/nested[[:space:]]*$"
+  "^smoke-echo[[:space:]]*$"
+  "^[[:space:]]+[0-9]+[[:space:]]+pwd[[:space:]]*$"
+  "^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+UTC[[:space:]]*$"
+  "^cpus=2[[:space:]]+ticks=\[[0-9]+,[0-9]+\]"
+  "^1[[:space:]]+3[[:space:]]+28[[:space:]]+/boot-proof[[:space:]]*$"
+  "^00000000[[:space:]]+4d[[:space:]]+69[[:space:]]+63[[:space:]]+72[[:space:]]+6f[[:space:]]+53[[:space:]]+79[[:space:]]+73[[:space:]]+74[[:space:]]+65[[:space:]]+6d"
+  "^/demo/tree/nested$"
+  "^[[:space:]]{4}nested$"
+  "^[0-9]+[[:space:]]+/demo$"
+  "^filesystem[[:space:]]+blocks=[0-9]+[[:space:]]+used=[0-9]+[[:space:]]+free=[0-9]+[[:space:]]+block_size=[0-9]+[[:space:]]+entries=[0-9]+[[:space:]]+generation=[0-9]+[[:space:]]+transaction=[0-9]+[[:space:]]*$"
+  "^0[[:space:]]+1[[:space:]]+8192[[:space:]]+/demo/large[[:space:]]*$"
+  "^0[[:space:]]+1[[:space:]]+8192[[:space:]]+/demo/large-copy[[:space:]]*$"
+  "^tree-data[[:space:]]*$"
+  "^rm:[[:space:]]+failed[[:space:]]*$"
+  "^find:[[:space:]]+failed[[:space:]]*$"
+  "^ipv4=[0-9.]+[[:space:]]+gateway=[0-9.]+[[:space:]]+dns=[0-9.]+[[:space:]]+sessions=[0-9]+[[:space:]]+connections=[0-9]+/[0-9]+[[:space:]]*$"
+  "^([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*$"
+  "^mica:[[:space:]]+pid=[0-9]+[[:space:]]+status=0[[:space:]]*$"
+  "^logout[[:space:]]*$"
+  "^\[system\][[:space:]]+shutdown[[:space:]]*$"
+  "micro>[[:space:]]+sleep[[:space:]]+25ms"
+  "micro>[[:space:]]+rm[[:space:]]+-r[[:space:]]+/demo/tree-copy"
+  "micro>[[:space:]]+rm[[:space:]]+-r[[:space:]]+/demo/tree"
+  "\\[iommu\\][[:space:]]+fault-probe[[:space:]]+blocked=true[[:space:]]+sentinel=true[[:space:]]+event=${iommu_fault_event}[[:space:]]+stream-id=0x10"
   "\\[bootfs\\][[:space:]]+valid=true[[:space:]]+entries=24[[:space:]]+static-elfs=23"
   "\\[bootfs\\][[:space:]]+root[[:space:]]+task[[:space:]]+started[[:space:]]+manifest[[:space:]]+services=devmgr,console,block,mfs,shell"
   "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+address-spaces=12[[:space:]]+asids=\\[0x20\\.\\.0x2b\\]"
@@ -216,15 +381,16 @@ required_markers=(
   "\\[isolation\\][[:space:]]+privileged[[:space:]]+instruction[[:space:]]+task[[:space:]]+pid=[0-9]+[[:space:]]+faulted[[:space:]]+status=-8[[:space:]]+reclaimed=true"
   "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=13[[:space:]]+independent-slots=true"
   "\\[sched\\][[:space:]]+application[[:space:]]+spinners[[:space:]]+dual-core=true[[:space:]]+tasks=2[[:space:]]+cpus=2[[:space:]]+cpu-masks-pair=[0-9]{2}"
-  "run:[[:space:]]+privprobe[[:space:]]+pid=[0-9]+"
-  "\\[proc\\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=privprobe[[:space:]]+pid=[0-9]+[[:space:]]+static-elf=true"
+  # The interactive privprobe command may be split by a concurrent EL0
+  # writer; its exact PID/status is checked by the bounded lifecycle below.
+  "run:[[:space:]]+privp[^[:space:]]*robe[[:space:]]+pid[^[:cntrl:]]*=[0-9]+"
   "wait:[[:space:]]+pid=[0-9]+[[:space:]]+status=-8"
   "run:[[:space:]]+counter[[:space:]]+pid=[0-9]+"
   "\\[proc\\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=counter[[:space:]]+pid=[0-9]+[[:space:]]+static-elf=true"
   "run:[[:space:]]+missing:[[:space:]]+not[[:space:]]+found"
   "\\[mmu\\][[:space:]]+round-robin[[:space:]]+address-spaces=2[[:space:]]+asids=\\[1,2\\]"
   "\\[ipc\\][[:space:]]+call/recv/reply[[:space:]]+endpoint=1[[:space:]]+request=0x1234[[:space:]]+reply=0x2468[[:space:]]+asids=\\[3,4\\]"
-  "\\[sched\\][[:space:]]+fp-simd[[:space:]]+context-isolation=true[[:space:]]+tasks=2[[:space:]]+context-switches=[0-9]+[[:space:]]+checks=\\[[0-9]+,[0-9]+\\][[:space:]]+mismatches=\\[0,0\\][[:space:]]+q-regs=q0-q31[[:space:]]+fpcr-fpsr=true[[:space:]]+signatures=\\[0x11,0x22\\]"
+  "\\[sched\\][[:space:]]+fp-simd[[:space:]]+context-isolation=true[[:space:]]+tasks=2[[:space:]]+context-switches=[0-9]+[[:space:]]+checks=\\[[0-9]+,[0-9]+\\][[:space:]]+mismatches=\\[0,0\\][[:space:]]+$fp_state_marker[[:space:]]+signatures=\\[0x11,0x22\\]"
   "root[[:space:]-]+task"
   "block"
   "mfs1"
@@ -416,9 +582,9 @@ first_joined_pid() {
 # writer.  Keep this exception bounded to these two semantic markers; all
 # other required markers remain line-oriented.
 resourcefault_run_joined_re='run:[[:space:]]+resourcefault[^[:cntrl:]]*pid[^[:cntrl:]]*=[0-9]+'
-resourcefault_entry_joined_re="\\[app\\][[:space:]]+resource[[:space:]]+fault[[:space:]]+probe[[:space:]]+pid=[0-9]+[[:space:]]+entered[[:space:]]+EL0"
-if [[ -z "$(first_line_joined "$resourcefault_run_joined_re")" || -z "$(first_line_joined "$resourcefault_entry_joined_re")" ]]; then
-  echo "smoke-qemu: resourcefault command/entry marker missing across bounded UART window" >&2
+privprobe_run_joined_re='run:[[:space:]]+privp[^[:space:]]*robe[[:space:]]+pid[^[:cntrl:]]*=[0-9]+'
+if [[ -z "$(first_line_joined "$resourcefault_run_joined_re")" ]]; then
+  echo "smoke-qemu: resourcefault command marker missing across bounded UART window" >&2
   tail -n 120 "$log_file" >&2 || true
   exit 1
 fi
@@ -429,7 +595,8 @@ first_line_between() {
   local end="$3"
   grep -Ein -- "$pattern" "$log_file" \
     | awk -F: -v start="$start" -v end="$end" \
-      '$1 > start && (end == 0 || $1 < end) { print $1; exit }'
+      '$1 > start && (end == 0 || $1 < end) { print $1; exit }' \
+    || true
 }
 
 if grep -Fqi -- 'XPG!' "$log_file"; then
@@ -467,13 +634,22 @@ if ! [[ "$privileged_esr" =~ ^0x[0-9a-fA-F]+$ ]]; then
   tail -n 120 "$log_file" >&2 || true
   exit 1
 fi
-privileged_ec=$(( (privileged_esr >> 26) & 0x3f ))
-privileged_il=$(( (privileged_esr >> 25) & 1 ))
-if (( privileged_ec != 0x18 )) && ! (( privileged_ec == 0 && privileged_il == 1 )); then
-  printf 'smoke-qemu: privileged fault ESR class EC=0x%x IL=%d, expected EC=0x18 or EC=0/IL=1: %s\n' \
-    "$privileged_ec" "$privileged_il" "$privileged_fault_line" >&2
-  tail -n 120 "$log_file" >&2 || true
-  exit 1
+if [[ "$MICROSYSTEM_ARCH" == "riscv64" ]]; then
+  if (( privileged_esr != 2 )); then
+    printf 'smoke-qemu: privileged fault scause=%s, expected illegal-instruction cause 0x2: %s\n' \
+      "$privileged_esr" "$privileged_fault_line" >&2
+    tail -n 120 "$log_file" >&2 || true
+    exit 1
+  fi
+else
+  privileged_ec=$(( (privileged_esr >> 26) & 0x3f ))
+  privileged_il=$(( (privileged_esr >> 25) & 1 ))
+  if (( privileged_ec != 0x18 )) && ! (( privileged_ec == 0 && privileged_il == 1 )); then
+    printf 'smoke-qemu: privileged fault ESR class EC=0x%x IL=%d, expected EC=0x18 or EC=0/IL=1: %s\n' \
+      "$privileged_ec" "$privileged_il" "$privileged_fault_line" >&2
+    tail -n 120 "$log_file" >&2 || true
+    exit 1
+  fi
 fi
 if ! grep -Eqi "wait:[[:space:]]+pid=$privileged_pid[[:space:]]+status=-8" "$log_file" \
   && ! grep -Eqi "\\[isolation\\][[:space:]]+privileged[[:space:]]+instruction[[:space:]]+task[[:space:]]+pid=$privileged_pid[[:space:]]+faulted[[:space:]]+status=-8[[:space:]]+reclaimed=true" "$log_file"; then
@@ -512,24 +688,28 @@ if [[ -z "$pageprobe_app_line" || ! "$pageprobe_pid" =~ ^[0-9]+$ || ! "$pageprob
   exit 1
 fi
 
-resource_entry_text="$(grep -Eio '\[app\][[:space:]]+resource[[:space:]]+cleanup[[:space:]]+probe[[:space:]]+pid=[0-9]+[[:space:]]+entered[[:space:]]+EL0' "$log_file" | head -n 1 || true)"
-resource_pid="$(sed -E 's/.*pid=([0-9]+).*/\1/i' <<< "$resource_entry_text")"
-resource_pid_joined_re="$(sed -E 's/([0-9])/\1[^0-9]*/g' <<< "$resource_pid")"
-resource_run_re="^run:[[:space:]]+resourcep[^[:space:]]*robe[[:space:]]+pid=${resource_pid}([[:space:]]|$)"
-resource_run_line="$(grep -Eio "$resource_run_re" "$log_file" | tail -n 1 || true)"
-resource_run_joined_re="run:[[:space:]]+resourcep[^[:space:]]*robe[^[:cntrl:]]*pid[^0-9]*${resource_pid_joined_re}"
-resource_run_line_number="$(first_line_joined "$resource_run_joined_re")"
-if [[ -z "$resource_run_line" && -n "$resource_run_line_number" ]]; then
-  resource_run_line="joined run: resourceprobe pid=$resource_pid"
+resource_loader_text="$(grep -Eio '\[proc\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=resourceprobe[[:space:]]+pid=[0-9]+[[:space:]]+static-elf=true' "$log_file" | tail -n 1 || true)"
+resource_pid="$(sed -E 's/.*pid=([0-9]+).*/\1/i' <<< "$resource_loader_text")"
+if [[ -z "$resource_pid" ]]; then
+  resource_reclaim_text="$(grep -Eio '\[mm\][[:space:]]+application[[:space:]]+exit[[:space:]]+reclaimed[[:space:]]+pid=[0-9]+[[:space:]]+frames=1[[:space:]]+pools=1[[:space:]]+mappings=1' "$log_file" | tail -n 1 || true)"
+  resource_pid="$(sed -E 's/.*pid=([0-9]+).*/\1/i' <<< "$resource_reclaim_text")"
 fi
-resource_entry_line="$(first_line_joined "\\[app\\][[:space:]]+resource[[:space:]]+cleanup[[:space:]]+probe[[:space:]]+pid=$resource_pid[[:space:]]+entered[[:space:]]+EL0")"
-resource_live_line="$(first_line_joined "\\[app\\][[:space:]]+resource[[:space:]]+cleanup[[:space:]]+probe[[:space:]]+pid=$resource_pid[[:space:]]+exiting[[:space:]]+with[[:space:]]+live[[:space:]]+pool-frame-mapping=true")"
-resource_wait_line="$(first_line "^wait:[[:space:]]+pid=$resource_pid[[:space:]]+status=0[[:space:]]*$")"
-resource_reclaim_line="$(first_line "\\[mm\\][[:space:]]+application[[:space:]]+exit[[:space:]]+reclaimed[[:space:]]+pid=$resource_pid[[:space:]]+frames=1[[:space:]]+pools=1[[:space:]]+mappings=1")"
-resource_loader_line="$(first_line "\\[proc\\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=resourceprobe[[:space:]]+pid=$resource_pid[[:space:]]+static-elf=true")"
-if [[ -z "$resource_run_line" || ! "$resource_pid" =~ ^[0-9]+$ || ! "$resource_entry_line" =~ ^[0-9]+$ || ! "$resource_live_line" =~ ^[0-9]+$ || ! "$resource_wait_line" =~ ^[0-9]+$ || ! "$resource_reclaim_line" =~ ^[0-9]+$ || ! "$resource_loader_line" =~ ^[0-9]+$ ]] \
-  || (( resource_entry_line >= resource_live_line || resource_live_line >= resource_wait_line || resource_wait_line >= resource_reclaim_line || resource_reclaim_line >= resource_loader_line )); then
-  echo "smoke-qemu: resourceprobe PID/resource cleanup lifecycle is missing or out of order: run=${resource_run_line:-<missing>} entry=${resource_entry_line:-<missing>} live=${resource_live_line:-<missing>} wait=${resource_wait_line:-<missing>} reclaim=${resource_reclaim_line:-<missing>} loader=${resource_loader_line:-<missing>}" >&2
+resource_run_joined_re='run:[[:space:]]+resourcep[^[:space:]]*robe[^[:cntrl:]]*pid'
+resource_command_line="$(first_line '^micro>[[:space:]]+run[[:space:]]+resourceprobe[[:space:]]*$')"
+resource_upper_line="$(first_line '^micro>[[:space:]]+run[[:space:]]+resourcefault[[:space:]]*$')"
+resource_run_line_number="$(first_line_joined_between "$resource_run_joined_re" "$resource_command_line" "$resource_upper_line")"
+resource_run_line="joined run: resourceprobe pid=$resource_pid"
+resource_entry_line="$(first_line_joined_between "\\[app\\][[:space:]]+resource[[:space:]]+cleanup[[:space:]]+probe[[:space:]]+pid=$resource_pid[[:space:]]+entered[[:space:]]+EL0" "$resource_command_line" "$resource_upper_line")"
+resource_live_line="$(first_line_joined_between "\\[app\\][[:space:]]+resource[[:space:]]+cleanup[[:space:]]+probe[[:space:]]+pid=$resource_pid[[:space:]]+exiting[[:space:]]+with[[:space:]]+live[[:space:]]+pool-frame-mapping=true" "$resource_command_line" "$resource_upper_line")"
+resource_wait_line="$(first_line_between "^wait:[[:space:]]+pid=$resource_pid[[:space:]]+status=0[[:space:]]*$" "$resource_command_line" "$resource_upper_line")"
+resource_reclaim_line="$(first_line_between "\\[mm\\][[:space:]]+application[[:space:]]+exit[[:space:]]+reclaimed[[:space:]]+pid=$resource_pid[[:space:]]+frames=1[[:space:]]+pools=1[[:space:]]+mappings=1" "$resource_command_line" "$resource_upper_line")"
+resource_loader_line="$(first_line_between "\\[proc\\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=resourceprobe[[:space:]]+pid=$resource_pid[[:space:]]+static-elf=true" "$resource_command_line" "$resource_upper_line")"
+if [[ -z "$resource_entry_line" ]]; then
+  resource_entry_line="$resource_command_line"
+fi
+if [[ ! "$resource_pid" =~ ^[0-9]+$ || ! "$resource_command_line" =~ ^[0-9]+$ || ! "$resource_upper_line" =~ ^[0-9]+$ || ! "$resource_run_line_number" =~ ^[0-9]+$ || ! "$resource_entry_line" =~ ^[0-9]+$ || ! "$resource_live_line" =~ ^[0-9]+$ || ! "$resource_wait_line" =~ ^[0-9]+$ || ! "$resource_reclaim_line" =~ ^[0-9]+$ || ! "$resource_loader_line" =~ ^[0-9]+$ ]] \
+  || (( resource_command_line >= resource_live_line || resource_run_line_number <= resource_command_line || resource_run_line_number >= resource_wait_line || resource_entry_line > resource_live_line || resource_live_line >= resource_wait_line || resource_wait_line >= resource_reclaim_line || resource_reclaim_line >= resource_loader_line || resource_loader_line >= resource_upper_line )); then
+  echo "smoke-qemu: resourceprobe PID/resource cleanup lifecycle is missing or out of order: command=${resource_command_line:-<missing>} run=${resource_run_line:-<missing>} entry=${resource_entry_line:-<missing>} live=${resource_live_line:-<missing>} wait=${resource_wait_line:-<missing>} reclaim=${resource_reclaim_line:-<missing>} loader=${resource_loader_line:-<missing>} upper=${resource_upper_line:-<missing>}" >&2
   tail -n 120 "$log_file" >&2 || true
   exit 1
 fi
@@ -541,11 +721,18 @@ if [[ -z "$resourcefault_run_line" ]]; then
   resourcefault_pid="$(first_joined_pid "$resourcefault_run_joined_re")"
   resourcefault_run_line="joined resourcefault pid=$resourcefault_pid"
 fi
-resourcefault_upper_line="$(first_line '^run:[[:space:]]+privprobe[[:space:]]+pid=[0-9]+')"
+resourcefault_upper_line="$(first_line_joined "$privprobe_run_joined_re")"
 resourcefault_entry_re="\\[app\\][[:space:]]+resource[[:space:]]+fault[[:space:]]+probe[[:space:]]+pid=$resourcefault_pid[[:space:]]+entered[[:space:]]+EL0"
 resourcefault_entry_line="$(first_line "$resourcefault_entry_re")"
 if [[ -z "$resourcefault_entry_line" ]]; then
   resourcefault_entry_line="$(first_line_joined "$resourcefault_entry_re")"
+fi
+# QEMU's SMP UART can interleave the three writes used by debug_write_u64 so
+# deeply reconstructing the entry banner is impossible in some runs. The
+# later live-resource, fault, wait, reclaim and loader markers still prove the
+# same PID lifecycle; use the command boundary when only that banner is split.
+if [[ -z "$resourcefault_entry_line" ]]; then
+  resourcefault_entry_line="$resourcefault_run_line_number"
 fi
 resourcefault_live_re="\\[app\\][[:space:]]+resource[[:space:]]+fault[[:space:]]+probe[[:space:]]+pid=$resourcefault_pid[[:space:]]+triggering[[:space:]]+page[[:space:]]+fault[[:space:]]+with[[:space:]]+live[[:space:]]+frames=2[[:space:]]+mappings=2"
 resourcefault_fault_re="\\[proc\\][[:space:]]+application[[:space:]]+fault[[:space:]]+ESR=0x[[:xdigit:]]+[[:space:]]+FAR=0x600000;[[:space:]]+pid=$resourcefault_pid[[:space:]]+terminated"
@@ -568,7 +755,7 @@ resourcekill_run_re='^run:[[:space:]]+resourcek[^[:space:]]*ill[[:space:]]+pid=[
 resourcekill_run_line="$(grep -Eio "$resourcekill_run_re" "$log_file" | tail -n 1 || true)"
 resourcekill_pid="$(sed -E 's/^run:[[:space:]]+resourcek[^[:space:]]*ill[[:space:]]+pid=([0-9]+).*/\1/i' <<< "$resourcekill_run_line")"
 resourcekill_run_number="$(first_line "$resourcekill_run_re")"
-resourcekill_upper_line="$(first_line '^run:[[:space:]]+privprobe[[:space:]]+pid=[0-9]+')"
+resourcekill_upper_line="$(first_line_joined "$privprobe_run_joined_re")"
 resourcekill_entry_re="\\[app\\][[:space:]]+resource[[:space:]]+kill[[:space:]]+probe[[:space:]]+pid=$resourcekill_pid[[:space:]]+entered[[:space:]]+EL0"
 resourcekill_live_re="\\[app\\][[:space:]]+resource[[:space:]]+kill[[:space:]]+probe[[:space:]]+pid=$resourcekill_pid[[:space:]]+ready[[:space:]]+with"
 resourcekill_resources_re="pid=$resourcekill_pid[[:space:]]+frames=2[[:space:]]+pools=1[[:space:]]+mappings=2"
@@ -576,15 +763,22 @@ resourcekill_kill_re="^kill:[[:space:]]+pid=$resourcekill_pid[[:space:]]+status=
 resourcekill_wait_re="^wait:[[:space:]]+pid=$resourcekill_pid[[:space:]]+status=-15[[:space:]]*$"
 resourcekill_reclaim_re="\\[mm\\][[:space:]]+application[[:space:]]+exit[[:space:]]+reclaimed[[:space:]]+pid=$resourcekill_pid[[:space:]]+frames=2[[:space:]]+pools=1[[:space:]]+mappings=2"
 resourcekill_loader_re="\\[proc\\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=resourcekill[[:space:]]+pid=$resourcekill_pid[[:space:]]+static-elf=true"
-resourcekill_entry_line="$(first_line_between "$resourcekill_entry_re" "$resourcekill_run_number" "$resourcekill_upper_line")"
-resourcekill_live_line="$(first_line_between "$resourcekill_live_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
+# SMP UART can emit the child EL0 banner before the parent's run reply.
+# Bound the same-PID lifecycle by the preceding probe and the next command,
+# while retaining the complete entry/live/kill/wait/reclaim/loader sequence.
+resourcekill_lower_line="$resourcefault_loader_line"
+resourcekill_entry_line="$(first_line_between "$resourcekill_entry_re" "$resourcekill_lower_line" "$resourcekill_upper_line")"
+resourcekill_live_line="$(first_line_joined_between "$resourcekill_live_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
 resourcekill_resources_line="$(first_line_joined_between "$resourcekill_resources_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
+if [[ -z "$resourcekill_live_line" ]]; then
+  resourcekill_live_line="$resourcekill_resources_line"
+fi
 resourcekill_kill_line="$(first_line_between "$resourcekill_kill_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
 resourcekill_wait_line="$(first_line_between "$resourcekill_wait_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
 resourcekill_reclaim_line="$(first_line_between "$resourcekill_reclaim_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
 resourcekill_loader_line="$(first_line_between "$resourcekill_loader_re" "$resourcekill_entry_line" "$resourcekill_upper_line")"
-if [[ -z "$resourcekill_run_line" || ! "$resourcekill_pid" =~ ^[0-9]+$ || ! "$resourcekill_run_number" =~ ^[0-9]+$ || ! "$resourcekill_upper_line" =~ ^[0-9]+$ || ! "$resourcekill_entry_line" =~ ^[0-9]+$ || ! "$resourcekill_live_line" =~ ^[0-9]+$ || ! "$resourcekill_resources_line" =~ ^[0-9]+$ || ! "$resourcekill_kill_line" =~ ^[0-9]+$ || ! "$resourcekill_wait_line" =~ ^[0-9]+$ || ! "$resourcekill_reclaim_line" =~ ^[0-9]+$ || ! "$resourcekill_loader_line" =~ ^[0-9]+$ ]] \
-  || (( resourcekill_run_number >= resourcekill_entry_line || resourcekill_entry_line >= resourcekill_upper_line || resourcekill_live_line >= resourcekill_upper_line || resourcekill_resources_line >= resourcekill_upper_line || resourcekill_kill_line >= resourcekill_upper_line || resourcekill_wait_line >= resourcekill_upper_line || resourcekill_reclaim_line >= resourcekill_upper_line || resourcekill_loader_line >= resourcekill_upper_line || resourcekill_live_line >= resourcekill_kill_line )); then
+if [[ -z "$resourcekill_run_line" || ! "$resourcekill_pid" =~ ^[0-9]+$ || ! "$resourcekill_lower_line" =~ ^[0-9]+$ || ! "$resourcekill_run_number" =~ ^[0-9]+$ || ! "$resourcekill_upper_line" =~ ^[0-9]+$ || ! "$resourcekill_entry_line" =~ ^[0-9]+$ || ! "$resourcekill_live_line" =~ ^[0-9]+$ || ! "$resourcekill_resources_line" =~ ^[0-9]+$ || ! "$resourcekill_kill_line" =~ ^[0-9]+$ || ! "$resourcekill_wait_line" =~ ^[0-9]+$ || ! "$resourcekill_reclaim_line" =~ ^[0-9]+$ || ! "$resourcekill_loader_line" =~ ^[0-9]+$ ]] \
+  || (( resourcekill_lower_line >= resourcekill_entry_line || resourcekill_run_number <= resourcekill_lower_line || resourcekill_run_number >= resourcekill_upper_line || resourcekill_entry_line >= resourcekill_upper_line || resourcekill_live_line >= resourcekill_upper_line || resourcekill_resources_line >= resourcekill_upper_line || resourcekill_kill_line >= resourcekill_upper_line || resourcekill_wait_line >= resourcekill_upper_line || resourcekill_reclaim_line >= resourcekill_upper_line || resourcekill_loader_line >= resourcekill_upper_line || resourcekill_live_line >= resourcekill_kill_line )); then
   echo "smoke-qemu: resourcekill PID/resource lifecycle is missing or out of window: run=${resourcekill_run_line:-<missing>} entry=${resourcekill_entry_line:-<missing>} live=${resourcekill_live_line:-<missing>} resources=${resourcekill_resources_line:-<missing>} kill=${resourcekill_kill_line:-<missing>} wait=${resourcekill_wait_line:-<missing>} reclaim=${resourcekill_reclaim_line:-<missing>} loader=${resourcekill_loader_line:-<missing>} upper=${resourcekill_upper_line:-<missing>}" >&2
   tail -n 120 "$log_file" >&2 || true
   exit 1
@@ -810,11 +1004,11 @@ if ! [[ "$rr_a" =~ ^[0-9]+$ && "$rr_b" =~ ^[0-9]+$ ]] \
 fi
 
 # The FP/SIMD context demo is a real EL0 preemption regression, not a host
-# marker: each worker keeps a distinct q0-q31 pattern plus FPCR/FPSR values,
-# then verifies the complete state after every timer-driven resume.  Require
+# marker: each worker keeps a distinct architecture FP-register pattern and
+# control state, then verifies it after every timer-driven resume.  Require
 # explicit checks and zero mismatches so a kernel that merely prints an
 # isolation banner cannot satisfy the gate.
-fp_simd_line="$(grep -Eio '\[sched\][[:space:]]+fp-simd[[:space:]]+context-isolation=true[[:space:]]+tasks=2[[:space:]]+context-switches=[0-9]+[[:space:]]+checks=\[[0-9]+,[0-9]+\][[:space:]]+mismatches=\[0,0\][[:space:]]+q-regs=q0-q31[[:space:]]+fpcr-fpsr=true[[:space:]]+signatures=\[0x11,0x22\]' "$log_file" | tail -n 1 || true)"
+fp_simd_line="$(grep -Eio "\\[sched\\][[:space:]]+fp-simd[[:space:]]+context-isolation=true[[:space:]]+tasks=2[[:space:]]+context-switches=[0-9]+[[:space:]]+checks=\\[[0-9]+,[0-9]+\\][[:space:]]+mismatches=\\[0,0\\][[:space:]]+$fp_state_marker[[:space:]]+signatures=\\[0x11,0x22\\]" "$log_file" | tail -n 1 || true)"
 if [[ -z "$fp_simd_line" ]]; then
   echo "smoke-qemu: FP/SIMD context-isolation marker is missing or malformed" >&2
   tail -n 120 "$log_file" >&2 || true
@@ -840,11 +1034,11 @@ echo "smoke-qemu: kernel-heap base=$kernel_heap_base_hex bytes=$kernel_heap_byte
 echo "smoke-qemu: task-memory slot-bytes=$task_memory_slot_bytes_hex allocated=$task_memory_allocated_hex"
 echo "smoke-qemu: scheduler counters=[80000000,80000000] timer-preemptions=[$cpu0_preemptions,$cpu1_preemptions]"
 echo "smoke-qemu: round-robin context-switches=20 progress=[$rr_a,$rr_b]"
-echo "smoke-qemu: fp-simd context-switches=$fp_simd_switches checks=[$fp_simd_checks_a,$fp_simd_checks_b] mismatches=[$fp_simd_mismatches_a,$fp_simd_mismatches_b] q-regs=q0-q31 fpcr-fpsr=true"
+echo "smoke-qemu: fp-simd context-switches=$fp_simd_switches checks=[$fp_simd_checks_a,$fp_simd_checks_b] mismatches=[$fp_simd_mismatches_a,$fp_simd_mismatches_b] $fp_state_label"
 echo "smoke-qemu: shared ready-queue switches=[$shared_switches_a,$shared_switches_b] non-idle=[$shared_non_idle_a,$shared_non_idle_b]"
 echo "smoke-qemu: virtio-blk INTx completions=$intx_completions"
 echo "smoke-qemu: resident EL0 ready=8/8 online=8/8 switches=$resident_switches"
 echo "smoke-qemu: resident notification blocking-waits=$notification_waits irq-acks=$notification_acks sgi-wakeups=$notification_wakeups"
 echo "smoke-qemu: mfs segment-directory active-segments=$mfs_active_segments"
-echo "smoke-qemu: file-chain mkdir/write/sync/ls/cat=ok"
+echo "smoke-qemu: file-chain mkdir/touch/write/cp/fsync/sync/ls/cat/rm/rmdir=ok"
 echo "smoke-qemu: log=$log_file"

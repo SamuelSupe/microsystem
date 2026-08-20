@@ -25,6 +25,9 @@ impl<D: BlockDevice> FileService<D> {
     pub fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
         self.filesystem.read(path)
     }
+    pub fn read_range(&self, path: &str, offset: usize, maximum: usize) -> Result<Vec<u8>, Error> {
+        self.filesystem.read_range(path, offset, maximum)
+    }
     pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
         self.filesystem.metadata(path)
     }

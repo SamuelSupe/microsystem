@@ -1,13 +1,14 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-const KERNEL_OFFSET: usize = 0xffffff8000000000;
 const STREAM_ENTRIES: usize = 64;
 const DMA_IOVA: u64 = 0x0010_0000;
 const RUNTIME_IOVA_PAGES: u64 = 32;
 const PROBE_IOVA: u64 = 0x0018_0000;
 const CMDQ_LOG2_ENTRIES: u32 = 7;
 const CMDQ_ENTRIES: u32 = 1 << CMDQ_LOG2_ENTRIES;
+const CMDQ_INDEX_MASK: u32 = CMDQ_ENTRIES - 1;
+const CMDQ_POSITION_MASK: u32 = (CMDQ_ENTRIES << 1) - 1;
 const CMDQ_OP_TLBI_NH_VA: u64 = 0x12;
 const CMDQ_OP_SYNC: u64 = 0x46;
 const CMDQ_OP_CFGI_STE: u64 = 0x03;
@@ -17,6 +18,7 @@ pub const KEYBOARD_QUEUE_IOVA: u64 = 0x0050_1000;
 pub const TABLET_QUEUE_IOVA: u64 = 0x0050_2000;
 pub const NET_RX_QUEUE_IOVA: u64 = 0x0050_3000;
 pub const NET_TX_QUEUE_IOVA: u64 = 0x0050_4000;
+pub const RNG_QUEUE_IOVA: u64 = 0x0050_5000;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Error {
@@ -87,7 +89,7 @@ pub fn create_domain(
         return Err(Error::StreamId);
     }
 
-    let base = KERNEL_OFFSET + smmu_physical;
+    let base = crate::arch::phys_to_virt(smmu_physical as u64);
     let idr0 = read32(base);
     let idr1 = read32(base + 0x04);
     let idr5 = read32(base + 0x14);
@@ -145,7 +147,7 @@ pub fn create_domain(
         );
         core::ptr::write_volatile(level3.add(((DMA_IOVA >> 12) & 0x1ff) as usize), 0);
         core::ptr::write_volatile(level3.add((((DMA_IOVA + 4096) >> 12) & 0x1ff) as usize), 0);
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        crate::arch::dma_write_barrier();
     }
 
     write32(base + 0x28, 0x0d75);
@@ -194,7 +196,7 @@ pub fn map_gui_pages(physical_base: u64, pages: usize, queue_physical: u64) -> R
             core::ptr::addr_of_mut!((*gui)[1][256]),
             queue_physical | 3 | (1 << 10),
         );
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        crate::arch::dma_write_barrier();
     }
     Ok(())
 }
@@ -202,7 +204,11 @@ pub fn map_gui_pages(physical_base: u64, pages: usize, queue_physical: u64) -> R
 pub fn map_gui_aux_page(iova: u64, physical: u64) -> Result<(), Error> {
     if !matches!(
         iova,
-        KEYBOARD_QUEUE_IOVA | TABLET_QUEUE_IOVA | NET_RX_QUEUE_IOVA | NET_TX_QUEUE_IOVA
+        KEYBOARD_QUEUE_IOVA
+            | TABLET_QUEUE_IOVA
+            | NET_RX_QUEUE_IOVA
+            | NET_TX_QUEUE_IOVA
+            | RNG_QUEUE_IOVA
     ) || physical & 0xfff != 0
     {
         return Err(Error::Address);
@@ -218,7 +224,7 @@ pub fn map_gui_aux_page(iova: u64, physical: u64) -> Result<(), Error> {
             core::ptr::addr_of_mut!((*gui)[table][index]),
             physical | 3 | (1 << 10),
         );
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        crate::arch::dma_write_barrier();
     }
     let base = ACTIVE_BASE.load(Ordering::Acquire);
     if base == 0 {
@@ -243,7 +249,7 @@ pub fn attach_stream(stream_id: u32) -> Result<(), Error> {
             stream.add(stream_id as usize * 8),
             (physical(context) & !0x3f) | 1 | (5 << 1),
         );
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        crate::arch::dma_write_barrier();
     }
     submit_config_command(base, stream_id)
 }
@@ -258,7 +264,7 @@ pub fn take_fault() -> Option<FaultEvent> {
     if producer == consumer {
         return None;
     }
-    unsafe { core::arch::asm!("dmb oshld", options(nostack, preserves_flags)) };
+    crate::arch::dma_read_barrier();
     let event = unsafe { core::ptr::addr_of_mut!((*TABLES.0.get()).event).cast::<u64>() };
     let slot = ((consumer & 0x7f) as usize) * 4;
     let first = unsafe { core::ptr::read_volatile(event.add(slot)) };
@@ -272,36 +278,7 @@ pub fn take_fault() -> Option<FaultEvent> {
 }
 
 fn submit_config_command(base: usize, stream_id: u32) -> Result<(), Error> {
-    let producer = COMMAND_PRODUCER.load(Ordering::Acquire);
-    if producer + 2 >= CMDQ_ENTRIES {
-        return Err(Error::Command);
-    }
-    let command = unsafe {
-        core::ptr::addr_of_mut!((*TABLES.0.get()).command)
-            .cast::<u64>()
-            .add(producer as usize * 2)
-    };
-    unsafe {
-        core::ptr::write_volatile(command, CMDQ_OP_CFGI_STE | ((stream_id as u64) << 32));
-        core::ptr::write_volatile(command.add(1), 0);
-        core::ptr::write_volatile(command.add(2), CMDQ_OP_SYNC);
-        core::ptr::write_volatile(command.add(3), 0);
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
-    }
-    let next = producer + 2;
-    write32(base + 0x98, next);
-    for _ in 0..1_000_000 {
-        let consumer = read32(base + 0x9c);
-        if consumer >> 24 & 0x7f != 0 {
-            return Err(Error::Command);
-        }
-        if consumer & (CMDQ_ENTRIES - 1) == next {
-            COMMAND_PRODUCER.store(next, Ordering::Release);
-            return Ok(());
-        }
-        core::hint::spin_loop();
-    }
-    Err(Error::AckTimeout)
+    submit_commands(base, [CMDQ_OP_CFGI_STE | ((stream_id as u64) << 32), 0])
 }
 
 impl Domain {
@@ -315,7 +292,7 @@ impl Domain {
         if producer == consumer {
             return None;
         }
-        unsafe { core::arch::asm!("dmb oshld", options(nostack, preserves_flags)) };
+        crate::arch::dma_read_barrier();
         let first = unsafe { core::ptr::read_volatile(self.event) };
         let address = unsafe { core::ptr::read_volatile(self.event.add(2)) };
         write32(self.base + 0xac, producer);
@@ -356,36 +333,48 @@ fn update_runtime_page(iova: u64, descriptor: u64) -> Result<(), Error> {
     let level3 = unsafe { core::ptr::addr_of_mut!((*tables).level3).cast::<u64>() };
     unsafe {
         core::ptr::write_volatile(level3.add(((iova >> 12) & 0x1ff) as usize), descriptor);
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        crate::arch::dma_write_barrier();
     }
     invalidate_runtime_page(base, iova)
 }
 
 fn invalidate_runtime_page(base: usize, iova: u64) -> Result<(), Error> {
+    submit_commands(base, [CMDQ_OP_TLBI_NH_VA, (iova & !0xfff) | 1])
+}
+
+fn submit_commands(base: usize, first: [u64; 2]) -> Result<(), Error> {
     let producer = COMMAND_PRODUCER.load(Ordering::Acquire);
-    if producer + 2 >= CMDQ_ENTRIES {
-        return Err(Error::Command);
+    for _ in 0..1_000_000 {
+        let consumer = read32(base + 0x9c);
+        if consumer >> 24 & 0x7f != 0 {
+            return Err(Error::Command);
+        }
+        if consumer & CMDQ_POSITION_MASK == producer {
+            break;
+        }
+        core::hint::spin_loop();
     }
-    let command = unsafe {
-        core::ptr::addr_of_mut!((*TABLES.0.get()).command)
-            .cast::<u64>()
-            .add(producer as usize * 2)
-    };
+    if read32(base + 0x9c) & CMDQ_POSITION_MASK != producer {
+        return Err(Error::AckTimeout);
+    }
+    let queue = unsafe { core::ptr::addr_of_mut!((*TABLES.0.get()).command).cast::<u64>() };
+    let first_slot = (producer & CMDQ_INDEX_MASK) as usize * 2;
+    let sync_slot = (producer.wrapping_add(1) & CMDQ_INDEX_MASK) as usize * 2;
     unsafe {
-        core::ptr::write_volatile(command, CMDQ_OP_TLBI_NH_VA);
-        core::ptr::write_volatile(command.add(1), (iova & !0xfff) | 1);
-        core::ptr::write_volatile(command.add(2), CMDQ_OP_SYNC);
-        core::ptr::write_volatile(command.add(3), 0);
-        core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+        core::ptr::write_volatile(queue.add(first_slot), first[0]);
+        core::ptr::write_volatile(queue.add(first_slot + 1), first[1]);
+        core::ptr::write_volatile(queue.add(sync_slot), CMDQ_OP_SYNC);
+        core::ptr::write_volatile(queue.add(sync_slot + 1), 0);
+        crate::arch::dma_write_barrier();
     }
-    let next = producer + 2;
+    let next = producer.wrapping_add(2) & CMDQ_POSITION_MASK;
     write32(base + 0x98, next);
     for _ in 0..1_000_000 {
         let consumer = read32(base + 0x9c);
         if consumer >> 24 & 0x7f != 0 {
             return Err(Error::Command);
         }
-        if consumer & (CMDQ_ENTRIES - 1) == next {
+        if consumer & CMDQ_POSITION_MASK == next {
             COMMAND_PRODUCER.store(next, Ordering::Release);
             return Ok(());
         }
@@ -395,7 +384,7 @@ fn invalidate_runtime_page(base: usize, iova: u64) -> Result<(), Error> {
 }
 
 fn physical(pointer: *mut u64) -> u64 {
-    pointer as usize as u64 - KERNEL_OFFSET as u64
+    crate::arch::virt_to_phys(pointer as usize as u64).unwrap_or(0)
 }
 
 fn wait_cr0(base: usize, expected: u32) -> Result<(), Error> {

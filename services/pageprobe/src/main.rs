@@ -10,9 +10,7 @@ pub extern "C" fn _start(pid: u64) -> ! {
         pid,
         b" entered EL0\n",
     );
-    unsafe {
-        core::arch::asm!("ldr xzr, [{address}]", address = in(reg) 0x0060_0000u64, options(nostack));
-    }
+    unsafe { microsystem_user_rt::fault_probe(0x0060_0000) };
     microsystem_user_rt::exit(1)
 }
 

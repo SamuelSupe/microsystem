@@ -1,6 +1,5 @@
 use core::cell::UnsafeCell;
 
-const KERNEL_OFFSET: usize = 0xffffff8000000000;
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK_MODERN: u16 = 0x1042;
 pub const VIRTIO_GPU_MODERN: u16 = 0x1050;
@@ -248,7 +247,7 @@ fn transport_from_bars(
                     .checked_add(offset as u64)
                     .filter(|address| *address >= mmio_base as u64 && *address < window_end)
                     .ok_or(VirtioError::CapabilityBar)?;
-                let address = KERNEL_OFFSET + physical as usize;
+                let address = crate::arch::phys_to_virt(physical);
                 match kind {
                     1 => common = address,
                     2 => {
@@ -323,7 +322,7 @@ impl VirtioTransport {
     }
 
     pub fn queue_physical(&self) -> u64 {
-        BLOCK_QUEUE.0.get() as usize as u64 - KERNEL_OFFSET as u64
+        crate::arch::virt_to_phys(BLOCK_QUEUE.0.get() as usize as u64).unwrap_or(0)
     }
 
     pub fn user_grant(&self, dma_iova: u64, pci_function_physical: u64) -> UserTransportGrant {
@@ -340,7 +339,7 @@ impl VirtioTransport {
     }
 
     pub fn data_physical(&self) -> u64 {
-        BLOCK_DATA.0.get() as usize as u64 - KERNEL_OFFSET as u64
+        crate::arch::virt_to_phys(BLOCK_DATA.0.get() as usize as u64).unwrap_or(0)
     }
 
     pub fn reset_for_user(&self, ecam_physical: usize, device: Device) {
@@ -353,7 +352,7 @@ impl VirtioTransport {
             0x04,
             command & !((1 << 1) | (1 << 2)),
         );
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        crate::arch::dma_barrier();
     }
 
     pub fn prepare_fault_probe(&self, dma_base: u64) -> Result<(), BlockIoError> {
@@ -395,7 +394,7 @@ impl VirtioTransport {
 
     pub fn probe_dma_fault(&self, dma_base: u64) -> DmaFaultProbe {
         let sentinel = DMA_SENTINEL.0.get().cast::<u8>();
-        let attempted_iova = sentinel as usize as u64 - KERNEL_OFFSET as u64;
+        let attempted_iova = crate::arch::virt_to_phys(sentinel as usize as u64).unwrap_or(0);
         unsafe {
             core::ptr::write_volatile(sentinel as *mut u64, SENTINEL_VALUE);
             dma_write_barrier();
@@ -505,7 +504,7 @@ impl VirtioTransport {
 }
 
 fn physical_page(high_address: usize) -> u64 {
-    ((high_address - KERNEL_OFFSET) as u64) & !0xfff
+    crate::arch::virt_to_phys(high_address as u64).unwrap_or(0) & !0xfff
 }
 
 fn configured_bars(ecam: usize, device: Device) -> [u64; 6] {
@@ -529,7 +528,9 @@ fn configured_bars(ecam: usize, device: Device) -> [u64; 6] {
 }
 
 fn config_address(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> usize {
-    KERNEL_OFFSET + ecam_physical + ((slot as usize) << 15) + ((function as usize) << 12) + offset
+    crate::arch::phys_to_virt(
+        ecam_physical as u64 + ((slot as u64) << 15) + ((function as u64) << 12) + offset as u64,
+    )
 }
 
 fn read8(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u8 {
@@ -604,9 +605,9 @@ unsafe fn write_descriptor(
 }
 
 unsafe fn dma_write_barrier() {
-    unsafe { core::arch::asm!("dmb oshst", options(nostack, preserves_flags)) }
+    crate::arch::dma_write_barrier()
 }
 
 unsafe fn dma_read_barrier() {
-    unsafe { core::arch::asm!("dmb oshld", options(nostack, preserves_flags)) }
+    crate::arch::dma_read_barrier()
 }

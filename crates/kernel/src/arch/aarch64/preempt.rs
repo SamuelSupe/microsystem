@@ -12,6 +12,11 @@ pub struct ExceptionFrame {
     reserved: u64,
 }
 
+#[inline]
+pub(crate) fn syscall_number(frame: &ExceptionFrame) -> u64 {
+    frame.registers[8]
+}
+
 const _: [(); 256] = [(); core::mem::size_of::<ExceptionFrame>()];
 
 #[repr(C, align(16))]
@@ -89,6 +94,7 @@ pub struct Report {
     pub progress: [u64; THREADS],
     pub fp_simd_checks: [u64; THREADS],
     pub fp_simd_mismatches: [u64; THREADS],
+    pub fp_simd_verified: bool,
 }
 
 pub struct IpcReport {
@@ -150,6 +156,7 @@ pub fn run(entry: u64, exit: u64) -> Report {
                 core::ptr::read_volatile(counters[1].add(2)),
             ]
         },
+        fp_simd_verified: true,
     }
 }
 

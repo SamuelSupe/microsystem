@@ -44,9 +44,7 @@ pub extern "C" fn _start(pid: u64) -> ! {
         pid,
         b" triggering page fault with live frames=2 mappings=2\n",
     );
-    unsafe {
-        core::arch::asm!("ldr xzr, [{address}]", address = in(reg) FAULT_VA, options(nostack));
-    }
+    unsafe { microsystem_user_rt::fault_probe(FAULT_VA) };
     microsystem_user_rt::exit(4)
 }
 

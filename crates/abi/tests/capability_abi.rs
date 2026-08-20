@@ -1,6 +1,7 @@
 use microsystem_abi::{
-    ABI_VERSION, CapHandle, Message, Rights, Status, Syscall, ThreadLaunchV1, ThreadLaunchV2,
-    MESSAGE_CAPS, MESSAGE_WORDS, boot_cap, gui, process, script, time,
+    ABI_VERSION, CapHandle, FilesystemStatsV1, MESSAGE_CAPS, MESSAGE_WORDS, Message, Rights,
+    Status, Syscall, SystemControlOperation, ThreadLaunchV1, ThreadLaunchV2, boot_cap, filesystem,
+    gui, network, process, script, time,
 };
 
 #[test]
@@ -70,6 +71,15 @@ fn syscall_and_status_numbers_are_stable() {
     assert_eq!(process::Operation::List as u16, 3);
     assert_eq!(process::Operation::Kill as u16, 4);
     assert_eq!(process::Operation::MemoryPool as u16, 5);
+    assert_eq!(filesystem::Operation::ReadRange as u16, 13);
+    assert_eq!(filesystem::Operation::Stats as u16, 14);
+    assert_eq!(filesystem::Operation::WriteRange as u16, 15);
+    assert_eq!(core::mem::size_of::<FilesystemStatsV1>(), 80);
+    assert_eq!(network::Operation::Stats as u16, 21);
+    assert_eq!(SystemControlOperation::ActivatePci as u64, 1);
+    assert_eq!(SystemControlOperation::Poweroff as u64, 2);
+    assert_eq!(SystemControlOperation::Reboot as u64, 3);
+    assert_eq!(boot_cap::SHELL_SYSTEM_CONTROL, CapHandle::from_parts(85, 1));
     assert_eq!(time::Operation::Sleep as u16, 1);
     assert_eq!(time::Operation::Uptime as u16, 2);
     assert_eq!(boot_cap::TIME_ENDPOINT, CapHandle::from_parts(39, 1));
@@ -96,8 +106,7 @@ fn mica_gui_launch_and_ring_contract_is_stable() {
     assert_eq!(gui::EVENT_RING_HEADER_BYTES, 64);
     assert_eq!(
         gui::EVENT_CAPACITY,
-        (gui::EVENT_BYTES - gui::EVENT_RING_HEADER_BYTES)
-            / std::mem::size_of::<gui::Event>()
+        (gui::EVENT_BYTES - gui::EVENT_RING_HEADER_BYTES) / std::mem::size_of::<gui::Event>()
     );
     assert_eq!(gui::MAX_DAMAGE_RECTS, 16);
     assert_eq!(gui::MAX_COMMANDS, 4096);
@@ -135,7 +144,10 @@ fn desktop_application_launch_contract_is_stable() {
     assert_eq!(gui::Application::Monitor as u16, 3);
     assert_eq!(gui::Application::Reader as u16, 4);
     assert_eq!(gui::Application::Editor as u16, 5);
-    assert_eq!(gui::Application::from_u64(5), Some(gui::Application::Editor));
+    assert_eq!(
+        gui::Application::from_u64(5),
+        Some(gui::Application::Editor)
+    );
     assert_eq!(gui::Application::from_u64(6), None);
     assert_eq!(boot_cap::GUI_LAUNCH_ENDPOINT.slot(), 84);
 }

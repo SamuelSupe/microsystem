@@ -3,8 +3,8 @@ use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::aarch64;
-use crate::arch::aarch64::preempt::{self, Context, ExceptionFrame};
+use crate::arch::selected as arch;
+use crate::arch::selected::preempt::{self, Context, ExceptionFrame};
 use crate::bootfs::Archive;
 use crate::device_control;
 use crate::kernel_heap;
@@ -13,7 +13,7 @@ use crate::physical_memory;
 use crate::smmu;
 use microsystem_abi::{
     ABI_VERSION, CapHandle, MESSAGE_CAP_MOVE_MASK, MESSAGE_CAPS, Message, ObjectType, Rights,
-    Status, ThreadLaunchV1, ThreadLaunchV2, message_cap_move,
+    Status, SystemControlOperation, ThreadLaunchV1, ThreadLaunchV2, message_cap_move,
 };
 use microsystem_kernel::capability::{Capability, CapabilityTable, MAX_CAPABILITIES};
 use microsystem_kernel::elf::{ElfImage, USER_MIN};
@@ -29,7 +29,6 @@ const CPU_COUNT: usize = 2;
 const IDLE_START: usize = APPLICATION_START + APPLICATION_COUNT;
 const TASK_COUNT: usize = IDLE_START + CPU_COUNT;
 
-const KERNEL_OFFSET: usize = 0xffffff8000000000;
 const IMAGE_BYTES: usize = 0xe0000;
 const HEAP_BYTES: usize = 0x100000;
 const HEAP_START: u64 = 0x0068_0000;
@@ -369,7 +368,7 @@ fn lock_state() -> StateGuard {
 }
 
 fn current_cpu() -> usize {
-    aarch64::cpu_id().min(CPU_COUNT - 1)
+    arch::cpu_id().min(CPU_COUNT - 1)
 }
 
 fn current_task(state: &State) -> usize {
@@ -395,7 +394,7 @@ fn is_idle_task(task: usize) -> bool {
 }
 
 fn set_running(state: &mut State, cpu: usize, task: usize) {
-    let now = aarch64::timer_ticks(cpu);
+    let now = arch::timer_ticks(cpu);
     let previous = state.current[cpu];
     let elapsed = now.saturating_sub(state.last_accounted_ticks[cpu]);
     if let Some(index) = previous.checked_sub(APPLICATION_START)
@@ -444,22 +443,14 @@ pub fn prepare(bootfs: &'static [u8]) -> Result<(), ()> {
         load_task(idle_task(cpu), idle)?;
     }
 
-    unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "ic iallu",
-            "dsb ish",
-            "isb",
-            options(nostack, preserves_flags)
-        );
-    }
+    arch::flush_icache();
     PREPARED.store(true, Ordering::Release);
     Ok(())
 }
 
 pub fn run() -> ! {
     while !PREPARED.load(Ordering::Acquire) {
-        aarch64::wait_for_event();
+        arch::wait_for_event();
     }
     let starts = unsafe { &*STARTS.0.get() };
     let _guard = lock_state();
@@ -471,7 +462,7 @@ pub fn run() -> ! {
         reply_to: [None; TASK_COUNT],
         requests: [Message::new(0, 0); TASK_COUNT],
         current: [0; CPU_COUNT],
-        last_accounted_ticks: [aarch64::timer_ticks(0), aarch64::timer_ticks(1)],
+        last_accounted_ticks: [arch::timer_ticks(0), arch::timer_ticks(1)],
         applications: [ApplicationSlot::EMPTY; APPLICATION_COUNT],
     };
     for (context, start) in state.contexts.iter_mut().zip(starts) {
@@ -505,7 +496,7 @@ pub fn run() -> ! {
     reset_runtime_frames();
     unsafe { *FRAME_REGIONS.0.get() = [FrameRegion::EMPTY; FRAME_REGION_COUNT] };
     if reset_memory_pools().is_err() {
-        aarch64::shutdown(true);
+        arch::shutdown(true);
     }
     reset_notifications();
     reset_filesystem_frame();
@@ -520,13 +511,13 @@ pub fn run() -> ! {
     }
     SMP_REPORTED.store(false, Ordering::Release);
     if install_boot_capabilities().is_err() {
-        aarch64::shutdown(true);
+        arch::shutdown(true);
     }
-    aarch64::activate_ttbr0(starts[0].ttbr0);
+    arch::activate_ttbr0(starts[0].ttbr0);
     ACTIVE_CPUS.fetch_or(1 << 1, Ordering::Release);
     let registers = state.contexts[0].registers;
     drop(_guard);
-    aarch64::enter_service(
+    arch::enter_service(
         starts[0].entry,
         [
             registers[0],
@@ -539,12 +530,12 @@ pub fn run() -> ! {
         ],
     );
     ACTIVE_CPUS.fetch_and(!(1 << 1), Ordering::Release);
-    aarch64::shutdown(false)
+    arch::shutdown(false)
 }
 
 pub fn join_primary() -> ! {
     while ACTIVE_CPUS.load(Ordering::Acquire) & (1 << 1) == 0 {
-        aarch64::wait_for_event();
+        arch::wait_for_event();
     }
     let starts = unsafe { &*STARTS.0.get() };
     let guard = lock_state();
@@ -554,10 +545,10 @@ pub fn join_primary() -> ! {
     let context = state.contexts[task];
     ACTIVE_CPUS.fetch_or(1, Ordering::Release);
     drop(guard);
-    aarch64::activate_ttbr0(starts[task].ttbr0);
-    aarch64::enter_service(context.elr, context.registers[..7].try_into().unwrap());
+    arch::activate_ttbr0(starts[task].ttbr0);
+    arch::enter_service(context.elr, context.registers[..7].try_into().unwrap());
     ACTIVE_CPUS.fetch_and(!1, Ordering::Release);
-    aarch64::shutdown(false)
+    arch::shutdown(false)
 }
 
 pub fn handle_yield(frame: &mut ExceptionFrame) -> Option<u64> {
@@ -705,7 +696,7 @@ pub fn handle_frame_mapping(frame: &mut ExceptionFrame, syscall: u64) -> Option<
                 Err(Status::AccessDenied)
             } else if (0..pages).any(|page| {
                 user_descriptor(memory, address + page as u64 * 4096)
-                    .is_some_and(|descriptor| descriptor & 0b11 != 0)
+                    .is_some_and(|descriptor| arch::page_table_present(descriptor))
             }) {
                 Err(Status::Busy)
             } else {
@@ -716,11 +707,13 @@ pub fn handle_frame_mapping(frame: &mut ExceptionFrame, syscall: u64) -> Option<
                         .or_else(|| runtime_frame_physical(capability.object))
                         .ok_or(Status::BadCapability)?;
                     *user_descriptor_mut(memory, address + page as u64 * 4096)
-                        .ok_or(Status::Invalid)? = physical
-                        | user_page_flags(
+                        .ok_or(Status::Invalid)? = arch::page_table_entry(
+                        physical,
+                        user_page_flags(
                             requested.contains(Rights::WRITE),
                             requested.contains(Rights::EXECUTE),
-                        );
+                        ),
+                    );
                 }
                 Ok(())
             }
@@ -733,10 +726,10 @@ pub fn handle_frame_mapping(frame: &mut ExceptionFrame, syscall: u64) -> Option<
                     .ok_or(Status::BadCapability)?;
                 let descriptor =
                     user_descriptor(memory, address + page as u64 * 4096).ok_or(Status::Invalid)?;
-                if descriptor & 0b11 == 0 {
+                if !arch::page_table_present(descriptor) {
                     return Err(Status::NotFound);
                 }
-                if descriptor & 0x0000_ffff_ffff_f000 != expected {
+                if arch::page_table_physical(descriptor) != expected {
                     return Err(Status::AccessDenied);
                 }
             }
@@ -748,7 +741,7 @@ pub fn handle_frame_mapping(frame: &mut ExceptionFrame, syscall: u64) -> Option<
         }
     })();
     if result.is_ok() {
-        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+        arch::invalidate_user_asid(ASID_BASE + task as u16);
     }
     frame.registers[0] = match result {
         Ok(()) => Status::Ok as i64 as u64,
@@ -860,7 +853,7 @@ pub fn handle_irq_control(frame: &mut ExceptionFrame, syscall: u64) -> Option<u6
         if acknowledgements == 1 {
             crate::kprintln!(
                 "[irq] virtio-blk INTx completions={}",
-                aarch64::device_interrupts()
+                arch::device_interrupts()
             );
         }
     }
@@ -905,7 +898,8 @@ pub fn handle_dma_control(frame: &mut ExceptionFrame, syscall: u64) -> Option<u6
             frame.registers[0] = Status::Busy as i64 as u64;
             return Some(0);
         }
-        let frame_capability = table.capability(CapHandle(frame.registers[1] as u32), Rights::MAP);
+        let dma_rights = Rights(Rights::MAP.0 | Rights::WRITE.0);
+        let frame_capability = table.capability(CapHandle(frame.registers[1] as u32), dma_rights);
         let Ok(frame_capability) = frame_capability else {
             frame.registers[0] = Status::AccessDenied as i64 as u64;
             return Some(0);
@@ -973,24 +967,57 @@ pub fn handle_system_control(frame: &mut ExceptionFrame, syscall: u64) -> Option
     if !active_on_current_cpu() || syscall != 22 {
         return None;
     }
+    let operation = match frame.registers[1] {
+        value if value == SystemControlOperation::ActivatePci as u64 => {
+            SystemControlOperation::ActivatePci
+        }
+        value if value == SystemControlOperation::Poweroff as u64 => {
+            SystemControlOperation::Poweroff
+        }
+        value if value == SystemControlOperation::Reboot as u64 => SystemControlOperation::Reboot,
+        _ => {
+            frame.registers[0] = Status::AccessDenied as i64 as u64;
+            return Some(0);
+        }
+    };
     let guard = lock_state();
     let task = current_task(unsafe { &*STATE.0.get() });
     let capability = unsafe { &(&*CAPS.0.get())[task] }
         .capability(CapHandle(frame.registers[0] as u32), Rights::MANAGE);
-    let authorized = task == DEVMGR_TASK
+    let task_authorized = matches!(
+        (task, operation),
+        (DEVMGR_TASK, SystemControlOperation::ActivatePci)
+            | (SHELL_TASK, SystemControlOperation::Poweroff)
+            | (SHELL_TASK, SystemControlOperation::Reboot)
+            | (TERMINAL_TASK, SystemControlOperation::Poweroff)
+            | (TERMINAL_TASK, SystemControlOperation::Reboot)
+    );
+    let authorized = task_authorized
         && matches!(capability, Ok(capability) if capability.object_type == ObjectType::SystemControl);
     drop(guard);
     if !authorized {
         frame.registers[0] = Status::AccessDenied as i64 as u64;
         return Some(0);
     }
-    let slot = u8::try_from(frame.registers[1]).ok();
-    let function = u8::try_from(frame.registers[2]).ok();
-    let result = match (slot, function) {
-        (Some(slot), Some(function)) => {
-            device_control::activate(slot, function).and_then(install_transport)
+    let result = match operation {
+        SystemControlOperation::ActivatePci => {
+            let slot = u8::try_from(frame.registers[2]).ok();
+            let function = u8::try_from(frame.registers[3]).ok();
+            match (slot, function) {
+                (Some(slot), Some(function)) => {
+                    device_control::activate(slot, function).and_then(install_transport)
+                }
+                _ => Err(Status::Invalid),
+            }
         }
-        _ => Err(Status::Invalid),
+        SystemControlOperation::Poweroff => {
+            crate::kprintln!("[system] shutdown");
+            return arch::shutdown(true);
+        }
+        SystemControlOperation::Reboot => {
+            crate::kprintln!("[system] reboot");
+            return arch::reboot();
+        }
     };
     frame.registers[0] = match result {
         Ok(()) => Status::Ok as i64 as u64,
@@ -1033,13 +1060,13 @@ pub fn handle_system_stats(frame: &mut ExceptionFrame, syscall: u64) -> Option<u
         version: 1,
         cpu_count: CPU_COUNT as u16,
         reserved: 0,
-        cpu_ticks: [aarch64::timer_ticks(0), aarch64::timer_ticks(1)],
+        cpu_ticks: [arch::timer_ticks(0), arch::timer_ticks(1)],
         free_frames: physical_memory::free_frames() as u64,
         kernel_heap_used: kernel_heap::allocated_bytes() as u64,
         kernel_heap_total: physical_memory::kernel_heap_bytes() as u64,
         runnable_threads: runnable,
         blocked_threads: blocked,
-        irq_count: aarch64::device_interrupts(),
+        irq_count: arch::device_interrupts(),
         ipc_calls: IPC_CALLS.load(Ordering::Relaxed),
     };
     frame.registers[0] = if copy_to_user(
@@ -1135,47 +1162,37 @@ pub fn handle_gui_present(frame: &mut ExceptionFrame, syscall: u64) -> Option<u6
                 frame.registers[0] = Status::Fault as i64 as u64;
                 return Some(0);
             };
-            let source = (KERNEL_OFFSET + physical as usize + within_page) as *const u8;
+            let source = (crate::arch::phys_to_virt(physical) + within_page) as *const u8;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    source,
-                    destination.as_mut_ptr().add(offset),
-                    bytes,
-                );
+                core::ptr::copy_nonoverlapping(source, destination.as_mut_ptr().add(offset), bytes);
             }
             offset += bytes;
             remaining -= bytes;
         }
     }
-    frame.registers[0] = if crate::gpu::flush_rect(
-        x as u32,
-        y as u32,
-        width as u32,
-        height as u32,
-    )
-    .is_ok()
-    {
-        if !GUI_PRESENT_REPORTED.swap(true, Ordering::AcqRel) {
-            crate::kprintln!(
-                "[gui] EL0 windowd presented scanout bytes={} dma-isolated=true",
-                destination.len()
-            );
-        }
-        if (width != 1024 || height != 768)
-            && !GUI_PARTIAL_PRESENT_REPORTED.swap(true, Ordering::AcqRel)
-        {
-            crate::kprintln!(
-                "[gui] EL0 windowd partial-present=true rect={}x{}+{},{}",
-                width,
-                height,
-                x,
-                y
-            );
-        }
-        Status::Ok as i64 as u64
-    } else {
-        Status::Io as i64 as u64
-    };
+    frame.registers[0] =
+        if crate::gpu::flush_rect(x as u32, y as u32, width as u32, height as u32).is_ok() {
+            if !GUI_PRESENT_REPORTED.swap(true, Ordering::AcqRel) {
+                crate::kprintln!(
+                    "[gui] EL0 windowd presented scanout bytes={} dma-isolated=true",
+                    destination.len()
+                );
+            }
+            if (width != 1024 || height != 768)
+                && !GUI_PARTIAL_PRESENT_REPORTED.swap(true, Ordering::AcqRel)
+            {
+                crate::kprintln!(
+                    "[gui] EL0 windowd partial-present=true rect={}x{}+{},{}",
+                    width,
+                    height,
+                    x,
+                    y
+                );
+            }
+            Status::Ok as i64 as u64
+        } else {
+            Status::Io as i64 as u64
+        };
     Some(0)
 }
 
@@ -1334,11 +1351,9 @@ fn install_transport(grant: UserTransportGrant) -> Result<(), Status> {
             normal_page_flags(),
         );
     }
-    unsafe {
-        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
-    }
+    crate::arch::dma_write_barrier();
     for task in [BLOCK_TASK, MFS_TASK, DEVMGR_TASK] {
-        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+        arch::invalidate_user_asid(ASID_BASE + task as u16);
     }
     Ok(())
 }
@@ -1348,9 +1363,9 @@ pub fn notify_device_irq() {
         return;
     }
     DEVICE_NOTIFICATION.fetch_or(1, Ordering::Release);
-    aarch64::send_reschedule(0);
-    aarch64::send_reschedule(1);
-    aarch64::send_event();
+    arch::send_reschedule(0);
+    arch::send_reschedule(1);
+    arch::send_event();
 }
 
 pub fn on_timer(frame: &mut ExceptionFrame) {
@@ -1429,7 +1444,7 @@ pub fn mark_current_online() {
         crate::kprintln!("[service] block transport ready (VirtIO-PCI)");
         crate::kprintln!("[service] mfs1 ready (resident EL0)");
     }
-    aarch64::send_event();
+    arch::send_event();
 }
 
 pub fn exit_disposition(code: u64) -> Option<(&'static str, bool)> {
@@ -1560,16 +1575,8 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
         None
     };
     load_task(task, image).map_err(|_| Status::Invalid)?;
-    unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            options(nostack, preserves_flags)
-        );
-    }
-    aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+    arch::flush_icache();
+    arch::invalidate_user_asid(ASID_BASE + task as u16);
     let start = unsafe { (&*STARTS.0.get())[task] };
     state.contexts[task] = Context::EMPTY;
     state.contexts[task].elr = start.entry;
@@ -1628,9 +1635,9 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
     state.threads[task] = ThreadState::Runnable;
     let pid = (task + 1) as u64;
     drop(guard);
-    aarch64::send_reschedule(0);
-    aarch64::send_reschedule(1);
-    aarch64::send_event();
+    arch::send_reschedule(0);
+    arch::send_reschedule(1);
+    arch::send_event();
     Ok(pid)
 }
 
@@ -1943,7 +1950,7 @@ pub fn kill_application(pid: u64, status: i64) -> Result<(), Status> {
     if let Some(cpu) = running_cpu {
         state.threads[task] = ThreadState::Terminating { cpu };
         state.applications[index].exit_status = status;
-        aarch64::send_reschedule(cpu);
+        arch::send_reschedule(cpu);
     } else {
         finish_application(state, task, status);
     }
@@ -1962,18 +1969,33 @@ pub fn notification_diagnostics() -> (u64, u64, u64) {
     )
 }
 
-pub fn validate_user_read(pointer: u64, bytes: u64) -> bool {
+pub fn copy_user_read(pointer: u64, output: &mut [u8]) -> Result<(), Status> {
     if !active_on_current_cpu() {
-        return false;
+        return Err(Status::AccessDenied);
     }
     let _guard = lock_state();
     let current = current_task(unsafe { &*STATE.0.get() });
-    validate_user_range(current, pointer, bytes, false)
+    if !validate_user_range(current, pointer, output.len() as u64, false) {
+        return Err(Status::Fault);
+    }
+    copy_from_user(current, pointer, output.as_mut_ptr(), output.len()).ok_or(Status::Fault)
 }
 
-fn active_on_current_cpu() -> bool {
-    let cpu = aarch64::cpu_id();
+pub fn active_on_current_cpu() -> bool {
+    let cpu = arch::cpu_id();
     cpu < CPU_COUNT && ACTIVE_CPUS.load(Ordering::Acquire) & (1 << cpu) != 0
+}
+
+pub fn active_cpu_mask() -> u32 {
+    ACTIVE_CPUS.load(Ordering::Acquire)
+}
+
+pub fn panic_context(cpu: usize) -> (usize, u64, u64) {
+    let state = unsafe { &*STATE.0.get() };
+    let cpu = cpu.min(CPU_COUNT - 1);
+    let task = state.current[cpu].min(TASK_COUNT - 1);
+    let context = state.contexts[task];
+    (task, context.elr, context.ttbr0)
 }
 
 fn switch(frame: &mut ExceptionFrame) {
@@ -2371,7 +2393,7 @@ fn install_boot_capabilities() -> Result<(), Status> {
         Rights::MANAGE,
         NETWORK_MEMORY_POOL_NODE,
     )?;
-    for task in [TERMINAL_TASK, MONITOR_TASK] {
+    for task in [SHELL_TASK, TERMINAL_TASK, MONITOR_TASK] {
         tables[task].insert_root_at(
             microsystem_abi::boot_cap::SYSTEM_INFO,
             60,
@@ -2436,6 +2458,15 @@ fn install_boot_capabilities() -> Result<(), Status> {
         Rights::MANAGE,
         16,
     )?;
+    for task in [SHELL_TASK, TERMINAL_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::SHELL_SYSTEM_CONTROL,
+            1,
+            ObjectType::SystemControl,
+            Rights::MANAGE,
+            16,
+        )?;
+    }
     tables[0].insert_root_at(
         microsystem_abi::boot_cap::DEVMGR_VIRTIO_MMIO,
         DEVICE_MMIO_OBJECT,
@@ -2593,6 +2624,16 @@ fn install_boot_capabilities() -> Result<(), Status> {
         Rights::READ,
         30,
     )?;
+    for task in [SHELL_TASK, TERMINAL_TASK] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::NETWORK_ENDPOINT,
+            13,
+            Rights::WRITE,
+            30,
+        )?;
+    }
     insert_endpoint_cap(
         tables,
         SSHD_TASK,
@@ -2788,15 +2829,20 @@ fn stage_cap_transfer(
         let Some(capability) = capability else {
             continue;
         };
-        if !moved[index]
-            || capability.object_type != ObjectType::Frame
-            || !task_runtime_frame_is_mapped(sender, capability.object)
-        {
+        if !moved[index] {
+            continue;
+        }
+        let mapped_by_sender = match capability.object_type {
+            ObjectType::Frame => task_runtime_frame_is_mapped(sender, capability.object),
+            ObjectType::FrameRegion => task_frame_region_is_mapped(sender, capability.object),
+            _ => false,
+        };
+        if !mapped_by_sender {
             continue;
         }
         let retains_mapping_authority = tables[sender].capabilities().any(|other| {
             other.object == capability.object
-                && other.object_type == ObjectType::Frame
+                && other.object_type == capability.object_type
                 && other.rights.contains(Rights::MAP)
                 && !capabilities
                     .iter()
@@ -3372,9 +3418,9 @@ fn signal_notification(object: u32, bits: u64) -> Option<bool> {
     NOTIFICATION_BITS[slot].fetch_or(bits, Ordering::AcqRel);
     let woke = wake_notification_object(object);
     if woke {
-        aarch64::send_reschedule(0);
-        aarch64::send_reschedule(1);
-        aarch64::send_event();
+        arch::send_reschedule(0);
+        arch::send_reschedule(1);
+        arch::send_event();
     }
     Some(woke)
 }
@@ -3558,7 +3604,8 @@ fn runtime_frame_is_mapped(object: u32) -> bool {
                 .chain(memory.level3_high.iter())
                 .chain(memory.large_heap_level3.iter().flatten())
                 .any(|descriptor| {
-                    descriptor & 0b11 != 0 && descriptor & 0x0000_ffff_ffff_f000 == frame_physical
+                    arch::page_table_present(*descriptor)
+                        && arch::page_table_physical(*descriptor) == frame_physical
                 })
         })
     })
@@ -3577,8 +3624,18 @@ fn task_runtime_frame_is_mapped(task: usize, object: u32) -> bool {
         .chain(memory.level3_high.iter())
         .chain(memory.large_heap_level3.iter().flatten())
         .any(|descriptor| {
-            descriptor & 0b11 != 0 && descriptor & 0x0000_ffff_ffff_f000 == frame_physical
+            arch::page_table_present(*descriptor)
+                && arch::page_table_physical(*descriptor) == frame_physical
         })
+}
+
+fn task_frame_region_is_mapped(task: usize, object: u32) -> bool {
+    let Some(region) = frame_region(object) else {
+        return false;
+    };
+    region.frames[..region.pages as usize]
+        .iter()
+        .any(|frame| task_runtime_frame_is_mapped(task, *frame))
 }
 
 fn runtime_frame_is_dma_mapped(object: u32) -> bool {
@@ -3595,13 +3652,13 @@ fn clear_task_runtime_mappings(task: usize) -> u32 {
     let last = (((DYNAMIC_MAP_END - 1) >> 12) & 0x1ff) as usize;
     let mut cleared = 0u32;
     for descriptor in &mut memory.level3[first..=last] {
-        if *descriptor & 0b11 != 0 {
+        if arch::page_table_present(*descriptor) {
             *descriptor = 0;
             cleared = cleared.saturating_add(1);
         }
     }
     if cleared != 0 {
-        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+        arch::invalidate_user_asid(ASID_BASE + task as u16);
     }
     cleared
 }
@@ -3614,7 +3671,7 @@ fn task_runtime_mapping_count(task: usize) -> u32 {
     let last = (((DYNAMIC_MAP_END - 1) >> 12) & 0x1ff) as usize;
     memory.level3[first..=last]
         .iter()
-        .filter(|descriptor| **descriptor & 0b11 != 0)
+        .filter(|descriptor| arch::page_table_present(**descriptor))
         .count() as u32
 }
 
@@ -3638,14 +3695,16 @@ fn clear_task_runtime_frame_mappings(task: usize, object: u32) -> u32 {
         .chain(memory.level3_high.iter_mut())
         .chain(memory.large_heap_level3.iter_mut().flatten())
     {
-        if *descriptor & 0b11 != 0 && *descriptor & 0x0000_ffff_ffff_f000 == physical {
+        if arch::page_table_present(*descriptor)
+            && arch::page_table_physical(*descriptor) == physical
+        {
             *descriptor = 0;
             cleared = cleared.saturating_add(1);
         }
     }
     if cleared != 0 {
         // Revoke commits cap deletion and mapping removal under the scheduler lock.
-        aarch64::invalidate_user_asid(ASID_BASE + task as u16);
+        arch::invalidate_user_asid(ASID_BASE + task as u16);
     }
     cleared
 }
@@ -3700,7 +3759,7 @@ fn record_switch(cpu: usize) {
 }
 
 fn expire_deadlines() {
-    let now = aarch64::clock_nanos();
+    let now = arch::clock_nanos();
     let state = unsafe { &mut *STATE.0.get() };
     for task in 0..TASK_COUNT {
         let deadline = match state.threads[task] {
@@ -3766,7 +3825,7 @@ fn wake_notification_object(object: u32) -> bool {
 }
 
 fn deadline_elapsed(deadline: u64) -> bool {
-    deadline != 0 && deadline <= aarch64::clock_nanos()
+    deadline != 0 && deadline <= arch::clock_nanos()
 }
 
 fn fail(frame: &mut ExceptionFrame, status: Status) -> u64 {
@@ -3826,10 +3885,7 @@ fn validate_user_range(task: usize, pointer: u64, bytes: u64, write: bool) -> bo
         let Some(descriptor) = user_descriptor(memory, page) else {
             return false;
         };
-        if descriptor & 0b11 != 0b11
-            || descriptor & (1 << 6) == 0
-            || write && descriptor & (1 << 7) != 0
-        {
+        if !crate::arch::user_page_accessible(descriptor, write) {
             return false;
         }
         if page == last {
@@ -3867,8 +3923,8 @@ fn translated_user_address(task: usize, pointer: u64, write: bool) -> Option<usi
         return None;
     }
     let descriptor = user_descriptor(task_memory(task)?, pointer)?;
-    let physical = descriptor & 0x0000_ffff_ffff_f000;
-    Some(KERNEL_OFFSET + physical as usize + (pointer as usize & 0xfff))
+    let physical = arch::page_table_physical(descriptor);
+    Some(crate::arch::phys_to_virt(physical) + (pointer as usize & 0xfff))
 }
 
 fn user_descriptor(memory: &TaskMemory, virtual_address: u64) -> Option<u64> {
@@ -3955,13 +4011,17 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     let image_physical = physical(memory.image.as_ptr() as usize);
     let stack_physical = physical(memory.stack.as_ptr() as usize);
     let heap_physical = physical(memory.heap.as_ptr() as usize);
-    memory.level1[0] = level2_physical | 3;
-    memory.level2[2] = level3_physical | 3;
-    memory.level2[3] = level3_high_physical | 3;
+    memory.level1[0] = crate::arch::page_table_branch(level2_physical);
+    memory.level1[256] = crate::arch::kernel_mmio_entry();
+    memory.level1[257] = crate::arch::kernel_pci_mmio_entry();
+    memory.level1[258] = crate::arch::kernel_high_half_entry();
+    memory.level2[2] = crate::arch::page_table_branch(level3_physical);
+    memory.level2[3] = crate::arch::page_table_branch(level3_high_physical);
     if uses_large_window(task) {
         for (table, entries) in memory.large_heap_level3.iter().enumerate() {
             let level2 = (LARGE_HEAP_START as usize >> 21) + table;
-            memory.level2[level2] = physical(entries.as_ptr() as usize) | 3;
+            memory.level2[level2] =
+                crate::arch::page_table_branch(physical(entries.as_ptr() as usize));
         }
     }
 
@@ -3985,13 +4045,10 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         let last_page = (end - 1) & !0xfff;
         for offset in (first_page..=last_page).step_by(4096) {
             let index = (((USER_MIN as usize + offset) >> 12) & 0x1ff) as usize;
-            let low = if segment.writable { 0x747 } else { 0x7c7 };
-            let execute = if segment.executable {
-                0x0020u64 << 48
-            } else {
-                0x0060u64 << 48
-            };
-            memory.level3[index] = image_physical + offset as u64 | low | execute;
+            memory.level3[index] = crate::arch::page_table_entry(
+                image_physical + offset as u64,
+                crate::arch::user_page_flags(segment.writable, segment.executable),
+            );
         }
     }
     for offset in (0..STACK_BYTES).step_by(4096) {
@@ -4015,8 +4072,10 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         for offset in (0..LARGE_HEAP_BYTES).step_by(4096) {
             let table = offset / 0x20_0000;
             let index = (offset >> 12) & 0x1ff;
-            memory.large_heap_level3[table][index] =
-                (heap_physical + offset as u64) | normal_page_flags();
+            memory.large_heap_level3[table][index] = crate::arch::page_table_entry(
+                heap_physical + offset as u64,
+                crate::arch::normal_page_flags(),
+            );
         }
     }
     if task == CONSOLE_TASK {
@@ -4097,7 +4156,7 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     starts[task] = Start {
         entry: image.entry(),
         stack: STACK_TOP,
-        ttbr0: ((ASID_BASE + task as u16) as u64) << 48 | level1_physical,
+        ttbr0: crate::arch::address_space_root(level1_physical, ASID_BASE + task as u16),
     };
     Ok(())
 }
@@ -4105,30 +4164,24 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
 fn map_page(memory: &mut TaskMemory, virtual_address: u64, physical: u64, flags: u64) {
     let index = ((virtual_address >> 12) & 0x1ff) as usize;
     if virtual_address < 0x0060_0000 {
-        memory.level3[index] = (physical & !0xfff) | flags;
+        memory.level3[index] = crate::arch::page_table_entry(physical, flags);
     } else {
-        memory.level3_high[index] = (physical & !0xfff) | flags;
+        memory.level3_high[index] = crate::arch::page_table_entry(physical, flags);
     }
 }
 
 fn normal_page_flags() -> u64 {
-    0x747 | (0x0060u64 << 48)
+    crate::arch::normal_page_flags()
 }
 
 fn user_page_flags(writable: bool, executable: bool) -> u64 {
-    let access = if writable { 0x747 } else { 0x7c7 };
-    let execute = if executable {
-        0x0020u64 << 48
-    } else {
-        0x0060u64 << 48
-    };
-    access | execute
+    crate::arch::user_page_flags(writable, executable)
 }
 
 fn device_page_flags() -> u64 {
-    0x743 | (0x0060u64 << 48)
+    crate::arch::device_page_flags()
 }
 
 fn physical(high: usize) -> u64 {
-    (high - KERNEL_OFFSET) as u64
+    crate::arch::virt_to_phys(high as u64).unwrap_or(0)
 }

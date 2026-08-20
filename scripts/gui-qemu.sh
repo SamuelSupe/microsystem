@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/qemu-arch.sh"
 
 timeout_seconds="${MICROSYSTEM_GUI_QEMU_TIMEOUT:-45}"
 browser_http_port="${MICROSYSTEM_GUI_BROWSER_HTTP_PORT:-18083}"
@@ -38,6 +39,7 @@ if [[ ! -f /.dockerenv && "${MICROSYSTEM_IN_CONTAINER:-0}" != "1" ]]; then
   inner_qmp_log="/workspace/target/$(basename -- "$qmp_log")"
   inner_serial_fifo="/workspace/target/$(basename -- "$serial_fifo")"
   exec docker run --rm -i --init \
+    -e ARCH="$MICROSYSTEM_ARCH" \
     -e RUSTUP_TOOLCHAIN=1.97.1 \
     -e MICROSYSTEM_IN_CONTAINER=1 \
     -e MICROSYSTEM_GUI_QEMU_TIMEOUT="$timeout_seconds" \
@@ -56,15 +58,15 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "gui-qemu: cargo is required inside the OrbStack toolchain container" >&2
   exit 2
 fi
-if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
-  echo "gui-qemu: qemu-system-aarch64 is required" >&2
+if ! command -v "$MICROSYSTEM_QEMU_BINARY" >/dev/null 2>&1; then
+	echo "gui-qemu: $MICROSYSTEM_QEMU_BINARY is required" >&2
   exit 2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   echo "gui-qemu: python3 is required for the HTTP fixture and QMP gate" >&2
   exit 2
 fi
-if [[ ! -f target/aarch64-unknown-none-softfloat/release/microsystem-kernel ]]; then
+if [[ ! -f "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" ]]; then
   echo "gui-qemu: built kernel ELF is missing; run make build first" >&2
   exit 2
 fi
@@ -313,7 +315,7 @@ required_markers=(
   "[gui] desktop launcher icons=5 fixed-registry=true click-to-open=true"
   "[gui] EL0 windowd presented scanout bytes="
   "[input] virtio-keyboard+tablet ready streams=2 queues=2 dma-isolated=true polling=true"
-  "[gui] terminal window ready interactive=true filesystem=ls,cat,stat,write,mkdir,mv,rm,sync shared-bytes=4096"
+  "[gui] terminal window ready interactive=true extended-shell=true filesystem=ls,cat,stat,touch,cp,write,mkdir,rmdir,mv,rm,fsync,sync shared-bytes=4096"
   "[gui] files window ready"
   "[gui] files service wait=event-blocked"
   "[gui] monitor window ready"
@@ -632,6 +634,16 @@ def key_events(*keys):
         ]
     }
 
+def send_input_events_sequential(stream, prefix, payload):
+    for event_index, event in enumerate(payload["events"]):
+        send_command(
+            stream,
+            f"{prefix}-event-{event_index}",
+            "input-send-event",
+            {"events": [event]},
+        )
+        time.sleep(0.1)
+
 def tablet_click(x, y):
     # VirtIO tablet coordinates are normalized to the visible 1024x768 scanout.
     return {
@@ -756,25 +768,16 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         }
     }, sort_keys=True))
     time.sleep(0.2)
-    keyboard_events = []
-    for key in ("u", "p", "t", "i", "m", "e"):
-        keyboard_events.extend(
-            [
-                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": key}}},
-                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": key}}},
-            ]
+    for character_index, character in enumerate("uptime"):
+        send_input_events_sequential(
+            stream,
+            f"input-terminal-uptime-char-{character_index}",
+            text_key_events(character),
         )
-    keyboard_events.extend(
-        [
-            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "ret"}}},
-            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "ret"}}},
-        ]
-    )
-    send_command(
+    send_input_events_sequential(
         stream,
-        "input-terminal-uptime",
-        "input-send-event",
-        {"events": keyboard_events},
+        "input-terminal-uptime-return",
+        key_events(("ret", True), ("ret", False)),
     )
     wait_for_marker(terminal_command_marker, "terminal uptime command")
 
@@ -790,23 +793,19 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 + b" status=ok"
             )
             before = serial_contents().count(marker)
-        # Keep each VirtIO input request to one character.  The windowd event
-        # ring can be busy while the terminal drains a prior key; submitting a
-        # whole command (or even a multi-character chunk) can therefore lose
-        # bytes before the parser sees it.  Return is deliberately separate so
-        # the parser sees the complete command before execution.
+        # Keep each VirtIO input request to one key event. The windowd event
+        # ring can be busy while the terminal drains a prior key, so even a
+        # combined key-down/key-up request can eventually exhaust descriptors
+        # during a long command. Return stays separate from the command text.
         for character_index, character in enumerate(command):
-            send_command(
+            send_input_events_sequential(
                 stream,
                 f"input-terminal-{name}-char-{character_index}",
-                "input-send-event",
                 text_key_events(character),
             )
-            time.sleep(0.1)
-        send_command(
+        send_input_events_sequential(
             stream,
             f"input-terminal-{name}-return",
-            "input-send-event",
             key_events(("ret", True), ("ret", False)),
         )
         if marker is None:
@@ -830,11 +829,13 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
     )
 
     terminal_command("mkdir", "mkdir /tfs", "mkdir")
+    terminal_command("touch", "touch /tfs/empty", "touch")
     terminal_command(
         "write",
         "write /tfs/a proof",
         "write",
     )
+    terminal_command("cp", "cp /tfs/a /tfs/c", "cp")
     terminal_command("stat", "stat /tfs/a", "stat")
     terminal_command(
         "mv",
@@ -843,8 +844,11 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
     )
     terminal_command("cat", "cat /tfs/b", "cat")
     terminal_command("ls", "ls /tfs", "ls")
+    terminal_command("fsync", "fsync /tfs/b", "fsync")
     terminal_command("rm-file", "rm /tfs/b", "rm")
-    terminal_command("rm-dir", "rm /tfs", "rm")
+    terminal_command("rm-copy", "rm /tfs/c", "rm")
+    terminal_command("rm-empty", "rm /tfs/empty", "rm")
+    terminal_command("rm-dir", "rmdir /tfs", "rmdir")
     terminal_command("sync", "sync", "sync")
     # The fixed Terminal client intentionally exposes only diagnostic
     # commands. Launch Mica through the real SSH shell; QMP still drives all

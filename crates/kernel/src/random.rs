@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dtb::PlatformInfo;
 use crate::pci;
+use crate::smmu;
 
-const KERNEL_OFFSET: usize = 0xffff_ff80_0000_0000;
 const DESC_OFFSET: usize = 0;
 const AVAIL_OFFSET: usize = 256;
 const USED_OFFSET: usize = 320;
@@ -23,11 +23,13 @@ unsafe impl Sync for QueueCell {}
 
 static QUEUE: QueueCell = QueueCell(UnsafeCell::new(QueuePage([0; 4096])));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static FIRST_FILL_REPORTED: AtomicBool = AtomicBool::new(false);
 static mut DEVICE: Option<RandomDevice> = None;
 
 #[derive(Clone, Copy)]
 struct RandomDevice {
     transport: pci::VirtioTransport,
+    stream_id: u32,
     notify: usize,
     available: u16,
     used: u16,
@@ -43,6 +45,10 @@ pub fn activate(platform: PlatformInfo) -> Result<(), ()> {
         platform.pcie_mmio_bytes,
     )
     .map_err(|_| ())?;
+    let stream_id = platform.stream_id(device.requester_id()).ok_or(())?;
+    let physical = crate::arch::virt_to_phys(QUEUE.0.get() as usize as u64).ok_or(())?;
+    smmu::map_gui_aux_page(smmu::RNG_QUEUE_IOVA, physical).map_err(|_| ())?;
+    smmu::attach_stream(stream_id).map_err(|_| ())?;
     negotiate(transport)?;
     let queue = unsafe { &mut (*QUEUE.0.get()).0 };
     queue.fill(0);
@@ -51,11 +57,23 @@ pub fn activate(platform: PlatformInfo) -> Result<(), ()> {
         return Err(());
     }
     write16(transport.common + 24, 1);
-    let physical = QUEUE.0.get() as usize as u64 - KERNEL_OFFSET as u64;
-    write64(transport.common + 32, physical + DESC_OFFSET as u64);
-    write64(transport.common + 40, physical + AVAIL_OFFSET as u64);
-    write64(transport.common + 48, physical + USED_OFFSET as u64);
-    put64(queue, DESC_OFFSET, physical + DATA_OFFSET as u64);
+    write64(
+        transport.common + 32,
+        smmu::RNG_QUEUE_IOVA + DESC_OFFSET as u64,
+    );
+    write64(
+        transport.common + 40,
+        smmu::RNG_QUEUE_IOVA + AVAIL_OFFSET as u64,
+    );
+    write64(
+        transport.common + 48,
+        smmu::RNG_QUEUE_IOVA + USED_OFFSET as u64,
+    );
+    put64(
+        queue,
+        DESC_OFFSET,
+        smmu::RNG_QUEUE_IOVA + DATA_OFFSET as u64,
+    );
     put32(queue, DESC_OFFSET + 8, 256);
     put16(queue, DESC_OFFSET + 12, VRING_DESC_F_WRITE);
     let notify = read16(transport.common + 30) as usize * transport.notify_multiplier as usize;
@@ -67,6 +85,7 @@ pub fn activate(platform: PlatformInfo) -> Result<(), ()> {
     unsafe {
         DEVICE = Some(RandomDevice {
             transport,
+            stream_id,
             notify,
             available: 0,
             used: 0,
@@ -94,7 +113,8 @@ pub fn fill(output: &mut [u8]) -> Result<(), ()> {
     put16(queue, AVAIL_OFFSET + 2, device.available);
     dma_barrier();
     write16(device.transport.notify + device.notify, 0);
-    for _ in 0..10_000_000 {
+    let deadline = crate::arch::clock_nanos().saturating_add(1_000_000_000);
+    while crate::arch::clock_nanos() < deadline {
         let used = get16(queue, USED_OFFSET + 2);
         if used != device.used {
             dma_barrier();
@@ -105,9 +125,51 @@ pub fn fill(output: &mut [u8]) -> Result<(), ()> {
             output.copy_from_slice(&queue[DATA_OFFSET..DATA_OFFSET + output.len()]);
             device.used = used;
             unsafe { DEVICE = Some(device) };
+            if !FIRST_FILL_REPORTED.swap(true, Ordering::AcqRel) {
+                crate::kprintln!("[rng] first-fill bytes={} dma=true", output.len());
+            }
             return Ok(());
         }
         core::hint::spin_loop();
+    }
+    let available = get16(queue, AVAIL_OFFSET + 2);
+    let used = get16(queue, USED_OFFSET + 2);
+    let status = read8(device.transport.common + 20);
+    let queue_enabled = read16(device.transport.common + 28);
+    #[cfg(target_arch = "riscv64")]
+    let stream = smmu::stream_diagnostics(device.stream_id, smmu::RNG_QUEUE_IOVA);
+    if let Some(fault) = smmu::take_fault() {
+        crate::kprintln!(
+            "[rng] fill timeout avail={} used={} status={:#x} queue-enabled={} event={:#x} stream-id={:#x} iova={:#x}",
+            available,
+            used,
+            status,
+            queue_enabled,
+            fault.event_type,
+            fault.stream_id,
+            fault.address
+        );
+    } else {
+        #[cfg(target_arch = "aarch64")]
+        crate::kprintln!(
+            "[rng] fill timeout avail={} used={} status={:#x} queue-enabled={} event=none",
+            available,
+            used,
+            status,
+            queue_enabled
+        );
+        #[cfg(target_arch = "riscv64")]
+        crate::kprintln!(
+            "[rng] fill timeout avail={} used={} status={:#x} queue-enabled={} event=none stream-id={:#x} tc={:#x} fsc={:#x} pte={:#x}",
+            available,
+            used,
+            status,
+            queue_enabled,
+            device.stream_id,
+            stream.tc,
+            stream.fsc,
+            stream.pte
+        );
     }
     Err(())
 }
@@ -116,14 +178,14 @@ fn negotiate(transport: pci::VirtioTransport) -> Result<(), ()> {
     write8(transport.common + 20, 0);
     write8(transport.common + 20, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
     write32(transport.common, 1);
-    if read32(transport.common + 4) & 1 == 0 {
+    if read32(transport.common + 4) & 0b11 != 0b11 {
         write8(transport.common + 20, STATUS_FAILED);
         return Err(());
     }
     write32(transport.common + 8, 0);
     write32(transport.common + 12, 0);
     write32(transport.common + 8, 1);
-    write32(transport.common + 12, 1);
+    write32(transport.common + 12, 0b11);
     write8(
         transport.common + 20,
         read8(transport.common + 20) | STATUS_FEATURES_OK,
@@ -171,7 +233,5 @@ fn put64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 fn dma_barrier() {
-    unsafe {
-        core::arch::asm!("dmb osh", options(nostack, preserves_flags));
-    }
+    crate::arch::dma_barrier();
 }

@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use mfs1::{BLOCK_SIZE, BlockDevice, CommitStage, Error, Metadata};
-use microsystem_abi::{CapHandle, Message, Rights, Status, boot_cap, filesystem, protocol, script};
+use microsystem_abi::{
+    CapHandle, FilesystemStatsV1, Message, Rights, Status, boot_cap, filesystem, protocol, script,
+};
 use microsystem_block::Operation;
 use microsystem_fs::{FileService, Operation as FsOperation};
 
@@ -23,12 +25,14 @@ const SCRIPT_SESSION_VA: u64 = script::SESSION_VA;
 
 struct OpenFiles {
     paths: [Option<String>; OPEN_FILE_LIMIT],
+    generations: [u32; OPEN_FILE_LIMIT],
 }
 
 impl OpenFiles {
     const fn new() -> Self {
         Self {
             paths: [const { None }; OPEN_FILE_LIMIT],
+            generations: [0; OPEN_FILE_LIMIT],
         }
     }
 
@@ -36,12 +40,18 @@ impl OpenFiles {
         let Some(index) = self.paths.iter().position(Option::is_none) else {
             return Err(Error::NoSpace);
         };
+        let generation = self.generations[index].wrapping_add(1).max(1);
+        self.generations[index] = generation;
         self.paths[index] = Some(path);
-        Ok(index as u64 + 1)
+        Ok(((generation as u64) << 32) | (index as u64 + 1))
     }
 
     fn path(&self, descriptor: u64) -> Result<&str, Error> {
-        let index = descriptor.checked_sub(1).ok_or(Error::Invalid)? as usize;
+        let index = (descriptor as u32).checked_sub(1).ok_or(Error::Invalid)? as usize;
+        let generation = (descriptor >> 32) as u32;
+        if generation == 0 || self.generations.get(index).copied() != Some(generation) {
+            return Err(Error::NotFound);
+        }
         self.paths
             .get(index)
             .and_then(Option::as_deref)
@@ -49,12 +59,34 @@ impl OpenFiles {
     }
 
     fn close(&mut self, descriptor: u64) -> Result<(), Error> {
-        let index = descriptor.checked_sub(1).ok_or(Error::Invalid)? as usize;
+        let index = (descriptor as u32).checked_sub(1).ok_or(Error::Invalid)? as usize;
+        let generation = (descriptor >> 32) as u32;
+        if generation == 0 || self.generations.get(index).copied() != Some(generation) {
+            return Err(Error::NotFound);
+        }
         let slot = self.paths.get_mut(index).ok_or(Error::NotFound)?;
         if slot.take().is_none() {
             return Err(Error::NotFound);
         }
         Ok(())
+    }
+
+    fn invalidate_path(&mut self, path: &str) {
+        for slot in &mut self.paths {
+            if slot.as_deref() == Some(path) {
+                *slot = None;
+            }
+        }
+    }
+
+    fn rename_path(&mut self, source: &str, destination: &str) {
+        self.invalidate_path(destination);
+        for path in self.paths.iter_mut().flatten() {
+            if path.as_str() == source {
+                path.clear();
+                path.push_str(destination);
+            }
+        }
     }
 }
 
@@ -89,6 +121,18 @@ impl ScriptSessions {
         (token != 0)
             .then(|| self.entries.iter().position(|entry| entry.token == token))
             .flatten()
+    }
+
+    fn invalidate_path(&mut self, path: &str) {
+        for session in &mut self.entries {
+            session.open_files.invalidate_path(path);
+        }
+    }
+
+    fn rename_path(&mut self, source: &str, destination: &str) {
+        for session in &mut self.entries {
+            session.open_files.rename_path(source, destination);
+        }
     }
 
     fn register(&mut self, token: u64, region: CapHandle) -> Status {
@@ -154,10 +198,10 @@ impl IpcDisk {
         request.words[1] = BLOCK_SIZE as u64;
         request.caps[0] = boot_cap::SHARED_BLOCK_FRAME;
         let mut reply = Message::new(protocol::BLOCK, 0);
-        unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+        microsystem_user_rt::fence();
         microsystem_user_rt::ipc_call(boot_cap::BLOCK_ENDPOINT, &request, &mut reply, 0)
             .map_err(|_| Error::Io)?;
-        unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+        microsystem_user_rt::fence();
         if reply.words[5] as i64 == 0 {
             Ok(())
         } else {
@@ -337,7 +381,7 @@ fn handle_fs(
         return script_sessions.unregister(request.words[3]);
     }
     if request.words[4] == filesystem::SCRIPT_REQUEST_MAGIC {
-        return handle_script_fs(filesystem, script_sessions, request, reply);
+        return handle_script_fs(filesystem, open_files, script_sessions, request, reply);
     }
     if request.opcode == FsOperation::Stat as u16 && request.caps[0] == CapHandle::INVALID {
         reply.words[0] = 0x4d46_5331;
@@ -350,10 +394,22 @@ fn handle_fs(
         value if value == boot_cap::GUI_TERMINAL_COMMANDS => TERMINAL_FILESYSTEM_DATA,
         _ => return Status::AccessDenied,
     };
-    let path_length = request.words[0] as usize;
-    let data_length = request.words[1] as usize;
-    if path_length > 255 || path_length + data_length > BLOCK_SIZE {
+    let Ok(path_length) = usize::try_from(request.words[0]) else {
         return Status::Invalid;
+    };
+    let Ok(data_length) = usize::try_from(request.words[1]) else {
+        return Status::Invalid;
+    };
+    let Some(total_length) = path_length.checked_add(data_length) else {
+        return Status::Invalid;
+    };
+    if path_length > 255 || total_length > BLOCK_SIZE {
+        return Status::Invalid;
+    }
+    if request.opcode == FsOperation::Stats as u16 {
+        return write_filesystem_stats(filesystem, shared_address, reply)
+            .map(|()| Status::Ok)
+            .unwrap_or_else(map_fs_error);
     }
     let shared = unsafe { core::slice::from_raw_parts(shared_address as *const u8, BLOCK_SIZE) };
     let Ok(path) = String::from_utf8(shared[..path_length].to_vec()) else {
@@ -369,29 +425,25 @@ fn handle_fs(
             reply.words[0] = open_files.open(path.to_string())?;
             Ok(())
         }),
-        value if value == FsOperation::List as u16 => filesystem.list(&path).and_then(|entries| {
-            let mut output = Vec::new();
-            for entry in entries {
-                if !output.is_empty() {
-                    output.push(b'\n');
-                }
-                output.extend_from_slice(entry.as_bytes());
-            }
-            write_shared(shared_address, &output, reply)
-        }),
+        value if value == FsOperation::List as u16 => filesystem
+            .list(&path)
+            .and_then(|entries| encode_listing(entries, BLOCK_SIZE))
+            .and_then(|output| write_shared(shared_address, &output, reply)),
         value if value == FsOperation::Read as u16 => request_path(request, &path, open_files)
             .and_then(|path| filesystem.read(&path))
             .and_then(|bytes| write_shared(shared_address, &bytes, reply)),
         value if value == FsOperation::ReadRange as u16 => require_path(&path)
-            .and_then(|path| filesystem.read(path))
-            .and_then(|bytes| {
-                write_shared_range(shared_address, &bytes, request.words[2] as usize, reply)
-            }),
+            .and_then(|path| filesystem.read_range(path, request.words[2] as usize, BLOCK_SIZE))
+            .and_then(|bytes| write_shared(shared_address, &bytes, reply)),
         value if value == FsOperation::Write as u16 => {
             request_path(request, &path, open_files).and_then(|path| filesystem.write(&path, &data))
         }
+        value if value == FsOperation::WriteRange as u16 => require_path(&path)
+            .and_then(|path| write_range(filesystem, path, request.words[2], &data)),
         value if value == FsOperation::Mkdir as u16 => match filesystem.mkdir(&path) {
-            Err(Error::AlreadyExists) if filesystem.list(&path).is_ok() => Ok(()),
+            Err(Error::AlreadyExists) if filesystem.metadata(&path) == Ok(Metadata::Directory) => {
+                Ok(())
+            }
             result => result,
         },
         value if value == FsOperation::Sync as u16 => filesystem.sync(),
@@ -401,9 +453,26 @@ fn handle_fs(
             .and_then(|path| filesystem.fsync(&path)),
         value if value == FsOperation::Rename as u16 => {
             let destination = String::from_utf8(data).map_err(|_| Error::Utf8);
-            destination.and_then(|destination| filesystem.rename(&path, &destination))
+            destination.and_then(|destination| {
+                filesystem.rename(&path, &destination)?;
+                open_files.rename_path(&path, &destination);
+                script_sessions.rename_path(&path, &destination);
+                Ok(())
+            })
         }
-        value if value == FsOperation::Unlink as u16 => filesystem.unlink(&path),
+        value if value == FsOperation::Replace as u16 => {
+            let destination = String::from_utf8(data).map_err(|_| Error::Utf8);
+            destination.and_then(|destination| {
+                filesystem.replace_file(&path, &destination)?;
+                open_files.rename_path(&path, &destination);
+                script_sessions.rename_path(&path, &destination);
+                filesystem.fsync(&destination)
+            })
+        }
+        value if value == FsOperation::Unlink as u16 => filesystem.unlink(&path).map(|()| {
+            open_files.invalidate_path(&path);
+            script_sessions.invalidate_path(&path);
+        }),
         value if value == FsOperation::Close as u16 => open_files.close(request.words[2]),
         _ => return Status::Invalid,
     };
@@ -418,6 +487,7 @@ fn handle_fs(
 
 fn handle_script_fs(
     filesystem_service: &mut FileService<IpcDisk>,
+    open_files: &mut OpenFiles,
     sessions: &mut ScriptSessions,
     request: &Message,
     reply: &mut Message,
@@ -522,31 +592,28 @@ fn handle_script_fs(
             value if value == FsOperation::Stat as u16 => {
                 stat_path(filesystem_service, &resolved_path, reply)
             }
-            value if value == FsOperation::List as u16 => {
-                filesystem_service.list(&resolved_path).and_then(|entries| {
-                    let mut output = Vec::new();
-                    for entry in entries {
-                        if !output.is_empty() {
-                            output.push(b'\n');
-                        }
-                        output.extend_from_slice(entry.as_bytes());
-                    }
-                    write_script_payload(&output, reply)
-                })
-            }
+            value if value == FsOperation::List as u16 => filesystem_service
+                .list(&resolved_path)
+                .and_then(|entries| encode_listing(entries, script::BROKER_BYTES))
+                .and_then(|output| write_script_payload(&output, reply)),
             value if value == FsOperation::Read as u16 => filesystem_service
                 .read(&resolved_path)
                 .and_then(|bytes| write_script_payload(&bytes, reply)),
-            value if value == FsOperation::ReadRange as u16 => {
-                filesystem_service.read(&resolved_path).and_then(|bytes| {
-                    write_script_payload_range(&bytes, request.words[2] as usize, reply)
-                })
-            }
+            value if value == FsOperation::ReadRange as u16 => filesystem_service
+                .read_range(
+                    &resolved_path,
+                    request.words[2] as usize,
+                    script::BROKER_BYTES,
+                )
+                .and_then(|bytes| write_script_payload(&bytes, reply)),
             value if value == FsOperation::Write as u16 => {
                 filesystem_service.write(&resolved_path, &data)
             }
             value if value == FsOperation::WriteAtomic as u16 => {
-                let temporary = script_temporary_path(&resolved_path, token);
+                let temporary = match script_temporary_path(&resolved_path, token) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
                 let durable = request.words[2] & 1 != 0;
                 filesystem_service
                     .write(&temporary, &data)
@@ -557,7 +624,12 @@ fn handle_script_fs(
                             Ok(())
                         }
                     })
-                    .and_then(|()| filesystem_service.replace_file(&temporary, &resolved_path))
+                    .and_then(|()| {
+                        filesystem_service.replace_file(&temporary, &resolved_path)?;
+                        open_files.invalidate_path(&resolved_path);
+                        sessions.invalidate_path(&resolved_path);
+                        Ok(())
+                    })
                     .and_then(|()| {
                         if durable {
                             filesystem_service.fsync(&resolved_path)
@@ -577,12 +649,22 @@ fn handle_script_fs(
                 })
             }
             value if value == FsOperation::Fsync as u16 => filesystem_service.fsync(&resolved_path),
-            value if value == FsOperation::Rename as u16 => match String::from_utf8(data) {
-                Ok(destination) => filesystem_service.rename(&resolved_path, &destination),
-                Err(_) => Err(Error::Utf8),
-            },
+            value if value == FsOperation::Rename as u16 => String::from_utf8(data)
+                .map_err(|_| Error::Utf8)
+                .and_then(|destination| {
+                    normalize_script_path(&destination).map_err(|_| Error::Invalid)
+                })
+                .and_then(|destination| {
+                    filesystem_service.rename(&resolved_path, &destination)?;
+                    open_files.rename_path(&resolved_path, &destination);
+                    sessions.rename_path(&resolved_path, &destination);
+                    Ok(())
+                }),
             value if value == FsOperation::Unlink as u16 => {
-                filesystem_service.unlink(&resolved_path)
+                filesystem_service.unlink(&resolved_path).map(|()| {
+                    open_files.invalidate_path(&resolved_path);
+                    sessions.invalidate_path(&resolved_path);
+                })
             }
             value if value == FsOperation::Close as u16 => {
                 sessions.entries[index].open_files.close(descriptor)
@@ -699,7 +781,7 @@ fn rules_allow(input: &str, manifest: bool, access: &str, path: &str) -> bool {
 }
 
 fn normalize_script_path(path: &str) -> Result<String, Status> {
-    if !path.starts_with('/') || path.as_bytes().contains(&0) {
+    if path.len() > 255 || !path.starts_with('/') || path.as_bytes().contains(&0) {
         return Err(Status::Invalid);
     }
     let mut components = Vec::new();
@@ -716,10 +798,13 @@ fn normalize_script_path(path: &str) -> Result<String, Status> {
     }
     let mut normalized = String::from("/");
     normalized.push_str(&components.join("/"));
+    if normalized.len() > 255 {
+        return Err(Status::Invalid);
+    }
     Ok(normalized)
 }
 
-fn script_temporary_path(path: &str, token: u64) -> String {
+fn script_temporary_path(path: &str, token: u64) -> Result<String, Status> {
     use core::fmt::Write as _;
     let (directory, _) = path.rsplit_once('/').unwrap_or(("", path));
     let mut output = if directory.is_empty() {
@@ -731,7 +816,11 @@ fn script_temporary_path(path: &str, token: u64) -> String {
         output.push('/');
     }
     let _ = write!(output, ".mica-{token:016x}.tmp");
-    output
+    if output.len() > 255 {
+        Err(Status::Invalid)
+    } else {
+        Ok(output)
+    }
 }
 
 fn write_script_payload(bytes: &[u8], reply: &mut Message) -> Result<(), Error> {
@@ -744,20 +833,33 @@ fn write_script_payload(bytes: &[u8], reply: &mut Message) -> Result<(), Error> 
             (SCRIPT_SESSION_VA as *mut u8).add(script::BROKER_OFFSET),
             bytes.len(),
         );
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     reply.words[0] = bytes.len() as u64;
     Ok(())
 }
 
-fn write_script_payload_range(
-    bytes: &[u8],
-    offset: usize,
-    reply: &mut Message,
-) -> Result<(), Error> {
-    let start = offset.min(bytes.len());
-    let end = start.saturating_add(script::BROKER_BYTES).min(bytes.len());
-    write_script_payload(&bytes[start..end], reply)
+fn encode_listing(entries: Vec<String>, maximum: usize) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    for entry in entries {
+        let separator = usize::from(!output.is_empty());
+        let required = output
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(entry.len()))
+            .ok_or(Error::NoSpace)?;
+        if required > maximum {
+            return Err(Error::NoSpace);
+        }
+        output
+            .try_reserve_exact(separator + entry.len())
+            .map_err(|_| Error::NoSpace)?;
+        if separator != 0 {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(entry.as_bytes());
+    }
+    Ok(output)
 }
 
 fn map_fs_error(error: Error) -> Status {
@@ -806,6 +908,63 @@ fn stat_path(
     }
 }
 
+fn write_filesystem_stats(
+    filesystem: &FileService<IpcDisk>,
+    shared_address: usize,
+    reply: &mut Message,
+) -> Result<(), Error> {
+    let stats = filesystem.stats();
+    let output = FilesystemStatsV1 {
+        version: 1,
+        reserved: 0,
+        block_size: BLOCK_SIZE as u32,
+        total_blocks: stats.total_blocks,
+        used_blocks: stats.used_blocks,
+        free_blocks: stats.free_blocks,
+        generation: stats.generation,
+        transaction: stats.transaction,
+        entries: stats.entries as u64,
+        checkpoint_block: stats.checkpoint_block,
+        segments_since_checkpoint: stats.segments_since_checkpoint,
+        active_arena: stats.active_arena,
+        segment_directory: stats.segment_directory as u8,
+        active_segments: stats.active_segments,
+        reserved_tail: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&output as *const FilesystemStatsV1).cast::<u8>(),
+            core::mem::size_of::<FilesystemStatsV1>(),
+        )
+    };
+    write_shared(shared_address, bytes, reply)
+}
+
+fn write_range(
+    filesystem: &mut FileService<IpcDisk>,
+    path: &str,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), Error> {
+    let mut bytes = filesystem.read(path)?;
+    let offset = usize::try_from(offset).map_err(|_| Error::Invalid)?;
+    if offset > bytes.len() {
+        return Err(Error::Invalid);
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    let end = offset.checked_add(data.len()).ok_or(Error::NoSpace)?;
+    if end > bytes.len() {
+        bytes
+            .try_reserve_exact(end - bytes.len())
+            .map_err(|_| Error::NoSpace)?;
+        bytes.resize(end, 0);
+    }
+    bytes[offset..end].copy_from_slice(data);
+    filesystem.write(path, &bytes)
+}
+
 fn receive_with_maintenance(
     filesystem: &mut FileService<IpcDisk>,
     mut reply: Option<&Message>,
@@ -850,21 +1009,10 @@ fn write_shared(address: usize, bytes: &[u8], reply: &mut Message) -> Result<(),
     }
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
-        core::arch::asm!("dmb ish", options(nostack, preserves_flags));
+        microsystem_user_rt::fence();
     }
     reply.words[0] = bytes.len() as u64;
     Ok(())
-}
-
-fn write_shared_range(
-    address: usize,
-    bytes: &[u8],
-    offset: usize,
-    reply: &mut Message,
-) -> Result<(), Error> {
-    let start = offset.min(bytes.len());
-    let end = start.saturating_add(BLOCK_SIZE).min(bytes.len());
-    write_shared(address, &bytes[start..end], reply)
 }
 
 struct PanicText {
