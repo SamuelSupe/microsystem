@@ -302,10 +302,10 @@ else
 fi
 
 required_markers=(
-  "[bootfs] valid=true entries=24 static-elfs=23"
-  "[service] resident EL0 address-spaces=12 asids=[0x20..0x2b]"
-  "[service] resident EL0 ready=12/12 online=12/12 switches="
-  "[proc] dynamic application capacity=8 first-pid=13 independent-slots=true"
+  "[bootfs] valid=true entries=25 static-elfs=24"
+  "[service] resident EL0 address-spaces=13 asids=[0x20..0x2c]"
+  "[service] resident EL0 ready=13/13 online=13/13 switches="
+  "[proc] dynamic application capacity=8 first-pid=14 independent-slots=true"
   "[gui] virtio-gpu scanout ready"
   "[net] virtio-net ready mac=52:54:00:12:34:56 ipv4=10.0.2.15/24 rx-buffers=2"
   "[gui] unifont runtime loaded=true cache=128 fallback=ascii"

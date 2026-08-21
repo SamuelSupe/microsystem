@@ -203,10 +203,10 @@ setsid "$MICROSYSTEM_QEMU_BINARY" \
   >"$log_file" 2>&1 &
 qemu_pid=$!
 
-required_markers='[bootfs] valid=true entries=24 static-elfs=23
-[service] resident EL0 address-spaces=12 asids=[0x20..0x2b]
+required_markers='[bootfs] valid=true entries=25 static-elfs=24
+[service] resident EL0 address-spaces=13 asids=[0x20..0x2c]
 [service] resident EL0 ready=8/8 online=8/8 switches=
-[proc] dynamic application capacity=8 first-pid=13 independent-slots=true
+[proc] dynamic application capacity=8 first-pid=14 independent-slots=true
 [net] netd ready ipv4=10.0.2.15 outbound=true raw-device-isolated=true
 [ssh] sshd ready address=10.0.2.15 port=22 auth=publickey user=micro'
 fatal_re='\[panic\]|DMA fault|translation fault|gerror=0x[1-9a-f][0-9a-f]*|allocator fault'

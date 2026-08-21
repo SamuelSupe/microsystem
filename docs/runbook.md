@@ -128,6 +128,7 @@ The serial shell help surface is:
 shell: help pwd cd echo clear history ps kill wait uptime sleep date free sysinfo
 files: ls cat head tail wc hexdump xxd grep find tree du df stat touch cp write
        mkdir rmdir mv rm fsync sync (also available through fs <command>)
+database: sql <CREATE|DROP|INSERT|SELECT|UPDATE|DELETE statement>
 network: curl nslookup netstat
 programs: run mica
 system: exit shutdown poweroff reboot
@@ -144,6 +145,20 @@ dedicated `TERMINAL_FILESYSTEM_ENDPOINT` plus the `GUI_TERMINAL_COMMANDS`
 other filesystem payload frames. Input commands are capped at 512 bytes and
 output/replies at 4 KiB, with the viewport following the newest lines. The
 serial shell and GUI terminal share the filesystem parser and aliases.
+
+The serial shell's `sql <statement>` command sends one UTF-8 statement to the
+resident EL0 `db` service. For example:
+
+```text
+sql CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+sql INSERT INTO users VALUES (1, 'Alice')
+sql SELECT * FROM users WHERE id = 1
+```
+
+The request and response use the 4 KiB IPC shared frame. Mutating statements
+commit one complete candidate snapshot through MFS1 at
+`/.system/db/main.db`; the staging path is `/.system/db/main.db.tmp`. The
+service is a bounded MicroSystem SQL subset, not SQLite-compatible.
 
 The serial shell also has a bounded curl-like GET command:
 
@@ -223,10 +238,10 @@ and reclaims=2. Refresh-run icon CRCs were `5cb170eb`, `74eebaaa`, `05025d7a`
 and `f686e259` (pre, active, restored, restart). The fixture and QEMU cleanup
 completed without residue.
 
-The normal serial profile reports bootfs `24/23` (24 entries, 23 static
-ELFs), `SERVICE_COUNT=12`, resident ASIDs `0x20..0x2b`, serial ready/online
-`8/8`, and the first dynamic process PID `13`. The GUI profile reports
-GUI ready/online `12/12`. The kernel heap budget is `0x8000000` (128 MiB);
+The normal serial profile reports bootfs `25/24` (25 entries, 24 static
+ELFs), `SERVICE_COUNT=13`, resident ASIDs `0x20..0x2c`, serial ready/online
+`8/8`, and the first dynamic process PID `14`. The GUI profile reports
+GUI ready/online `13/13`. The kernel heap budget is `0x8000000` (128 MiB);
 ordinary user tasks have a 64 KiB stack and 1 MiB heap, and a Mica image is
 loaded at `0xe0000`.
 
@@ -236,10 +251,11 @@ These marker fields are useful when diagnosing a boot or profile mismatch
 (the service fields may be emitted on one line):
 
 ```text
-[bootfs] valid=true entries=24 static-elfs=23
-[service] ... address-spaces=12 asids=[0x20..0x2b] ... ready=8/8 online=8/8
-[service] ... address-spaces=12 asids=[0x20..0x2b] ... ready=12/12 online=12/12
-[proc] dynamic application capacity=8 first-pid=13
+[bootfs] valid=true entries=25 static-elfs=24
+[service] ... address-spaces=13 asids=[0x20..0x2c] ... ready=8/8 online=8/8
+[service] ... address-spaces=13 asids=[0x20..0x2c] ... ready=13/13 online=13/13
+[proc] dynamic application capacity=8 first-pid=14
+[ipc] resident shell->db ping=true
 [mm] kernel heap ready bytes=0x8000000
 [net] ... raw-device-isolated=true tcp-owner=true dns=true
 [ssh] sshd ready address=10.0.2.15 port=22 auth=publickey user=micro
@@ -277,10 +293,13 @@ boundary described above; do not use it as a general data-recovery tool.
 
 ## Profiles and service boundaries
 
-The serial profile enables the eight boot services that can operate without a
-GPU. The GUI profile enables all twelve services, including `windowd` and the
-terminal/GUI path. `SERVICE_COUNT` and the address-space/ASID range come from
-the kernel service table, not from a hand-maintained marker.
+The service table reserves 13 resident slots in this order:
+`init console block mfs shell devmgr windowd terminal files monitor sshd netd db`.
+The serial manifest starts `devmgr,console,block,mfs,db,shell,netd,sshd`; the
+GUI profile adds `windowd,terminal,files,monitor`. `SERVICE_COUNT` and the
+address-space/ASID range come from the kernel service table, not from a
+hand-maintained marker. The serial readiness mask still reports `8/8`, while
+the GUI mask covers all 13 and reports `13/13`.
 
 `netd` is the only task with the raw `NETWORK_DEVICE` capability. Applications,
 Mica, and `sshd` receive broker endpoints and bounded shared buffers; raw
@@ -351,9 +370,9 @@ The timeout parser accepts `1ms` through `24h`; non-GUI Mica is hard-capped at
 
 ## Failure interpretation
 
-- No `[bootfs]` or an unexpected 24/23 count: inspect image construction before
+- No `[bootfs]` or an unexpected 25/24 count: inspect image construction before
   debugging services.
-- Serial `8/8` or GUI `12/12` not reached: inspect the profile/device path and
+- Serial `8/8` or GUI `13/13` not reached: inspect the profile/device path and
   the first service marker; do not infer a process leak from a partial boot.
 - A raw network syscall from a non-`netd` task must fail; a successful raw
   receive/send outside `netd` is an isolation regression.

@@ -28,10 +28,11 @@ stale descendants rather than relying on a slot number alone.
 | `SSH` | 7 | reserved protocol namespace |
 | `SCRIPT` | **8** | Mica script broker |
 | `NETWORK` | **9** | netd and its clients |
+| `DATABASE` | **10** | resident EL0 `db` service |
 
-The script and network numbers are intentionally distinct: Mica sends process
-operations through `SCRIPT`, while data-plane DNS/TCP/UDP operations go through
-`NETWORK` to netd.
+The script, network and database numbers are intentionally distinct: Mica sends
+process operations through `SCRIPT`, data-plane DNS/TCP/UDP operations go
+through `NETWORK` to netd, and SQL requests go through `DATABASE` to `db`.
 
 ## Syscalls and process operations
 
@@ -60,7 +61,7 @@ frame and dedicated GUI endpoint). Init is the only caller; the accepted
 profile is `THREAD_PROFILE_MICA` and the program must be the bootfs `mica`
 image. V2 is transactional: validation, capability installation and rollback
 cover all nine entries. Ordinary application slots begin at
-`process::FIRST_APPLICATION_PID = 13` and there are eight slots.
+`process::FIRST_APPLICATION_PID = 14` and there are eight slots.
 
 `time::Operation` is `Sleep=1`, `Uptime=2`, `Realtime=3`. The TIME endpoint
 currently serves Sleep/Uptime; `Realtime=3` is represented in the ABI and
@@ -72,9 +73,9 @@ valid Unix time; otherwise `ClockRealtime` returns `NotSupported`.
 
 Filesystem operations are `Stat=1`, `List=2`, `Read=3`, `Write=4`, `Mkdir=5`,
 `Sync=6`, `Open=7`, `Fsync=8`, `Rename=9`, `Unlink=10`, `Close=11`,
-`WriteAtomic=12`, `ReadRange=13`. Script registration uses `0x100` and
-unregistration `0x101`; requests carry `MICAFS01`, and the exact trusted CA
-read carries `MICACA01`.
+`WriteAtomic=12`, `ReadRange=13`, `Stats=14`, `WriteRange=15`, and
+`Replace=16`. Script registration uses `0x100` and unregistration `0x101`;
+requests carry `MICAFS01`, and the exact trusted CA read carries `MICACA01`.
 
 `script::SessionHeaderV1` is version 1 with magic `MICA`:
 
@@ -94,7 +95,83 @@ token-authenticated request, then unmap it. The CA bundle is fetched from the
 exact MFS path `/.system/certs/ca-bundle.derpack` with `MICACA01`; it is not a
 shared GUI/FrameRegion data source.
 
-## Boot capabilities used by Mica, netd and SSH
+## Database protocol 10
+
+The database protocol is a deliberately small MicroSystem contract. It is
+served by the resident EL0 `db` service through `DATABASE_ENDPOINT` (86/1),
+with the shell as the current client. Requests use protocol `DATABASE=10` and
+carry `SHARED_FILESYSTEM_FRAME` (25/1) in capability slot 0. The frame is a
+single 4 KiB request/response area; request word 0 is the UTF-8 SQL byte length
+and `Execute` accepts at most 4,096 bytes. `Ping=1` checks the endpoint and
+`Execute=2` executes one statement. One optional trailing semicolon is allowed;
+additional statements are rejected.
+
+The supported SQL subset is:
+
+```text
+CREATE TABLE name (column INTEGER|TEXT|BOOL|BOOLEAN [PRIMARY KEY|NOT NULL], ...)
+DROP TABLE name
+INSERT INTO name [(column, ...)] VALUES (literal, ...)
+SELECT *|column, ... FROM name [WHERE predicate [AND predicate ...]]
+UPDATE name SET column=literal [, ...] [WHERE predicate [AND predicate ...]]
+DELETE FROM name [WHERE predicate [AND predicate ...]]
+```
+
+Identifiers are ASCII letters/underscore followed by ASCII letters, digits or
+underscore, with a 63-byte limit. Keywords are case-insensitive. Literals are
+signed decimal integers, single-quoted text (a doubled quote escapes a quote),
+`TRUE`, `FALSE` and `NULL`. Predicates support `=`, `!=`, `<>`, `<`, `<=`, `>`
+and `>=`, plus `IS NULL` and `IS NOT NULL`; only conjunction with `AND` is
+supported. A table may have at most one primary-key column; `PRIMARY KEY`
+implies `NOT NULL`, and explicit `NOT NULL` is supported. The limits are 32
+tables, 32 columns per table, 1,024 bytes per text value, 256 KiB per snapshot,
+and 4 KiB for the complete response.
+
+Joins, expressions, functions, `OR`, aggregates, ordering, grouping, limits,
+offsets, subqueries, indexes, `ALTER TABLE`, foreign keys and explicit
+transaction statements are outside this subset. This is not SQLite syntax or
+API compatibility: the on-disk snapshot uses the `MSQLDB1\0` magic, version 1
+and a CRC32C payload, not SQLite's file format.
+
+### Request, response and tagged values
+
+`DbResponseHeaderV1` is a 24-byte `repr(C)` header at the start of the shared
+frame:
+
+```text
+magic=SQL1  version=1  kind  columns  rows  reserved
+affected_rows  payload_bytes
+```
+
+`kind` is `Command=1`, `Rows=2` or `Error=3`. `reply.words[0]` is the total
+response bytes and `reply.words[1]` is the affected-row or row count; the
+status is in `reply.words[5]`. A command response has no payload and reports
+`affected_rows`. An error response carries its UTF-8 message in the payload
+and returns a non-OK status.
+
+For a row response, the payload first contains one column descriptor per
+column: `u8 name_bytes`, the UTF-8 name, then the `SqlType` byte (`1=Integer`,
+`2=Text`, `3=Bool`). Values follow in row-major order, each beginning with a
+tagged value byte:
+
+| Tag | Encoding |
+| ---: | --- |
+| `0` | `Null`, no payload |
+| `1` | `Integer`, signed little-endian `i64` |
+| `2` | `Text`, little-endian `u16` byte length followed by UTF-8 bytes |
+| `3` | `Bool`, one byte `0=false` or `1=true` |
+
+The header and payload together must fit in the 4 KiB frame. A mutating
+statement executes against a cloned database, encodes a complete snapshot, and
+is committed only after MFS1 has written and fsynced
+`/.system/db/main.db.tmp`, replaced it with `/.system/db/main.db`, and fsynced
+the final path. `SELECT` is read-only. There is no multi-statement transaction
+or SQLite transaction compatibility.
+
+At startup, a missing snapshot creates an empty database, but a CRC failure or
+unknown snapshot version returns `Corrupt` and does not reset the database.
+
+## Boot capabilities used by Mica, netd, SSH and DB
 
 The fixed boot handles are:
 
@@ -112,11 +189,13 @@ The fixed boot handles are:
 | `SSH_NETWORK_ENDPOINT` | 69/1 | SSH↔netd endpoint | sshd `WRITE`, netd `READ` |
 | `SCRIPT_BROKER_ENDPOINT` | 70/1 | init script broker | Mica process calls |
 | `SSH_FILESYSTEM_FRAME` | 71/1 | SSH/MFS payload frame | MFS/sshd only |
+| `SHARED_FILESYSTEM_FRAME` | 25/1 | MFS filesystem payload frame | MFS/shell/db |
 | `GUI_CONFIG_ENDPOINT` | 54/1 | init↔windowd client registry | init `WRITE`; windowd `READ` |
 | `SCRIPT_GUI_COMMANDS` | 72/1 | 64 KiB GUI command FrameRegion | Mica GUI `READ|WRITE|MAP` |
 | `SCRIPT_GUI_EVENTS` | 73/1 | 4 KiB GUI event Frame | Mica GUI `READ|WRITE|MAP` |
 | `SCRIPT_GUI_ENDPOINT` | 74/1 | dedicated windowd endpoint | Mica GUI `WRITE` |
 | `GUI_DYNAMIC_ENDPOINT_BASE` | 75..82 | windowd endpoint slots | one slot per dynamic client |
+| `DATABASE_ENDPOINT` | 86/1 | resident `db` endpoint | shell `WRITE`; db `READ` |
 
 The Mica task itself receives the session region, notification,
 `FILESYSTEM_ENDPOINT` (write), `NETWORK_ENDPOINT` (write), `RANDOM_SOURCE`
@@ -155,18 +234,19 @@ input-batch=16`. The network driver marker records
 
 ## Topology and address-space numbers
 
-The generated bootfs has 24 entries: 23 static ELF files and `etc/services`.
-`SERVICE_COUNT` is 12 and the service order is:
+The generated bootfs has 25 entries: 24 static ELF files and `etc/services`.
+`SERVICE_COUNT` is 13 and the service order is:
 
 ```text
-init console block mfs shell devmgr windowd terminal files monitor sshd netd
+init console block mfs shell devmgr windowd terminal files monitor sshd netd db
 ```
 
-The serial profile expects the first six plus `sshd` and `netd` and reports
-`ready=8/8 online=8/8`. A detected VirtIO-GPU/input device enables all twelve
-and the GUI profile reports `ready=12/12 online=12/12`. Service address spaces
-use ASIDs `0x20..0x2b`. Dynamic application slots begin at PID 13 and are
-separate from these service slots.
+The serial manifest starts `devmgr,console,block,mfs,db,shell,netd,sshd` and
+the serial readiness mask reports `ready=8/8 online=8/8`. A detected
+VirtIO-GPU/input device additionally starts `windowd,terminal,files,monitor`,
+enables all 13 service slots and reports `ready=13/13 online=13/13`. Service
+address spaces use ASIDs `0x20..0x2c`. Dynamic application slots begin at PID
+14 and are separate from these service slots.
 
 The kernel heap is 128 MiB. Each ordinary task has a 64 KiB stack and 1 MiB
 user heap. MFS has the explicitly provisioned 32 MiB large-heap backing;

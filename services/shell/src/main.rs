@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use microsystem_abi::{
-    FilesystemStatsV1, Message, Rights, Status, SystemStats, boot_cap, network, process, protocol,
-    script, time,
+    DbResponseHeaderV1, FilesystemStatsV1, Message, Rights, Status, SystemStats, boot_cap,
+    database, network, process, protocol, script, time,
 };
 use microsystem_console::{INLINE_BYTES, Operation as ConsoleOperation};
 use microsystem_fs::Operation as FsOperation;
@@ -75,6 +75,10 @@ pub extern "C" fn _start() -> ! {
     let _ = microsystem_user_rt::debug_write(
         b"[ipc] filesystem open/read/write/fsync/sync/stat/readdir/mkdir/rename/unlink protocol=true\n",
     );
+    if verify_database_protocol().is_err() {
+        microsystem_user_rt::exit(10);
+    }
+    let _ = microsystem_user_rt::debug_write(b"[ipc] resident shell->db ping=true\n");
     if verify_time_protocol().is_err() {
         microsystem_user_rt::exit(7);
     }
@@ -132,6 +136,7 @@ fn execute(line: &str, state: &mut ShellState) {
             b"shell: help pwd cd echo clear history ps kill wait uptime sleep date free sysinfo\n\
 files: ls cat head tail wc hexdump xxd grep find tree du df stat touch cp write\n\
        mkdir rmdir mv rm fsync sync (also available through fs <command>)\n\
+database: sql <CREATE|DROP|INSERT|SELECT|UPDATE|DELETE statement>\n\
 network: curl nslookup netstat\nprograms: run mica\nsystem: exit shutdown poweroff reboot\n\
 options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n",
         ),
@@ -158,7 +163,7 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
             let cpu1 = microsystem_user_rt::timer_ticks(1).unwrap_or(0);
             let shell_cpu = microsystem_user_rt::current_cpu().unwrap_or(0);
             output(format_args!(
-                "PID 1 init resident cpu=shared\nPID 2 console resident cpu=shared\nPID 3 block resident cpu=shared\nPID 4 mfs resident cpu=shared\nPID 5 shell running cpu={}\nPID 6 devmgr resident cpu=shared ticks=[{},{}]\n",
+                "PID 1 init resident cpu=shared\nPID 2 console resident cpu=shared\nPID 3 block resident cpu=shared\nPID 4 mfs resident cpu=shared\nPID 5 shell running cpu={}\nPID 6 devmgr resident cpu=shared ticks=[{},{}]\nPID 13 db resident cpu=shared\n",
                 shell_cpu, cpu0, cpu1
             ));
             let mut cursor = 7;
@@ -371,6 +376,7 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
 find/tree/du/df, stat, touch/create, cp [-r], write, mkdir [-p], rmdir,\n\
 mv/rename, rm/remove/unlink [-r], fsync, sync\n",
         ),
+        Ok(Command::Sql(statement)) => run_sql(statement),
         Ok(Command::Curl(arguments)) => run_curl(arguments, state),
         Ok(Command::Nslookup(host)) => run_nslookup(host),
         Ok(Command::Netstat) => run_netstat(),
@@ -1496,6 +1502,199 @@ fn time_request(operation: time::Operation, argument: u64) -> Result<u64, Status
         return Err(Status::Io);
     }
     Ok(reply.words[0])
+}
+
+fn verify_database_protocol() -> Result<(), Status> {
+    let reply = db_call(database::Operation::Ping, "")?;
+    if status_from_raw(reply.words[5] as i64) != Status::Ok || reply.protocol != protocol::DATABASE
+    {
+        return Err(Status::Io);
+    }
+    Ok(())
+}
+
+fn db_call(operation: database::Operation, sql: &str) -> Result<Message, Status> {
+    if sql.len() > SHARED_BYTES {
+        return Err(Status::Invalid);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(sql.as_ptr(), SHARED_DATA as *mut u8, sql.len());
+        microsystem_user_rt::fence();
+    }
+    let mut request = Message::new(protocol::DATABASE, operation as u16);
+    request.words[0] = sql.len() as u64;
+    request.caps[0] = boot_cap::SHARED_FILESYSTEM_FRAME;
+    let mut reply = Message::new(protocol::DATABASE, 0);
+    microsystem_user_rt::ipc_call(boot_cap::DATABASE_ENDPOINT, &request, &mut reply, 0)?;
+    if reply.protocol != protocol::DATABASE {
+        return Err(Status::Io);
+    }
+    microsystem_user_rt::fence();
+    Ok(reply)
+}
+
+fn run_sql(statement: &str) {
+    let reply = match db_call(database::Operation::Execute, statement) {
+        Ok(reply) => reply,
+        Err(status) => {
+            output(format_args!("sql: request failed status={:?}\n", status));
+            return;
+        }
+    };
+    let status = status_from_raw(reply.words[5] as i64);
+    if status != Status::Ok {
+        print_db_error(&reply, status);
+        return;
+    }
+    let Some(header) = db_response_header(&reply) else {
+        console_write(b"sql: invalid database response\n");
+        return;
+    };
+    match header.kind {
+        value if value == database::ResponseKind::Command as u16 => {
+            output(format_args!("ok affected_rows={}\n", header.affected_rows));
+        }
+        value if value == database::ResponseKind::Rows as u16 => print_db_rows(&header),
+        _ => {
+            console_write(b"sql: invalid database response kind\n");
+        }
+    }
+}
+
+fn print_db_error(reply: &Message, status: Status) {
+    if let Some(header) = db_response_header(reply)
+        && header.kind == database::ResponseKind::Error as u16
+    {
+        let start = core::mem::size_of::<DbResponseHeaderV1>();
+        let end = start.saturating_add(header.payload_bytes as usize);
+        if end <= SHARED_BYTES {
+            let bytes = unsafe {
+                core::slice::from_raw_parts((SHARED_DATA + start) as *const u8, end - start)
+            };
+            if let Ok(message) = core::str::from_utf8(bytes) {
+                output(format_args!("sql: {}\n", message));
+                return;
+            }
+        }
+    }
+    output(format_args!("sql: failed status={:?}\n", status));
+}
+
+fn db_response_header(reply: &Message) -> Option<DbResponseHeaderV1> {
+    let total = usize::try_from(reply.words[0]).ok()?;
+    let header_bytes = core::mem::size_of::<DbResponseHeaderV1>();
+    if total < header_bytes || total > SHARED_BYTES {
+        return None;
+    }
+    let header = unsafe { core::ptr::read_unaligned(SHARED_DATA as *const DbResponseHeaderV1) };
+    if header.magic != database::RESPONSE_MAGIC
+        || header.version != database::RESPONSE_VERSION
+        || header.payload_bytes as usize != total - header_bytes
+    {
+        return None;
+    }
+    Some(header)
+}
+
+fn print_db_rows(header: &DbResponseHeaderV1) {
+    let header_bytes = core::mem::size_of::<DbResponseHeaderV1>();
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            (SHARED_DATA + header_bytes) as *const u8,
+            header.payload_bytes as usize,
+        )
+    };
+    let mut offset = 0usize;
+    let mut names = Vec::new();
+    for _ in 0..header.columns {
+        let Some(length) = payload.get(offset).copied().map(usize::from) else {
+            console_write(b"sql: malformed column metadata\n");
+            return;
+        };
+        offset += 1;
+        let Some(bytes) = payload.get(offset..offset.saturating_add(length)) else {
+            console_write(b"sql: malformed column metadata\n");
+            return;
+        };
+        let Ok(name) = core::str::from_utf8(bytes) else {
+            console_write(b"sql: malformed column metadata\n");
+            return;
+        };
+        names.push(name.to_string());
+        offset += length;
+        if payload.get(offset).is_none() {
+            console_write(b"sql: malformed column metadata\n");
+            return;
+        }
+        offset += 1;
+    }
+    for (index, name) in names.iter().enumerate() {
+        if index != 0 {
+            console_write(b" | ");
+        }
+        console_write(name.as_bytes());
+    }
+    console_write(b"\n");
+    for _ in 0..header.rows {
+        for column in 0..header.columns {
+            if column != 0 {
+                console_write(b" | ");
+            }
+            if print_db_value(payload, &mut offset).is_err() {
+                console_write(b"<malformed>");
+                console_write(b"\n");
+                return;
+            }
+        }
+        console_write(b"\n");
+    }
+    if offset != payload.len() {
+        console_write(b"sql: trailing result data\n");
+    }
+}
+
+fn print_db_value(payload: &[u8], offset: &mut usize) -> Result<(), ()> {
+    let tag = *payload.get(*offset).ok_or(())?;
+    *offset += 1;
+    match tag {
+        value if value == database::ValueTag::Null as u8 => console_write(b"NULL"),
+        value if value == database::ValueTag::Integer as u8 => {
+            let bytes = payload
+                .get(*offset..(*offset).saturating_add(8))
+                .ok_or(())?;
+            *offset += 8;
+            let number = i64::from_le_bytes(bytes.try_into().map_err(|_| ())?);
+            let mut text = Text::new();
+            text.write_fmt(format_args!("{}", number)).map_err(|_| ())?;
+            console_write(text.as_bytes());
+        }
+        value if value == database::ValueTag::Text as u8 => {
+            let length = u16::from_le_bytes(
+                payload
+                    .get(*offset..(*offset).saturating_add(2))
+                    .ok_or(())?
+                    .try_into()
+                    .map_err(|_| ())?,
+            ) as usize;
+            *offset += 2;
+            let bytes = payload
+                .get(*offset..(*offset).saturating_add(length))
+                .ok_or(())?;
+            *offset += length;
+            console_write(bytes);
+        }
+        value if value == database::ValueTag::Bool as u8 => {
+            let value = *payload.get(*offset).ok_or(())?;
+            *offset += 1;
+            match value {
+                0 => console_write(b"FALSE"),
+                1 => console_write(b"TRUE"),
+                _ => return Err(()),
+            }
+        }
+        _ => return Err(()),
+    }
+    Ok(())
 }
 
 fn verify_time_protocol() -> Result<(), Status> {

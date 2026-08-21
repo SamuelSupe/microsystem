@@ -717,9 +717,9 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 fi
 
 required_markers=(
-  "\\[bootfs\\][[:space:]]+valid=true[[:space:]]+entries=24[[:space:]]+static-elfs=23"
-  "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+address-spaces=12[[:space:]]+asids=\\[0x20\\.\\.0x2b\\]"
-  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=13[[:space:]]+independent-slots=true"
+  "\\[bootfs\\][[:space:]]+valid=true[[:space:]]+entries=25[[:space:]]+static-elfs=24"
+  "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+address-spaces=13[[:space:]]+asids=\\[0x20\\.\\.0x2c\\]"
+  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=14[[:space:]]+independent-slots=true"
   "\\[mm\\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=0x[[:xdigit:]]+[[:space:]]+allocated=0x[[:xdigit:]]+"
   "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+ready=8/8[[:space:]]+online=8/8[[:space:]]+switches=[0-9]+"
   "\\[service\\][[:space:]]+shell[[:space:]]+ready"
@@ -789,4 +789,4 @@ if grep -Eiq '\[panic\]|\[service\][[:space:]]+critical[[:space:]]+service|trans
   exit 1
 fi
 
-echo "mica-qemu: PASS bootfs=24/23 first-pid=13 mica-output=42 status=0 run-mica=not-found log=$log_file"
+echo "mica-qemu: PASS bootfs=25/24 first-pid=14 mica-output=42 status=0 run-mica=not-found log=$log_file"

@@ -67,19 +67,21 @@ and one idle task per CPU/hart; init then starts resident EL0 services by bootfs
 name, and each service is re-parsed as a static ELF64 `ET_EXEC` image with
 page-granular W^X checks.
 
-The bootfs has 24 entries (23 static ELF files and `etc/services`).
-`SERVICE_COUNT=12` and the service order is:
+The bootfs has 25 entries (24 static ELF files and `etc/services`).
+`SERVICE_COUNT=13` and the service-slot order is:
 
 ```text
-init console block mfs shell devmgr windowd terminal files monitor sshd netd
+init console block mfs shell devmgr windowd terminal files monitor sshd netd db
 ```
 
-Without GPU/input, the expected resident set is the six core services plus
-`sshd`/`netd` (`8/8`). With GPU/input, the kernel enables windowd/terminal/files/
-monitor too (`12/12`). Service address spaces use ASIDs `0x20..0x2b`.
-Ordinary application slots are independent, capacity eight, and the first
-dynamic PID is 13. The tested Mica process is created through `ThreadStartEx`
-and is not a resident service.
+Without GPU/input, init starts the non-GUI manifest
+`devmgr,console,block,mfs,db,shell,netd,sshd`; with GPU/input it additionally
+starts `windowd,terminal,files,monitor`. The serial readiness mask reports
+`8/8` for its required slots, while the GUI profile enables all 13 slots and
+reports `13/13`. Service address spaces use ASIDs `0x20..0x2c`. Ordinary
+application slots are independent, capacity eight, and the first dynamic PID
+is 14. The tested Mica process is created through `ThreadStartEx` and is not a
+resident service.
 
 Each ordinary task receives a 64 KiB stack, a 1 MiB user-rt heap and a
 `0xe0000`-byte image window. MFS receives a 32 MiB large-heap backing; windowd
@@ -114,7 +116,7 @@ Messages have six words and four caps. The high four flag bits carry the move
 mask; move/copy pre-validates all destination slots and rights and uses stable
 derivation nodes for revoke. Endpoints are capability-scoped, not globally
 addressable. The core protocol numbers are documented in [docs/abi.md](abi.md):
-Mica script is protocol 8 and network is protocol 9.
+Mica script is protocol 8, network is protocol 9, and database is protocol 10.
 
 The script launch path is:
 
@@ -144,6 +146,30 @@ same-origin, while an explicit address-bar URL may choose another origin.
 TLS 1.3 validation retains the trust anchor when a server repeats it as the
 chain tail (the redundant tail is omitted before revalidation) and explicitly
 supports P-384 ECDSA `CertificateVerify`.
+
+### User-space SQL service
+
+`db` is a resident EL0 user-space service, not a kernel database or a SQLite
+library. The shell reaches it through `protocol::DATABASE = 10` and the
+capability-scoped `DATABASE_ENDPOINT`. SQL input and the response occupy the
+same 4 KiB IPC shared frame; row responses use the `SQL1` response header and
+tagged `Null`, `Integer`, `Text` and `Bool` values. The complete wire layout and
+the supported SQL subset are in [docs/abi.md](abi.md).
+
+At startup, `db` creates `/.system/db` if needed and loads the MSQLDB1 v1
+snapshot at `/.system/db/main.db`; a missing file starts an empty database.
+CRC failure or an unknown snapshot version reports `Corrupt` and stops the
+service; it never silently replaces the snapshot with an empty database.
+The service uses MFS1 through the filesystem endpoint rather than accessing
+the block device directly. A successful mutating statement is executed on a
+candidate copy, written in frame-bounded chunks through
+`/.system/db/main.db.tmp`, fsynced, atomically replaced into `main.db`, and
+fsynced again before the candidate becomes live. Thus each `Execute` carries
+one statement and has a single statement commit boundary. Parse, constraint, or
+persistence failure does not adopt the candidate. `SELECT` returns rows without
+a persistence write. The
+MSQLDB1 snapshot is a MicroSystem format with CRC32C, not a SQLite database
+file and not a SQLite-compatible client/storage contract.
 
 ## Storage and failure isolation
 

@@ -87,13 +87,14 @@ pub extern "C" fn _start() -> ! {
     verify_privileged_fault();
     start_service("block", 3);
     start_service("mfs", 4);
+    start_service("db", 13);
     start_service("shell", 5);
     let gui = delegate_block_transport();
     start_service("netd", 12);
     start_service("sshd", 11);
     if gui {
         let _ = microsystem_user_rt::debug_write(
-            b"[bootfs] root task started manifest services=devmgr,console,block,mfs,shell,netd,sshd,windowd,terminal,files,monitor\n",
+            b"[bootfs] root task started manifest services=devmgr,console,block,mfs,db,shell,netd,sshd,windowd,terminal,files,monitor\n",
         );
         start_service("windowd", 7);
         GUI_AVAILABLE.store(1, Ordering::Release);
@@ -102,7 +103,7 @@ pub extern "C" fn _start() -> ! {
         start_service("monitor", 10);
     } else {
         let _ = microsystem_user_rt::debug_write(
-            b"[bootfs] root task started manifest services=devmgr,console,block,mfs,shell,netd,sshd\n",
+            b"[bootfs] root task started manifest services=devmgr,console,block,mfs,db,shell,netd,sshd\n",
         );
     }
     let _ = microsystem_user_rt::debug_write(b"[ipc] resident procman endpoint=4 ready\n");

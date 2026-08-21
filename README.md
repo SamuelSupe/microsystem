@@ -4,7 +4,7 @@
 ![Rust](https://img.shields.io/badge/implementation-Rust%202024-f97316)
 ![Status](https://img.shields.io/badge/status-research%20prototype-7c3aed)
 
-> An AI-assisted attempt to implement a complete operating-system ecosystem — from an AArch64 microkernel to storage, networking, SSH, GUI, and a capability-aware scripting runtime.
+> An AI-assisted attempt to implement a complete operating-system ecosystem — from an AArch64 microkernel to storage, networking, SSH, GUI, a user-space database, and a capability-aware scripting runtime.
 
 [简体中文](README.zh-CN.md) · **English**
 
@@ -30,6 +30,12 @@ recorded host checks are `87/87`. This does not mean `make test` itself reports
 The exact `make ARCH=aarch64 test` and `make ARCH=riscv64 test` full matrices
 remain `validation in progress`; their in-flight state is not a PASS result.
 
+The latest source snapshot also includes a resident EL0 `db` service and the
+`microsystem-sql` library. It exposes a bounded CRUD subset through the serial
+shell's `sql` command, uses protocol 10 over a capability-scoped IPC endpoint,
+and persists MSQLDB1 snapshots through MFS1 with CRC32C validation and atomic
+replace. This is a MicroSystem storage format, not SQLite compatibility.
+
 ## See it running
 
 The image below is a real GUI frame captured from the repository's QEMU GUI profile, which exposes the guest through VNC on the default port `5900`. It shows the code-drawn desktop, Terminal, Mica Counter, Monitor, Files, Reader, and Editor launchers.
@@ -54,7 +60,7 @@ QEMU virt-7.2 hardware
           ↓
 EL1 microkernel: MMU · scheduling · IPC · capabilities · IRQ/IOMMU
           ↓
-EL0 services: init · devmgr · block · MFS1 · netd · sshd · windowd
+EL0 services: init · devmgr · block · MFS1 · db · netd · sshd · windowd
           ↓
 Mica scripts and GUI applications: Counter · Reader · Editor · Terminal
 ```
@@ -66,6 +72,7 @@ Mica scripts and GUI applications: Counter · Reader · Editor · Terminal
 | Kernel | AArch64 EL1 and RV64GC S-mode boot, MMU/Sv39, GICv3 or PLIC/SBI timer/interrupts, scheduling, ASIDs, W^X ELF loading, capability derivation/revoke, and bounded resource cleanup |
 | Isolation | DTB-driven PCI VirtIO discovery, SMMUv3 or RISC-V IOMMU domain setup, device grants, and strict privileged-mechanism / user-policy boundaries |
 | Storage | MFS1 transactional filesystem, metadata mirrors, fsck, offline narrow repair, power-cut and deterministic fault-injection paths |
+| Database | Resident EL0 `db` service, bounded `microsystem-sql` CRUD subset, 4 KiB IPC responses, MSQLDB1 snapshots, CRC32C validation, atomic MFS1 persistence, and fail-closed corruption handling |
 | Network and access | EL0 `netd`, endpoint-brokered networking, bounded HTTP/HTTPS access, SSH sessions, and policy intersection for scripts |
 | Desktop | VirtIO-GPU/input profile, code-drawn 1024×768 desktop, retained GUI command stream, window management, input batching, damage culling, Terminal, Files, Monitor, Reader, and Editor |
 | Runtime | Mica lexer/compiler/VM, capability-aware permissions, filesystem/network/GUI brokers, and bounded application slots |
@@ -126,6 +133,22 @@ program commands `run` and `mica`, and system commands `exit`, `shutdown`,
 the same aliases; `head/tail -n N`, `mkdir -p`, `cp -r`, and `rm -r` are bounded
 options.
 
+The serial shell also exposes the bounded SQL service:
+
+```text
+sql CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+sql INSERT INTO users VALUES (1, 'Alice')
+sql SELECT * FROM users WHERE id = 1
+```
+
+The supported subset covers `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, and
+`DELETE` with `INTEGER`, `TEXT`, `BOOL`, `NULL`, primary-key, and `NOT NULL`
+semantics. Each statement is limited to 4 KiB and each mutating statement is
+committed as one bounded MFS1 snapshot transaction at `/.system/db/main.db`.
+The full wire contract and storage boundary are documented in
+[`docs/abi.md`](docs/abi.md) and [`docs/architecture.md`](docs/architecture.md);
+the service is not SQLite-compatible.
+
 The serial shell also provides a bounded curl-like HTTP client. It supports
 GET over HTTP/HTTPS, `-i`/`--include`, `-s`/`--silent`, and atomic `-o`/
 `--output` to an absolute MFS path:
@@ -178,9 +201,10 @@ for retained provenance and limits.
 ```text
 crates/kernel/     EL1 kernel and AArch64 boot/runtime mechanisms
 crates/mfs1/       MFS1 filesystem implementation
+crates/sql/        bounded SQL parser, executor, and MSQLDB1 snapshot format
 crates/mica/       Mica language, VM, permissions, and standard library
 crates/gui/        GUI ABI and command-stream types
-services/          Static EL0 services and example applications
+services/          Static EL0 services and example applications, including `db`
 assets/            CA and font inputs used by the guest image
 docs/              Architecture, ABI, GUI, MFS1, network, SSH, and runbook docs
 scripts/           OrbStack/QEMU build and acceptance helpers
@@ -190,6 +214,7 @@ xtask/             Image generation and QEMU orchestration
 ## Read next
 
 - [Architecture](docs/architecture.md) — boot, address spaces, IPC, capabilities, storage, and GUI boundaries.
+- [ABI](docs/abi.md) — protocol 10, database frames, response layout, and service contracts.
 - [GUI profile](docs/gui.md) — windowd, retained Present, input, launch policy, and the VNC/QEMU path.
 - [Mica Programming Guide](docs/mica-programming.md) — language basics, permissions, filesystem, HTTP, and GUI examples.
 - [Mica runtime contract](docs/mica.md) — language, VM limits, permissions, and broker APIs.

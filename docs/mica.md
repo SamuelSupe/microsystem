@@ -63,7 +63,7 @@ than copied into the small inline source field.
 The kernel-side layout is separate from VM accounting: the kernel heap is
 128 MiB; every ordinary EL0 address space has a 64 KiB stack, a 1 MiB user heap,
 and a `0xe0000`-byte Mica/task image window. The Mica process is an ordinary
-`ThreadStartEx` application (dynamic PID range starts at 13), not a resident
+`ThreadStartEx` application (dynamic PID range starts at 14), not a resident
 service slot.
 
 The shell and SSH launchers parse `--timeout` from `1ms` through `24h`.

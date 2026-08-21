@@ -1,11 +1,14 @@
 # GUI profile
 
 The GUI profile is enabled when the VirtIO-GPU, keyboard and tablet devices are
-present. It starts all `SERVICE_COUNT=12` resident services with ASIDs
-`0x20..0x2b`; the serial profile keeps the eight-service set (`8/8`). The image
-contains 24 bootfs entries (23 static ELFs plus `etc/services`). The desktop is
-fixed at 1024×768 XRGB8888 and is presented through windowd's EL0 VirtIO-GPU
-path.
+present. It starts all `SERVICE_COUNT=13` resident services with ASIDs
+`0x20..0x2c`; the serial readiness mask remains `8/8`. The service-slot order
+is `init console block mfs shell devmgr windowd terminal files monitor sshd netd
+db`; the serial manifest starts `devmgr,console,block,mfs,db,shell,netd,sshd`,
+and GUI adds `windowd,terminal,files,monitor`. The image contains 25 bootfs
+entries (24 static ELFs plus `etc/services`). Dynamic application slots have
+capacity eight and begin at PID 14. The desktop is fixed at 1024×768 XRGB8888
+and is presented through windowd's EL0 VirtIO-GPU path.
 
 ## Device and capability boundary
 

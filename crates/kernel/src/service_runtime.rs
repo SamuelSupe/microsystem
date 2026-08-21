@@ -18,10 +18,10 @@ use microsystem_abi::{
 use microsystem_kernel::capability::{Capability, CapabilityTable, MAX_CAPABILITIES};
 use microsystem_kernel::elf::{ElfImage, USER_MIN};
 
-pub const SERVICE_COUNT: usize = 12;
+pub const SERVICE_COUNT: usize = 13;
 pub const SERVICE_NAMES: [&str; SERVICE_COUNT] = [
     "init", "console", "block", "mfs", "shell", "devmgr", "windowd", "terminal", "files",
-    "monitor", "sshd", "netd",
+    "monitor", "sshd", "netd", "db",
 ];
 const APPLICATION_START: usize = SERVICE_COUNT;
 const APPLICATION_COUNT: usize = microsystem_abi::process::MAX_APPLICATIONS;
@@ -39,9 +39,9 @@ const LARGE_HEAP_TABLES: usize = LARGE_HEAP_BYTES / 0x20_0000;
 const STACK_BYTES: usize = 16 * 4096;
 const STACK_TOP: u64 = 0x0080_0000;
 const ASID_BASE: u16 = 0x20;
-const ENDPOINT_COUNT: usize = 25;
+const ENDPOINT_COUNT: usize = 26;
 const ENDPOINT_OWNERS: [usize; ENDPOINT_COUNT] = [
-    1, 2, 3, 0, 5, 2, 6, 6, 6, 7, 8, 9, 11, 11, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0,
+    1, 2, 3, 0, 5, 2, 6, 6, 6, 7, 8, 9, 11, 11, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 12,
 ];
 const BLOCK_TASK: usize = 2;
 const CONSOLE_TASK: usize = 1;
@@ -53,6 +53,7 @@ const FILES_TASK: usize = 8;
 const MONITOR_TASK: usize = 9;
 const SSHD_TASK: usize = 10;
 const NETD_TASK: usize = 11;
+const DB_TASK: usize = 12;
 const BLOCK_COMMON_VA: u64 = 0x005a_0000;
 const BLOCK_DEVICE_VA: u64 = 0x005a_1000;
 const BLOCK_NOTIFY_VA: u64 = 0x005a_2000;
@@ -129,6 +130,7 @@ const RANDOM_SOURCE_NODE: u32 = 27;
 const GUI_CONFIG_ENDPOINT_NODE: u32 = 34;
 const GUI_DYNAMIC_ENDPOINT_NODE_BASE: u32 = 35;
 const GUI_LAUNCH_ENDPOINT_NODE: u32 = 44;
+const DATABASE_ENDPOINT_NODE: u32 = 46;
 
 #[repr(C, align(4096))]
 struct TaskMemory {
@@ -2329,7 +2331,7 @@ fn install_boot_capabilities() -> Result<(), Status> {
             SHARED_FRAME_NODE,
         )?;
     }
-    for task in [MFS_TASK, SHELL_TASK] {
+    for task in [MFS_TASK, SHELL_TASK, DB_TASK] {
         tables[task].insert_root_at(
             microsystem_abi::boot_cap::SHARED_FILESYSTEM_FRAME,
             FILESYSTEM_FRAME_OBJECT,
@@ -2546,6 +2548,7 @@ fn install_boot_capabilities() -> Result<(), Status> {
         (MFS_TASK, Rights::READ),
         (SHELL_TASK, Rights::WRITE),
         (SSHD_TASK, Rights::WRITE),
+        (DB_TASK, Rights::WRITE),
         (0, Rights(Rights::WRITE.0 | Rights::GRANT.0)),
     ] {
         insert_endpoint_cap(
@@ -2555,6 +2558,16 @@ fn install_boot_capabilities() -> Result<(), Status> {
             3,
             rights,
             FILESYSTEM_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [(DB_TASK, Rights::READ), (SHELL_TASK, Rights::WRITE)] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::DATABASE_ENDPOINT,
+            26,
+            rights,
+            DATABASE_ENDPOINT_NODE,
         )?;
     }
     for (task, rights) in [
@@ -3964,7 +3977,7 @@ fn user_descriptor_mut(memory: &mut TaskMemory, virtual_address: u64) -> Option<
 }
 
 fn uses_large_window(task: usize) -> bool {
-    matches!(task, MFS_TASK | WINDOWD_TASK)
+    matches!(task, MFS_TASK | WINDOWD_TASK | DB_TASK)
 }
 
 fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
@@ -4095,7 +4108,7 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
             );
         }
     }
-    if matches!(task, MFS_TASK | SHELL_TASK) {
+    if matches!(task, MFS_TASK | SHELL_TASK | DB_TASK) {
         let filesystem_physical = FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
         if filesystem_physical == 0 {
             return Err(());

@@ -577,6 +577,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "microsystem-db"
+version = "0.1.0"
+dependencies = [
+ "microsystem-abi",
+ "microsystem-sql",
+ "microsystem-user-rt",
+]
+
+[[package]]
 name = "microsystem-devmgr"
 version = "0.1.0"
 dependencies = [
@@ -730,6 +739,10 @@ version = "0.1.0"
 dependencies = [
  "microsystem-user-rt",
 ]
+
+[[package]]
+name = "microsystem-sql"
+version = "0.1.0"
 
 [[package]]
 name = "microsystem-sshd"

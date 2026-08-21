@@ -281,7 +281,8 @@ write mkdir [-p] rmdir mv rm [-r] fsync sync\n",
         | Ok(Command::MicaEval(_))
         | Ok(Command::MicaFile(_))
         | Ok(Command::MicaRepl)
-        | Ok(Command::MicaArgs(_)) => output.push(b"command is available on the serial shell\n"),
+        | Ok(Command::MicaArgs(_))
+        | Ok(Command::Sql(_)) => output.push(b"command is available on the serial shell\n"),
         Ok(Command::Exit) => {
             state.logout();
             output.push(b"logout\n");

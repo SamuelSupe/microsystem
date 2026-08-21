@@ -175,10 +175,11 @@ pub mod protocol {
     pub const SSH: u16 = 7;
     pub const SCRIPT: u16 = 8;
     pub const NETWORK: u16 = 9;
+    pub const DATABASE: u16 = 10;
 }
 
 pub mod process {
-    pub const FIRST_APPLICATION_PID: u64 = 13;
+    pub const FIRST_APPLICATION_PID: u64 = 14;
     pub const MAX_APPLICATIONS: usize = 8;
 
     #[repr(u16)]
@@ -219,6 +220,49 @@ pub mod filesystem {
         WriteRange = 15,
         Replace = 16,
     }
+}
+
+pub mod database {
+    pub const RESPONSE_MAGIC: u32 = u32::from_le_bytes(*b"SQL1");
+    pub const RESPONSE_VERSION: u16 = 1;
+    pub const SHARED_FRAME_BYTES: usize = 4096;
+
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Operation {
+        Ping = 1,
+        Execute = 2,
+    }
+
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ResponseKind {
+        Command = 1,
+        Rows = 2,
+        Error = 3,
+    }
+
+    #[repr(u8)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ValueTag {
+        Null = 0,
+        Integer = 1,
+        Text = 2,
+        Bool = 3,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DbResponseHeaderV1 {
+    pub magic: u32,
+    pub version: u16,
+    pub kind: u16,
+    pub columns: u16,
+    pub rows: u16,
+    pub reserved: u32,
+    pub affected_rows: u32,
+    pub payload_bytes: u32,
 }
 
 pub const THREAD_LAUNCH_CAPS: usize = 6;
@@ -656,6 +700,7 @@ pub mod boot_cap {
     pub const WINDOWD_FILESYSTEM_FRAME: CapHandle = CapHandle::from_parts(83, 1);
     pub const GUI_LAUNCH_ENDPOINT: CapHandle = CapHandle::from_parts(84, 1);
     pub const SHELL_SYSTEM_CONTROL: CapHandle = CapHandle::from_parts(85, 1);
+    pub const DATABASE_ENDPOINT: CapHandle = CapHandle::from_parts(86, 1);
 
     pub const fn gui_dynamic_endpoint(index: usize) -> CapHandle {
         CapHandle::from_parts(GUI_DYNAMIC_ENDPOINT_BASE + index as u16, 1)

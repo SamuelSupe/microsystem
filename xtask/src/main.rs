@@ -92,6 +92,7 @@ fn build(arch: Architecture) -> Result<(), String> {
         "microsystem-block",
         "microsystem-badptr",
         "microsystem-fs",
+        "microsystem-db",
         "microsystem-privprobe",
         "microsystem-resourceprobe",
         "microsystem-resourcefault",
@@ -472,6 +473,7 @@ fn create_bootfs(arch: Architecture) -> Result<(), String> {
         ("devmgr", "microsystem-devmgr"),
         ("block", "microsystem-block"),
         ("mfs", "microsystem-fs"),
+        ("db", "microsystem-db"),
         ("badptr", "microsystem-badptr"),
         ("privprobe", "microsystem-privprobe"),
         ("resourceprobe", "microsystem-resourceprobe"),
@@ -512,7 +514,7 @@ fn create_bootfs(arch: Architecture) -> Result<(), String> {
         100,
         "etc/services",
         0o100644,
-        b"init\ndevmgr\nconsole\nblock\nmfs\nshell\nnetd\nsshd\nwindowd\nterminal\nfiles\nmonitor\n",
+        b"init\ndevmgr\nconsole\nblock\nmfs\ndb\nshell\nnetd\nsshd\nwindowd\nterminal\nfiles\nmonitor\n",
     );
     append_newc(&mut archive, 0, "TRAILER!!!", 0, &[]);
     fs::write("build/bootfs.cpio", archive).map_err(|error| error.to_string())

@@ -109,6 +109,24 @@ send_input() {
   sleep "$input_delay"
   printf 'sync\n'
   sleep "$input_delay"
+  printf 'sql SELECT id, name FROM smoke_users WHERE id = 2\n'
+  sleep "$input_delay"
+  printf 'sql DROP TABLE smoke_users\n'
+  sleep "$input_delay"
+  printf 'sql CREATE TABLE smoke_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)\n'
+  sleep "$input_delay"
+  printf "sql INSERT INTO smoke_users VALUES (1, 'alice')\n"
+  sleep "$input_delay"
+  printf 'sql SELECT id, name FROM smoke_users WHERE id = 1\n'
+  sleep "$input_delay"
+  printf "sql UPDATE smoke_users SET name = 'bob' WHERE id = 1\n"
+  sleep "$input_delay"
+  printf 'sql SELECT id, name FROM smoke_users WHERE id = 1\n'
+  sleep "$input_delay"
+  printf 'sql DELETE FROM smoke_users WHERE id = 1\n'
+  sleep "$input_delay"
+  printf "sql INSERT INTO smoke_users VALUES (2, 'persisted')\n"
+  sleep "$input_delay"
   printf 'ls /demo\n'
   sleep "$input_delay"
   printf 'head -n 1 /boot-proof\n'
@@ -267,7 +285,15 @@ required_markers=(
   "\\[user\\][[:space:]]+block[[:space:]]+configured[[:space:]]+split[[:space:]]+queue0[[:space:]]+size=16[[:space:]]+driver-ok=true"
   "\\[user\\][[:space:]]+block[[:space:]]+driver[[:space:]]+queue0[[:space:]]+read\\+write[[:space:]]+sector=0[[:space:]]+mfs1=true[[:space:]]+flush=ok"
   "\\[user\\][[:space:]]+mfs1[[:space:]]+mounted[[:space:]]+via[[:space:]]+EL0[[:space:]]+block[[:space:]]+IPC"
+  "\\[user\\][[:space:]]+db[[:space:]]+service[[:space:]]+ELF[[:space:]]+entered[[:space:]]+EL0"
+  "\\[user\\][[:space:]]+msql[[:space:]]+snapshot[[:space:]]+loaded[[:space:]]+path=/\\.system/db/main\\.db"
+  "\\[ipc\\][[:space:]]+resident[[:space:]]+db[[:space:]]+endpoint=26[[:space:]]+ready"
+  "\\[ipc\\][[:space:]]+resident[[:space:]]+shell->db[[:space:]]+ping=true"
   "\\[user\\][[:space:]]+mfs1[[:space:]]+recovered[[:space:]]+/boot-proof[[:space:]]+after[[:space:]]+restart=true"
+  "id[[:space:]]+\\|[[:space:]]+name"
+  "1[[:space:]]+\\|[[:space:]]+alice"
+  "1[[:space:]]+\\|[[:space:]]+bob"
+  "2[[:space:]]+\\|[[:space:]]+persisted"
   "\\[user\\][[:space:]]+mfs1[[:space:]]+fsync[[:space:]]+/boot-proof[[:space:]]+persistent=true"
   "\\[cap\\][[:space:]]+resident[[:space:]]+generation[[:space:]]+rights[[:space:]]+revoke[[:space:]]+stale-handle=true"
   "\\[cap\\][[:space:]]+resident[[:space:]]+cross-task[[:space:]]+copy-move[[:space:]]+revoke[[:space:]]+atomic=true"
@@ -325,9 +351,9 @@ required_markers=(
   "micro>[[:space:]]+rm[[:space:]]+-r[[:space:]]+/demo/tree-copy"
   "micro>[[:space:]]+rm[[:space:]]+-r[[:space:]]+/demo/tree"
   "\\[iommu\\][[:space:]]+fault-probe[[:space:]]+blocked=true[[:space:]]+sentinel=true[[:space:]]+event=${iommu_fault_event}[[:space:]]+stream-id=0x10"
-  "\\[bootfs\\][[:space:]]+valid=true[[:space:]]+entries=24[[:space:]]+static-elfs=23"
-  "\\[bootfs\\][[:space:]]+root[[:space:]]+task[[:space:]]+started[[:space:]]+manifest[[:space:]]+services=devmgr,console,block,mfs,shell"
-  "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+address-spaces=12[[:space:]]+asids=\\[0x20\\.\\.0x2b\\]"
+  "\\[bootfs\\][[:space:]]+valid=true[[:space:]]+entries=25[[:space:]]+static-elfs=24"
+  "\\[bootfs\\][[:space:]]+root[[:space:]]+task[[:space:]]+started[[:space:]]+manifest[[:space:]]+services=devmgr,console,block,mfs,db,shell"
+  "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+address-spaces=13[[:space:]]+asids=\\[0x20\\.\\.0x2c\\]"
   "\\[user\\][[:space:]]+bootfs[[:space:]]+init[[:space:]]+ELF[[:space:]]+entered[[:space:]]+EL0"
   "\\[user\\][[:space:]]+console[[:space:]]+service[[:space:]]+ELF[[:space:]]+entered[[:space:]]+EL0"
   "\\[user\\][[:space:]]+block[[:space:]]+service[[:space:]]+ELF[[:space:]]+entered[[:space:]]+EL0"
@@ -379,7 +405,7 @@ required_markers=(
   "\\[app\\][[:space:]]+counter[[:space:]]+pid=[0-9]+[[:space:]]+started[[:space:]]+at[[:space:]]+EL0"
   "\\[app\\][[:space:]]+counter[[:space:]]+pid=[0-9]+[[:space:]]+completed"
   "\\[isolation\\][[:space:]]+privileged[[:space:]]+instruction[[:space:]]+task[[:space:]]+pid=[0-9]+[[:space:]]+faulted[[:space:]]+status=-8[[:space:]]+reclaimed=true"
-  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=13[[:space:]]+independent-slots=true"
+  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=14[[:space:]]+independent-slots=true"
   "\\[sched\\][[:space:]]+application[[:space:]]+spinners[[:space:]]+dual-core=true[[:space:]]+tasks=2[[:space:]]+cpus=2[[:space:]]+cpu-masks-pair=[0-9]{2}"
   # The interactive privprobe command may be split by a concurrent EL0
   # writer; its exact PID/status is checked by the bounded lifecycle below.

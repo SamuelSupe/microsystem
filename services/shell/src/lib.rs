@@ -65,6 +65,7 @@ pub enum Command<'a> {
     },
     Fsync(&'a str),
     FsHelp,
+    Sql(&'a str),
     Curl(&'a str),
     Nslookup(&'a str),
     Netstat,
@@ -156,6 +157,8 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
         "rm" | "remove" | "unlink" => parse_filesystem_command("rm", rest),
         "fsync" => parse_filesystem_command("fsync", rest),
         "sync" if rest.is_empty() => Ok(Command::Sync),
+        "sql" if !rest.is_empty() => Ok(Command::Sql(rest)),
+        "sql" => Err(ParseError::MissingArgument),
         "curl" if !rest.is_empty() => Ok(Command::Curl(rest)),
         "nslookup" => Ok(Command::Nslookup(one_argument(rest)?)),
         "netstat" if rest.is_empty() => Ok(Command::Netstat),
@@ -520,6 +523,34 @@ mod tests {
         assert_eq!(parse("xxd file"), Ok(Command::Hexdump("file")));
         assert_eq!(parse("find"), Ok(Command::Find(".")));
         assert_eq!(parse("sysinfo"), Ok(Command::SystemInfo));
+    }
+
+    #[test]
+    fn parses_sql_as_one_complete_statement() {
+        let statement = "SELECT id,  name FROM users WHERE note = 'a; b' ORDER BY id DESC;";
+        assert_eq!(
+            parse("sql SELECT id,  name FROM users WHERE note = 'a; b' ORDER BY id DESC;"),
+            Ok(Command::Sql(statement))
+        );
+    }
+
+    #[test]
+    fn sql_requires_a_statement_argument() {
+        assert_eq!(parse("sql"), Err(ParseError::MissingArgument));
+        assert_eq!(parse("sql   "), Err(ParseError::MissingArgument));
+    }
+
+    #[test]
+    fn sql_statement_is_not_truncated_when_parser_input_is_long() {
+        const SQL_BYTES: usize = 4097;
+        let mut bytes = [b'x'; 12 + SQL_BYTES + 2];
+        bytes[..12].copy_from_slice(b"sql SELECT '");
+        bytes[12 + SQL_BYTES..].copy_from_slice(b"';");
+        let line = core::str::from_utf8(&bytes).unwrap();
+        let statement = &line["sql ".len()..];
+
+        assert!(statement.len() > 4096);
+        assert_eq!(parse(&line), Ok(Command::Sql(statement)));
     }
 
     #[test]

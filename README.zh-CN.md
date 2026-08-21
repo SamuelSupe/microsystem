@@ -4,7 +4,7 @@
 ![Rust](https://img.shields.io/badge/implementation-Rust%202024-f97316)
 ![Status](https://img.shields.io/badge/status-research%20prototype-7c3aed)
 
-> 一次由 AI 辅助、从 AArch64 微内核延伸到存储、网络、SSH、GUI 与能力感知脚本运行时的完整操作系统生态实现尝试。
+> 一次由 AI 辅助、从 AArch64 微内核延伸到存储、网络、SSH、GUI、用户态数据库与能力感知脚本运行时的完整操作系统生态实现尝试。
 
 **简体中文** · [English](README.md)
 
@@ -29,6 +29,11 @@ host suites 合计 `81/81`（`22+9+6+9+11+24`）；另行运行的 shell parser 
 精确的 `make ARCH=aarch64 test` 与 `make ARCH=riscv64 test` 完整矩阵仍是
 `validation in progress`；执行中的状态不得写成 PASS。
 
+最新源码还加入了常驻 EL0 `db` 服务和 `microsystem-sql` 库：通过串口 shell
+的 `sql` 命令提供有界 CRUD SQL 子集，使用 capability 约束的 protocol 10
+IPC 端点，并通过 MFS1 以 CRC32C 校验和原子替换持久化 MSQLDB1 snapshot。
+这是 MicroSystem 自有存储格式，不是 SQLite 兼容实现。
+
 ## 运行画面
 
 下面的画面来自仓库已有的 QEMU GUI profile；该 profile 会通过默认 `5900` 端口向 VNC 提供 guest 画面，是一张真实 GUI 帧：其中包含代码绘制的桌面、Terminal、Mica Counter、Monitor，以及 Files、Reader、Editor 启动器。
@@ -52,7 +57,7 @@ QEMU virt-7.2 硬件
           ↓
 EL1 微内核：MMU · 调度 · IPC · capability · IRQ/IOMMU
           ↓
-EL0 服务：init · devmgr · block · MFS1 · netd · sshd · windowd
+EL0 服务：init · devmgr · block · MFS1 · db · netd · sshd · windowd
           ↓
 Mica 脚本与 GUI 应用：Counter · Reader · Editor · Terminal
 ```
@@ -64,6 +69,7 @@ Mica 脚本与 GUI 应用：Counter · Reader · Editor · Terminal
 | 内核 | AArch64 EL1 与 RV64GC S-mode 启动、MMU/Sv39、GICv3 或 PLIC/SBI 定时器/中断、调度、ASID、带 W^X 校验的 ELF 加载、capability 派生/撤销与有界资源回收 |
 | 隔离 | 基于 DTB 的 PCI VirtIO 发现、SMMUv3 或 RISC-V IOMMU 域设置、设备授予，以及严格的特权机制 / 用户策略边界 |
 | 存储 | MFS1 事务文件系统、元数据镜像、fsck、受限离线修复，以及断电和确定性故障注入路径 |
+| 数据库 | 常驻 EL0 `db` 服务、有界 `microsystem-sql` CRUD 子集、4 KiB IPC 响应、MSQLDB1 snapshot、CRC32C 校验、MFS1 原子持久化，以及损坏时 fail-closed |
 | 网络与访问 | EL0 `netd`、端点 broker 网络、有限 HTTP/HTTPS 访问、SSH 会话，以及脚本权限交集策略 |
 | 桌面 | VirtIO-GPU/输入设备 profile、代码绘制的 1024×768 桌面、保留式 GUI 命令流、窗口管理、输入批处理、damage culling，以及 Terminal、Files、Monitor、Reader、Editor |
 | 运行时 | Mica 词法器/编译器/VM、能力感知权限、文件系统/网络/GUI broker，以及有界应用槽位 |
@@ -120,6 +126,21 @@ shell 文件系统命令使用绝对路径，同时支持简写和显式 `fs` �
 `fs <command>` 暴露相同的文件系统命名空间和别名；支持有界选项
 `head/tail -n N`、`mkdir -p`、`cp -r`、`rm -r`。
 
+串口 shell 还提供有界 SQL 服务：
+
+```text
+sql CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+sql INSERT INTO users VALUES (1, 'Alice')
+sql SELECT * FROM users WHERE id = 1
+```
+
+支持的子集包括 `CREATE`、`DROP`、`INSERT`、`SELECT`、`UPDATE`、`DELETE`，以及
+`INTEGER`、`TEXT`、`BOOL`、`NULL`、primary key 和 `NOT NULL` 语义。每条语句
+上限为 4 KiB；写入语句以一个有界 MFS1 snapshot 事务提交到
+`/.system/db/main.db`。完整 wire contract 与存储边界见
+[`docs/abi.md`](docs/abi.md) 和 [`docs/architecture.md`](docs/architecture.md)；
+该服务不兼容 SQLite。
+
 串口 shell 还提供一个有界的 curl 风格 HTTP 客户端，支持 HTTP/HTTPS
 GET、`-i`/`--include`、`-s`/`--silent`，以及写入绝对 MFS 路径的原子
 `-o`/`--output`：
@@ -167,9 +188,10 @@ host suites `81/81`，以及另行 shell parser `6/6`（合并记录 `87/87`）�
 ```text
 crates/kernel/     EL1 内核与 AArch64 启动/运行机制
 crates/mfs1/       MFS1 文件系统实现
+crates/sql/        有界 SQL parser、executor 与 MSQLDB1 snapshot 格式
 crates/mica/       Mica 语言、VM、权限与标准库
 crates/gui/        GUI ABI 与命令流类型
-services/          静态 EL0 服务与示例应用
+services/          静态 EL0 服务与示例应用，包括 `db`
 assets/            guest 镜像使用的 CA 与字体输入
 docs/              架构、ABI、GUI、MFS1、网络、SSH 与 runbook 文档
 scripts/           OrbStack/QEMU 构建和验收辅助脚本
@@ -179,6 +201,7 @@ xtask/             镜像生成与 QEMU 编排
 ## 推荐阅读
 
 - [系统架构](docs/architecture.md) — 启动、地址空间、IPC、capability、存储与 GUI 边界。
+- [ABI](docs/abi.md) — protocol 10、数据库 frame、响应布局与服务契约。
 - [GUI profile](docs/gui.md) — windowd、保留式 Present、输入、启动策略与 VNC/QEMU 路径。
 - [Mica 编程说明（中文）](docs/mica-programming.zh-CN.md) — 从第一个脚本到权限、文件、HTTP 和 GUI 示例。
 - [Mica Programming Guide](docs/mica-programming.md) — English guide for language basics and broker APIs.
