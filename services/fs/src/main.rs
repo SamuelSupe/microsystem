@@ -19,6 +19,7 @@ const FILESYSTEM_DATA: usize = 0x005e_0000;
 const SSH_FILESYSTEM_DATA: usize = 0x005f_0000;
 const WINDOWD_FILESYSTEM_DATA: usize = 0x0060_0000;
 const TERMINAL_FILESYSTEM_DATA: usize = 0x0061_0000;
+const DATABASE_FILESYSTEM_DATA: usize = 0x0062_0000;
 const OPEN_FILE_LIMIT: usize = 16;
 const SCRIPT_SESSION_LIMIT: usize = 8;
 const SCRIPT_SESSION_VA: u64 = script::SESSION_VA;
@@ -392,6 +393,7 @@ fn handle_fs(
         value if value == boot_cap::SSH_FILESYSTEM_FRAME => SSH_FILESYSTEM_DATA,
         value if value == boot_cap::WINDOWD_FILESYSTEM_FRAME => WINDOWD_FILESYSTEM_DATA,
         value if value == boot_cap::GUI_TERMINAL_COMMANDS => TERMINAL_FILESYSTEM_DATA,
+        value if value == boot_cap::DATABASE_FILESYSTEM_FRAME => DATABASE_FILESYSTEM_DATA,
         _ => return Status::AccessDenied,
     };
     let Ok(path_length) = usize::try_from(request.words[0]) else {

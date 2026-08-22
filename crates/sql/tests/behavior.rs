@@ -1,4 +1,4 @@
-use microsystem_sql::{ColumnInfo, Database, Error, Execution, SqlType, Value};
+use microsystem_sql::{ColumnInfo, Database, Error, Execution, SqlType, Value, MAX_ROWS};
 
 fn command(db: &mut Database, sql: &str, affected_rows: u32) {
     assert_eq!(db.execute(sql), Ok(Execution::Command { affected_rows }));
@@ -106,6 +106,32 @@ fn crud_lifecycle_supports_named_inserts_and_drop() {
 
     command(&mut db, "DROP TABLE users", 0);
     assert_eq!(db.execute("SELECT * FROM users"), Err(Error::TableNotFound));
+}
+
+#[test]
+fn insert_row_budget_is_shared_across_tables_and_released_by_delete() {
+    let mut db = Database::new();
+    command(&mut db, "CREATE TABLE first (id INTEGER)", 0);
+    command(&mut db, "CREATE TABLE second (id INTEGER)", 0);
+
+    let first_table_rows = MAX_ROWS / 2;
+    for id in 0..first_table_rows {
+        command(&mut db, &format!("INSERT INTO first VALUES ({id})"), 1);
+    }
+    for id in first_table_rows..MAX_ROWS {
+        command(&mut db, &format!("INSERT INTO second VALUES ({id})"), 1);
+    }
+
+    assert_eq!(
+        db.execute(&format!("INSERT INTO second VALUES ({MAX_ROWS})")),
+        Err(Error::TooLarge)
+    );
+    command(&mut db, "DELETE FROM first WHERE id = 0", 1);
+    command(
+        &mut db,
+        &format!("INSERT INTO second VALUES ({MAX_ROWS})"),
+        1,
+    );
 }
 
 #[test]

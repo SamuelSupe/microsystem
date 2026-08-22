@@ -701,6 +701,7 @@ pub mod boot_cap {
     pub const GUI_LAUNCH_ENDPOINT: CapHandle = CapHandle::from_parts(84, 1);
     pub const SHELL_SYSTEM_CONTROL: CapHandle = CapHandle::from_parts(85, 1);
     pub const DATABASE_ENDPOINT: CapHandle = CapHandle::from_parts(86, 1);
+    pub const DATABASE_FILESYSTEM_FRAME: CapHandle = CapHandle::from_parts(87, 1);
 
     pub const fn gui_dynamic_endpoint(index: usize) -> CapHandle {
         CapHandle::from_parts(GUI_DYNAMIC_ENDPOINT_BASE + index as u16, 1)

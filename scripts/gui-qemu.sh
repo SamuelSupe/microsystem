@@ -2125,7 +2125,7 @@ if not (
 # requested 420x260 client; minimized content disappears while its taskbar
 # button remains active.  These bounds are deliberately broad around the
 # exact title text/button pixels.
-active_title = (0x1e, 0x3b, 0x63)
+active_title = (0xf7, 0xf9, 0xfc)
 max_run = row_color_count(snapshots["max"], 10, active_title)
 resized_run = row_color_count(snapshots["resized"], 80, active_title)
 restore_run = row_color_count(snapshots["restore"], 80, active_title)

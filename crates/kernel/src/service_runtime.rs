@@ -64,6 +64,7 @@ const FILESYSTEM_DATA_VA: u64 = 0x005e_0000;
 const SSH_FILESYSTEM_DATA_VA: u64 = 0x005f_0000;
 const WINDOWD_FILESYSTEM_DATA_VA: u64 = 0x0060_0000;
 const TERMINAL_FILESYSTEM_DATA_VA: u64 = 0x0061_0000;
+const DATABASE_FILESYSTEM_DATA_VA: u64 = 0x0062_0000;
 const CONSOLE_UART_VA: u64 = 0x005d_0000;
 const DEVMGR_PCI_CONFIG_VA: u64 = 0x005e_0000;
 const DEVMGR_ECAM_SCAN_VA: u64 = 0x0042_0000;
@@ -74,12 +75,14 @@ const FILESYSTEM_FRAME_OBJECT: u32 = 13;
 const SSH_FILESYSTEM_FRAME_OBJECT: u32 = 14;
 const WINDOWD_FILESYSTEM_FRAME_OBJECT: u32 = 15;
 const TERMINAL_FILESYSTEM_FRAME_OBJECT: u32 = 16;
+const DATABASE_FILESYSTEM_FRAME_OBJECT: u32 = 17;
 const DEVICE_NOTIFICATION_OBJECT: u32 = 2;
 const SHARED_FRAME_NODE: u32 = 1;
 const FILESYSTEM_FRAME_NODE: u32 = 8;
 const SSH_FILESYSTEM_FRAME_NODE: u32 = 33;
 const WINDOWD_FILESYSTEM_FRAME_NODE: u32 = 43;
 const TERMINAL_FILESYSTEM_FRAME_NODE: u32 = 45;
+const DATABASE_FILESYSTEM_FRAME_NODE: u32 = 47;
 const DEVICE_NOTIFICATION_NODE: u32 = 2;
 const DEVICE_IRQ_OBJECT: u32 = 37;
 const DEVICE_IRQ_NODE: u32 = 3;
@@ -357,6 +360,7 @@ static FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static SSH_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static WINDOWD_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static TERMINAL_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static DATABASE_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static KERNEL_HEAP_REPORTED: AtomicBool = AtomicBool::new(false);
 static BOOTFS_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static BOOTFS_LENGTH: AtomicUsize = AtomicUsize::new(0);
@@ -2320,6 +2324,8 @@ fn install_boot_capabilities() -> Result<(), Status> {
     WINDOWD_FILESYSTEM_FRAME_PHYSICAL.store(windowd_filesystem_physical, Ordering::Release);
     let terminal_filesystem_physical = physical_memory::allocate_zeroed()?;
     TERMINAL_FILESYSTEM_FRAME_PHYSICAL.store(terminal_filesystem_physical, Ordering::Release);
+    let database_filesystem_physical = physical_memory::allocate_zeroed()?;
+    DATABASE_FILESYSTEM_FRAME_PHYSICAL.store(database_filesystem_physical, Ordering::Release);
     let tables = unsafe { &mut *CAPS.0.get() };
     let shared_rights = Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0);
     for task in [BLOCK_TASK, MFS_TASK] {
@@ -2365,6 +2371,15 @@ fn install_boot_capabilities() -> Result<(), Status> {
             ObjectType::Frame,
             shared_rights,
             TERMINAL_FILESYSTEM_FRAME_NODE,
+        )?;
+    }
+    for task in [MFS_TASK, DB_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::DATABASE_FILESYSTEM_FRAME,
+            DATABASE_FILESYSTEM_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            DATABASE_FILESYSTEM_FRAME_NODE,
         )?;
     }
     tables[BLOCK_TASK].insert_root_at(
@@ -2825,7 +2840,9 @@ fn stage_cap_transfer(
                 || (capability.node == WINDOWD_FILESYSTEM_FRAME_NODE
                     && capability.object == WINDOWD_FILESYSTEM_FRAME_OBJECT)
                 || (capability.node == TERMINAL_FILESYSTEM_FRAME_NODE
-                    && capability.object == TERMINAL_FILESYSTEM_FRAME_OBJECT))
+                    && capability.object == TERMINAL_FILESYSTEM_FRAME_OBJECT)
+                || (capability.node == DATABASE_FILESYSTEM_FRAME_NODE
+                    && capability.object == DATABASE_FILESYSTEM_FRAME_OBJECT))
         {
             if let Some(handle) = tables[receiver].handle_for_object_with_rights(
                 capability.object,
@@ -3603,6 +3620,10 @@ fn reset_filesystem_frame() {
     if address != 0 {
         let _ = physical_memory::release(address);
     }
+    let address = DATABASE_FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        let _ = physical_memory::release(address);
+    }
 }
 
 fn runtime_frame_is_mapped(object: u32) -> bool {
@@ -4007,7 +4028,7 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     memory.image.fill(0);
     memory.stack.fill(0);
     memory.heap.fill(0);
-    if task == MFS_TASK {
+    if matches!(task, MFS_TASK | DB_TASK) {
         if memory.large_heap.is_null() {
             let layout =
                 core::alloc::Layout::from_size_align(LARGE_HEAP_BYTES, 4096).map_err(|_| ())?;
@@ -4080,7 +4101,7 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
             normal_page_flags(),
         );
     }
-    if task == MFS_TASK {
+    if matches!(task, MFS_TASK | DB_TASK) {
         let heap_physical = physical(memory.large_heap as usize);
         for offset in (0..LARGE_HEAP_BYTES).step_by(4096) {
             let table = offset / 0x20_0000;
@@ -4160,6 +4181,18 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         map_page(
             memory,
             TERMINAL_FILESYSTEM_DATA_VA,
+            filesystem_physical,
+            normal_page_flags(),
+        );
+    }
+    if matches!(task, MFS_TASK | DB_TASK) {
+        let filesystem_physical = DATABASE_FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if filesystem_physical == 0 {
+            return Err(());
+        }
+        map_page(
+            memory,
+            DATABASE_FILESYSTEM_DATA_VA,
             filesystem_physical,
             normal_page_flags(),
         );

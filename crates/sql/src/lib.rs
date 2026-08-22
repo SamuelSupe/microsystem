@@ -11,6 +11,7 @@ pub const MAX_SQL_BYTES: usize = 4096;
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 pub const MAX_TABLES: usize = 32;
 pub const MAX_COLUMNS: usize = 32;
+pub const MAX_ROWS: usize = 4096;
 pub const MAX_IDENTIFIER_BYTES: usize = 63;
 pub const MAX_TEXT_BYTES: usize = 1024;
 pub const MAX_RESULT_BYTES: usize = 4096;
@@ -148,6 +149,9 @@ impl Database {
     }
 
     pub fn encode_snapshot(&self, output: &mut Vec<u8>) -> Result<(), Error> {
+        if self.total_rows()? > MAX_ROWS {
+            return Err(Error::TooLarge);
+        }
         output.clear();
         output.resize(SNAPSHOT_HEADER_BYTES, 0);
         let mut payload = Vec::new();
@@ -216,6 +220,7 @@ impl Database {
             return Err(Error::Corrupt);
         }
         let mut database = Self::new();
+        let mut total_rows = 0usize;
         for _ in 0..table_count {
             let name = cursor.string()?;
             validate_identifier(&name)?;
@@ -255,6 +260,10 @@ impl Database {
                 return Err(Error::Corrupt);
             }
             let row_count = cursor.u32()? as usize;
+            total_rows = total_rows
+                .checked_add(row_count)
+                .filter(|rows| *rows <= MAX_ROWS)
+                .ok_or(Error::TooLarge)?;
             let mut rows = Vec::with_capacity(row_count.min(1024));
             for _ in 0..row_count {
                 let mut row = Vec::with_capacity(column_count);
@@ -304,7 +313,11 @@ impl Database {
                 columns,
                 values,
             } => {
-                let table = self.table_mut(&table)?;
+                let table_index = self.table_index(&table)?;
+                if self.total_rows()? >= MAX_ROWS {
+                    return Err(Error::TooLarge);
+                }
+                let table = &mut self.tables[table_index];
                 let mut row = vec![Value::Null; table.columns.len()];
                 if let Some(column_names) = columns {
                     if column_names.len() != values.len()
@@ -420,6 +433,12 @@ impl Database {
     fn table_mut(&mut self, name: &str) -> Result<&mut Table, Error> {
         let index = self.table_index(name)?;
         Ok(&mut self.tables[index])
+    }
+
+    fn total_rows(&self) -> Result<usize, Error> {
+        self.tables.iter().try_fold(0usize, |total, table| {
+            total.checked_add(table.rows.len()).ok_or(Error::TooLarge)
+        })
     }
 }
 

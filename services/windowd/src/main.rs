@@ -22,27 +22,33 @@ const UNIFONT_PATH: &[u8] = b"/.system/fonts/unifont-17.0.05.ufb";
 const GLYPH_CACHE_SIZE: usize = 128;
 const GLYPH_CACHE_WAYS: usize = 2;
 const GLYPH_CACHE_SETS: usize = GLYPH_CACHE_SIZE / GLYPH_CACHE_WAYS;
-const BACKGROUND: u32 = 0x0008_0f1d;
+const BACKGROUND: u32 = 0x00c4_d8e8;
 const BACKGROUND_BANDS: [u32; 6] = [
-    0x000c_1628,
-    0x000d_182b,
-    0x000e_1a2e,
-    0x000f_1c31,
-    0x0010_1e34,
-    0x0011_2037,
+    0x00b7_cfe2,
+    0x00c3_d9ea,
+    0x00d0_e3f0,
+    0x00de_ebf4,
+    0x00eb_f2f8,
+    0x00f5_f8fb,
 ];
-const TASKBAR: u32 = 0x000b_1322;
-const TASKBAR_BUTTON: u32 = 0x0018_2538;
-const BORDER: u32 = 0x0036_4964;
-const BORDER_ACTIVE: u32 = 0x005d_8fdc;
-const TITLE_ACTIVE: u32 = 0x001e_3b63;
-const TITLE_IDLE: u32 = 0x0017_2437;
-const CLIENT: u32 = 0x0010_1827;
-const PANEL: u32 = 0x0018_2436;
-const SHADOW: u32 = 0x0004_0811;
-const TEXT: u32 = 0x00ed_f4ff;
-const MUTED_TEXT: u32 = 0x0096_a8c1;
-const ACCENT: u32 = 0x005d_8fdc;
+const TASKBAR: u32 = 0x00e9_eff5;
+const TASKBAR_BUTTON: u32 = 0x00f8_fafd;
+const BORDER: u32 = 0x00a9_b8c8;
+const BORDER_ACTIVE: u32 = 0x006b_a7ea;
+const TITLE_ACTIVE: u32 = 0x00f7_f9fc;
+const TITLE_IDLE: u32 = 0x00e3_e9f0;
+const CLIENT: u32 = 0x00ff_ffff;
+const PANEL: u32 = 0x00f1_f5f9;
+const SHADOW: u32 = 0x006b_7d91;
+const TEXT: u32 = 0x001b_2733;
+const MUTED_TEXT: u32 = 0x006b_7785;
+const ACCENT: u32 = 0x0000_7aff;
+const ACCENT_TINT: u32 = 0x00d9_eaff;
+const CHROME_DIVIDER: u32 = 0x00d1_d9e2;
+const CONTROL_INACTIVE: u32 = 0x00b8_c1ca;
+const CONTROL_CLOSE: u32 = 0x00ff_5f57;
+const CONTROL_MINIMIZE: u32 = 0x00febc2e;
+const CONTROL_MAXIMIZE: u32 = 0x0028_c840;
 const INLINE_TEXT_BYTES: usize = 40;
 const TERMINAL_SHARED_BYTES: usize = 4096;
 const TERMINAL_SHARED_MAGIC: u64 = 0x5445_524d_5348_4152;
@@ -561,23 +567,24 @@ pub extern "C" fn _start() -> ! {
                         let _ = desktop.focus(id);
                         if let Some(window) = desktop.window(id).copied() {
                             if pointer.1 < window.rect.y + microsystem_gui::TITLE_BAR_HEIGHT {
-                                let right = window.rect.x + window.rect.width as i32;
-                                if pointer.0 >= right - 20 {
-                                    if !request_close(id, &desktop, &mut dynamic_clients) {
-                                        let _ = desktop.action(id, gui::WindowAction::Close);
+                                if let Some(mut action) = window_control_at(window.rect, pointer.0)
+                                {
+                                    if action == gui::WindowAction::Maximize
+                                        && window.state == WindowState::Maximized
+                                    {
+                                        action = gui::WindowAction::Restore;
                                     }
-                                } else if pointer.0 >= right - 34 {
-                                    let _ = desktop.action(id, gui::WindowAction::Minimize);
-                                    push_configure(id, &desktop, &mut dynamic_clients);
-                                } else if pointer.0 >= right - 48 {
-                                    let action = if window.state == WindowState::Maximized {
-                                        gui::WindowAction::Restore
+                                    if action == gui::WindowAction::Close {
+                                        if !request_close(id, &desktop, &mut dynamic_clients) {
+                                            let _ = desktop.action(id, action);
+                                        }
                                     } else {
-                                        gui::WindowAction::Maximize
-                                    };
-                                    let _ = desktop.action(id, action);
-                                    push_configure(id, &desktop, &mut dynamic_clients);
-                                    push_expose(id, &desktop, &mut dynamic_clients);
+                                        let _ = desktop.action(id, action);
+                                        push_configure(id, &desktop, &mut dynamic_clients);
+                                        if action != gui::WindowAction::Minimize {
+                                            push_expose(id, &desktop, &mut dynamic_clients);
+                                        }
+                                    }
                                 } else {
                                     dragging = Some((
                                         id,
@@ -701,18 +708,17 @@ pub extern "C" fn _start() -> ! {
         }
         let now = microsystem_user_rt::clock_now().unwrap_or(next_frame);
         if redraw_pending && !dirty.is_empty() && now >= next_frame {
-            let present = damage_bounds(dirty.as_slice());
-            render(
-                &desktop,
-                &terminal,
-                &dynamic_clients,
-                display_lists,
-                &mut font,
-                framebuffer,
-                dirty.as_slice(),
-            );
-            draw_pointer(framebuffer, pointer.0, pointer.1);
-            if let Some(present) = present {
+            if let Some(present) = damage_bounds(dirty.as_slice()) {
+                render(
+                    &desktop,
+                    &terminal,
+                    &dynamic_clients,
+                    display_lists,
+                    &mut font,
+                    framebuffer,
+                    core::slice::from_ref(&present),
+                );
+                draw_pointer(framebuffer, pointer.0, pointer.1);
                 let _ = microsystem_user_rt::gui_present_rect(region, present);
             }
             redraw_pending = false;
@@ -1500,15 +1506,36 @@ fn clear_desktop_launch_pending(application: u64) {
 
 fn taskbar_window_at(desktop: &Desktop, x: i32) -> Option<u32> {
     let count = desktop.z_order().count().max(1);
-    let width = (gui::WIDTH as usize / count).clamp(72, 132) as i32;
+    let (start, width) = taskbar_metrics(count);
     desktop
         .z_order()
         .enumerate()
         .find(|(index, _)| {
-            let left = 8 + *index as i32 * (width + 4);
-            x >= left && x < left + width
+            let left = start + *index as i32 * (width as i32 + 6);
+            x >= left && x < left + width as i32
         })
         .map(|(_, window)| window.id)
+}
+
+fn taskbar_metrics(count: usize) -> (i32, u32) {
+    let count = count.max(1) as i32;
+    let gap = 6;
+    let width = ((gui::WIDTH as i32 - 40 - gap * (count - 1)) / count).clamp(58, 118);
+    let total = width * count + gap * (count - 1);
+    ((gui::WIDTH as i32 - total) / 2, width as u32)
+}
+
+fn window_control_at(rect: gui::Rect, x: i32) -> Option<gui::WindowAction> {
+    let offset = x - (rect.x + 10);
+    if !(0..48).contains(&offset) {
+        return None;
+    }
+    match offset / 16 {
+        0 => Some(gui::WindowAction::Close),
+        1 => Some(gui::WindowAction::Minimize),
+        2 => Some(gui::WindowAction::Maximize),
+        _ => None,
+    }
 }
 
 struct UnicodeInput {
@@ -1791,6 +1818,7 @@ fn render(
         if !rect_is_dirty(paint_bounds) {
             continue;
         }
+        let active = desktop.focused() == Some(window.id);
         fill_rect(
             framebuffer,
             gui::Rect {
@@ -1802,7 +1830,6 @@ fn render(
             SHADOW,
         );
         fill_rect(framebuffer, window.rect, BORDER);
-        let active = desktop.focused() == Some(window.id);
         stroke_rect(
             framebuffer,
             window.rect,
@@ -1822,16 +1849,6 @@ fn render(
         fill_rect(
             framebuffer,
             gui::Rect {
-                x: window.rect.x + 1,
-                y: window.rect.y + 1,
-                width: window.rect.width.saturating_sub(2),
-                height: 2,
-            },
-            if active { ACCENT } else { BORDER },
-        );
-        fill_rect(
-            framebuffer,
-            gui::Rect {
                 x: window.rect.x + 2,
                 y: window.rect.y + microsystem_gui::TITLE_BAR_HEIGHT,
                 width: window.rect.width.saturating_sub(4),
@@ -1840,8 +1857,9 @@ fn render(
                     .height
                     .saturating_sub(microsystem_gui::TITLE_BAR_HEIGHT as u32 + 2),
             },
-            CLIENT + (window.client as u32 * 0x0001_0101),
+            CLIENT,
         );
+        fill_round_rect(framebuffer, client_rect(window.rect), CLIENT, 7);
         fill_rect(
             framebuffer,
             gui::Rect {
@@ -1850,12 +1868,12 @@ fn render(
                 width: window.rect.width.saturating_sub(4),
                 height: 1,
             },
-            if active { BORDER_ACTIVE } else { BORDER },
+            CHROME_DIVIDER,
         );
-        let title_bytes = (window.rect.width.saturating_sub(76) / 6) as usize;
+        let title_bytes = (window.rect.width.saturating_sub(132) / 6) as usize;
         draw_text(
             framebuffer,
-            window.rect.x + 10,
+            window.rect.x + 64,
             window.rect.y + 10,
             &window.title[..(window.title_len as usize).min(title_bytes)],
             if active { TEXT } else { MUTED_TEXT },
@@ -1888,43 +1906,44 @@ fn render(
     if !rect_is_dirty(taskbar_bounds) {
         return;
     }
-    draw_taskbar(framebuffer);
     let visible_windows = desktop
         .z_order()
         .filter(|window| window.id != 0)
         .count()
         .max(1);
-    let task_width = (gui::WIDTH as usize / visible_windows).clamp(72, 132) as u32;
+    draw_taskbar(framebuffer, visible_windows);
+    let (task_start, task_width) = taskbar_metrics(visible_windows);
     let mut task_index = 0i32;
     for window in desktop.z_order() {
         if window.id != 0 {
-            let x = 8 + task_index * (task_width as i32 + 4);
-            fill_rect(
+            let x = task_start + task_index * (task_width as i32 + 6);
+            fill_round_rect(
                 framebuffer,
                 gui::Rect {
                     x,
-                    y: gui::HEIGHT as i32 - microsystem_gui::TASKBAR_HEIGHT + 5,
+                    y: gui::HEIGHT as i32 - microsystem_gui::TASKBAR_HEIGHT + 6,
                     width: task_width,
-                    height: 26,
+                    height: 24,
                 },
                 if desktop.focused() == Some(window.id) {
-                    TITLE_ACTIVE
+                    ACCENT_TINT
                 } else {
                     TASKBAR_BUTTON
                 },
+                7,
             );
             fill_rect(
                 framebuffer,
                 gui::Rect {
                     x,
-                    y: gui::HEIGHT as i32 - 3,
+                    y: gui::HEIGHT as i32 - 5,
                     width: task_width,
-                    height: 3,
+                    height: 2,
                 },
                 if desktop.focused() == Some(window.id) {
                     ACCENT
                 } else {
-                    BORDER
+                    CHROME_DIVIDER
                 },
             );
             let task_title_bytes = (task_width.saturating_sub(16) / 6) as usize;
@@ -1960,21 +1979,29 @@ fn draw_desktop_background(framebuffer: &mut [u32]) {
             color,
         );
     }
-    for x in (24..gui::WIDTH as i32).step_by(96) {
-        fill_rect(
-            framebuffer,
-            gui::Rect {
-                x,
-                y: 0,
-                width: 1,
-                height: gui::HEIGHT - microsystem_gui::TASKBAR_HEIGHT as u32,
-            },
-            0x0013_2238,
-        );
-    }
+    fill_rect(
+        framebuffer,
+        gui::Rect {
+            x: 0,
+            y: 120,
+            width: gui::WIDTH,
+            height: 2,
+        },
+        0x00d8_e8f2,
+    );
+    fill_rect(
+        framebuffer,
+        gui::Rect {
+            x: 0,
+            y: 122,
+            width: gui::WIDTH,
+            height: 1,
+        },
+        0x00b5_cde0,
+    );
 }
 
-fn draw_taskbar(framebuffer: &mut [u32]) {
+fn draw_taskbar(framebuffer: &mut [u32], count: usize) {
     let top = gui::HEIGHT as i32 - microsystem_gui::TASKBAR_HEIGHT;
     fill_rect(
         framebuffer,
@@ -1994,30 +2021,40 @@ fn draw_taskbar(framebuffer: &mut [u32]) {
             width: gui::WIDTH,
             height: 1,
         },
-        0x002c_405c,
+        0x00c6_d2de,
+    );
+    let (start, width) = taskbar_metrics(count);
+    let dock_width = width as i32 * count as i32 + 6 * (count as i32 - 1) + 16;
+    fill_round_rect(
+        framebuffer,
+        gui::Rect {
+            x: start - 8,
+            y: top + 3,
+            width: dock_width.max(0) as u32,
+            height: 30,
+        },
+        0x00f4_f7fa,
+        10,
     );
 }
 
 fn draw_window_controls(framebuffer: &mut [u32], rect: gui::Rect, active: bool) {
-    let right = rect.x + rect.width as i32;
-    for (offset, color, glyph) in [
-        (0, 0x00e0_6677, b"X".as_slice()),
-        (14, 0x00d8_a64b, b"-".as_slice()),
-        (28, 0x0057_c792, b"+".as_slice()),
+    for (offset, color) in [
+        (0, CONTROL_CLOSE),
+        (16, CONTROL_MINIMIZE),
+        (32, CONTROL_MAXIMIZE),
     ] {
         let button = gui::Rect {
-            x: right - 18 - offset,
-            y: rect.y + 7,
+            x: rect.x + 10 + offset,
+            y: rect.y + 8,
             width: 12,
             height: 12,
         };
-        fill_rect(framebuffer, button, if active { color } else { BORDER });
-        draw_text(
+        fill_round_rect(
             framebuffer,
-            button.x + 3,
-            button.y + 3,
-            glyph,
-            if active { 0x000b_1322 } else { MUTED_TEXT },
+            button,
+            if active { color } else { CONTROL_INACTIVE },
+            6,
         );
     }
 }
@@ -2091,7 +2128,7 @@ fn draw_files(framebuffer: &mut [u32], window: gui::Rect) {
                     width: 80,
                     height: 22,
                 },
-                TITLE_ACTIVE,
+                ACCENT_TINT,
             );
         }
         draw_text(
@@ -2115,9 +2152,9 @@ fn draw_files(framebuffer: &mut [u32], window: gui::Rect) {
         BORDER,
     );
     for (index, (name, color)) in [
-        (b"DOCUMENTS".as_slice(), 0x00d8_a64b),
-        (b"SCRIPTS".as_slice(), 0x005d_8fdc),
-        (b"SYSTEM".as_slice(), 0x0057_c792),
+        (b"DOCUMENTS".as_slice(), 0x0052_a8ff),
+        (b"SCRIPTS".as_slice(), 0x00af_52de),
+        (b"SYSTEM".as_slice(), 0x0034_c759),
     ]
     .into_iter()
     .enumerate()
@@ -2157,9 +2194,9 @@ fn draw_monitor(framebuffer: &mut [u32], window: gui::Rect) {
         TEXT,
     );
     for (index, (label, value, color)) in [
-        (b"CPU".as_slice(), 58u32, 0x005d_8fdc),
-        (b"MEMORY".as_slice(), 72u32, 0x0088_6bd8),
-        (b"STORAGE".as_slice(), 41u32, 0x0057_c792),
+        (b"CPU".as_slice(), 58u32, 0x0000_7aff),
+        (b"MEMORY".as_slice(), 72u32, 0x00af_52de),
+        (b"STORAGE".as_slice(), 41u32, 0x0034_c759),
     ]
     .into_iter()
     .enumerate()
@@ -2188,7 +2225,7 @@ fn draw_monitor(framebuffer: &mut [u32], window: gui::Rect) {
                 width: track_width,
                 height: 7,
             },
-            0x000b_1322,
+            0x00d9_e1e9,
         );
         fill_rect(
             framebuffer,
@@ -2216,11 +2253,11 @@ fn client_rect(window: gui::Rect) -> gui::Rect {
 
 fn application_color(application: gui::Application) -> u32 {
     match application {
-        gui::Application::Terminal => 0x0049_7fc7,
-        gui::Application::Files => 0x00d8_a64b,
-        gui::Application::Monitor => 0x0057_c792,
-        gui::Application::Reader => 0x0088_6bd8,
-        gui::Application::Editor => 0x00e0_6677,
+        gui::Application::Terminal => 0x0034_3a40,
+        gui::Application::Files => 0x0052_a8ff,
+        gui::Application::Monitor => 0x0034_c759,
+        gui::Application::Reader => 0x00af_52de,
+        gui::Application::Editor => 0x00ff_375f,
     }
 }
 
@@ -2235,9 +2272,9 @@ fn draw_application_symbol(framebuffer: &mut [u32], application: gui::Applicatio
                     width: 32,
                     height: 24,
                 },
-                0x0008_101d,
+                0x0029_2f36,
             );
-            draw_text(framebuffer, x + 11, y + 16, b">_", TEXT);
+            draw_text(framebuffer, x + 11, y + 16, b">_", 0x00f6_f8fb);
         }
         gui::Application::Files => {
             fill_rect(
@@ -2248,7 +2285,7 @@ fn draw_application_symbol(framebuffer: &mut [u32], application: gui::Applicatio
                     width: 30,
                     height: 19,
                 },
-                0x00ff_d36a,
+                0x0052_a8ff,
             );
             fill_rect(
                 framebuffer,
@@ -2258,7 +2295,7 @@ fn draw_application_symbol(framebuffer: &mut [u32], application: gui::Applicatio
                     width: 13,
                     height: 6,
                 },
-                0x00ff_d36a,
+                0x0052_a8ff,
             );
         }
         gui::Application::Monitor => {
@@ -2271,7 +2308,7 @@ fn draw_application_symbol(framebuffer: &mut [u32], application: gui::Applicatio
                         width: 6,
                         height: height as u32,
                     },
-                    TEXT,
+                    0x0034_c759,
                 );
             }
         }
@@ -2339,7 +2376,7 @@ fn draw_desktop_icons(framebuffer: &mut [u32]) {
         if !rect_is_dirty(icon.rect) {
             continue;
         }
-        fill_rect(
+        fill_round_rect(
             framebuffer,
             gui::Rect {
                 x: icon.rect.x + 2,
@@ -2348,10 +2385,10 @@ fn draw_desktop_icons(framebuffer: &mut [u32]) {
                 height: icon.rect.height.saturating_sub(2),
             },
             SHADOW,
+            9,
         );
-        fill_rect(framebuffer, icon.rect, 0x0015_2133);
-        stroke_rect(framebuffer, icon.rect, 0x002d_4059, 1);
-        fill_rect(
+        fill_round_rect(framebuffer, icon.rect, 0x00f6_f9fc, 9);
+        fill_round_rect(
             framebuffer,
             gui::Rect {
                 x: icon.rect.x + 10,
@@ -2360,6 +2397,7 @@ fn draw_desktop_icons(framebuffer: &mut [u32]) {
                 height: 38,
             },
             application_color(icon.application),
+            8,
         );
         draw_application_symbol(
             framebuffer,
@@ -3059,6 +3097,11 @@ fn fill_rect(framebuffer: &mut [u32], rect: gui::Rect, color: u32) {
                 .fill(color);
         }
     }
+}
+
+fn fill_round_rect(framebuffer: &mut [u32], rect: gui::Rect, color: u32, radius: u32) {
+    let _ = radius;
+    fill_rect(framebuffer, rect, color);
 }
 
 #[panic_handler]

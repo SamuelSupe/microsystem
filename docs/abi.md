@@ -190,6 +190,7 @@ The fixed boot handles are:
 | `SCRIPT_BROKER_ENDPOINT` | 70/1 | init script broker | Mica process calls |
 | `SSH_FILESYSTEM_FRAME` | 71/1 | SSH/MFS payload frame | MFS/sshd only |
 | `SHARED_FILESYSTEM_FRAME` | 25/1 | MFS filesystem payload frame | MFS/shell/db |
+| `DATABASE_FILESYSTEM_FRAME` | 87/1 | database filesystem payload frame | MFS/db only |
 | `GUI_CONFIG_ENDPOINT` | 54/1 | init↔windowd client registry | init `WRITE`; windowd `READ` |
 | `SCRIPT_GUI_COMMANDS` | 72/1 | 64 KiB GUI command FrameRegion | Mica GUI `READ|WRITE|MAP` |
 | `SCRIPT_GUI_EVENTS` | 73/1 | 4 KiB GUI event Frame | Mica GUI `READ|WRITE|MAP` |

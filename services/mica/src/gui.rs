@@ -8,14 +8,15 @@ const MAX_WIDGETS: usize = 256;
 const MAX_CHILDREN: usize = 32;
 const DEFAULT_WIDTH: u32 = 420;
 const DEFAULT_HEIGHT: u32 = 260;
-const COLOR_BACKGROUND: u32 = 0x0010_1827;
-const COLOR_PANEL: u32 = 0x0018_2436;
-const COLOR_INPUT: u32 = 0x000b_1322;
-const COLOR_BORDER: u32 = 0x0036_4964;
-const COLOR_ACCENT: u32 = 0x005d_8fdc;
-const COLOR_ACCENT_DARK: u32 = 0x003e_6faa;
-const COLOR_TEXT: u32 = 0x00ed_f4ff;
-const COLOR_MUTED: u32 = 0x0096_a8c1;
+const COLOR_BACKGROUND: u32 = 0x00f5_f8fb;
+const COLOR_PANEL: u32 = 0x00eb_f0f5;
+const COLOR_INPUT: u32 = 0x00ff_ffff;
+const COLOR_BUTTON: u32 = 0x00e7_ecf2;
+const COLOR_BORDER: u32 = 0x00c4_ced9;
+const COLOR_ACCENT: u32 = 0x0000_7aff;
+const COLOR_SELECTION: u32 = 0x00d9_eaff;
+const COLOR_TEXT: u32 = 0x001b_2733;
+const COLOR_MUTED: u32 = 0x006b_7785;
 
 pub const PRELUDE: &str = r#"
 function __gui_set_root(self, root)
@@ -836,7 +837,7 @@ impl GuiHost {
                     output,
                     gui::CommandKind::FillRect,
                     widget.rect,
-                    COLOR_ACCENT_DARK,
+                    COLOR_BUTTON,
                     0,
                     &[],
                 )?;
@@ -847,7 +848,7 @@ impl GuiHost {
                         height: 2,
                         ..widget.rect
                     },
-                    COLOR_ACCENT,
+                    0x00f8_fafd,
                     0,
                     &[],
                 )?;
@@ -978,7 +979,7 @@ impl GuiHost {
                             output,
                             gui::CommandKind::FillRect,
                             row,
-                            COLOR_ACCENT_DARK,
+                            COLOR_SELECTION,
                             0,
                             &[],
                         )?;

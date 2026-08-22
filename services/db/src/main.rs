@@ -12,6 +12,7 @@ use microsystem_abi::{
 use microsystem_sql::{ColumnInfo, Database, Error as SqlError, Execution, Value};
 
 const SHARED_DATA: usize = 0x005e_0000;
+const FILESYSTEM_DATA: usize = 0x0062_0000;
 const SHARED_BYTES: usize = database::SHARED_FRAME_BYTES;
 const RESPONSE_HEADER_BYTES: usize = core::mem::size_of::<DbResponseHeaderV1>();
 const DATABASE_PATH: &str = "/.system/db/main.db";
@@ -20,30 +21,33 @@ const DATABASE_TEMP_PATH: &str = "/.system/db/main.db.tmp";
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let _ = microsystem_user_rt::debug_write(b"[user] db service ELF entered EL0\n");
-    if ensure_storage().is_err() {
-        let _ = microsystem_user_rt::debug_write(b"[db] storage initialization failed\n");
-        microsystem_user_rt::exit(2);
-    }
-    let mut database_state = match load_database() {
-        Ok(database) => database,
+    let (mut database_state, startup_error) =
+        match ensure_storage().and_then(|_| load_database()) {
+        Ok(database) => {
+            let _ = microsystem_user_rt::debug_write(
+                b"[user] msql snapshot loaded path=/.system/db/main.db\n",
+            );
+            (database, None)
+        }
         Err(status) => {
             if status == Status::Corrupt {
                 let _ = microsystem_user_rt::debug_write(
                     b"[db] snapshot load failed status=Corrupt; empty database not installed\n",
                 );
             } else {
-                let _ = microsystem_user_rt::debug_write(b"[db] snapshot load failed status=-");
+                let _ = microsystem_user_rt::debug_write(b"[db] startup failed status=-");
                 let _ = microsystem_user_rt::debug_write_u64(
                     b"",
                     (status as i64).unsigned_abs(),
                     b"\n",
                 );
             }
-            microsystem_user_rt::exit(3);
+            let _ = microsystem_user_rt::debug_write(
+                b"[db] service remains online; database execution disabled\n",
+            );
+            (Database::new(), Some(status))
         }
     };
-    let _ =
-        microsystem_user_rt::debug_write(b"[user] msql snapshot loaded path=/.system/db/main.db\n");
     let _ = microsystem_user_rt::service_online();
     let mut request = Message::new(protocol::DATABASE, 0);
     if microsystem_user_rt::ipc_recv(boot_cap::DATABASE_ENDPOINT, &mut request, 0).is_err() {
@@ -52,7 +56,12 @@ pub extern "C" fn _start() -> ! {
     let _ = microsystem_user_rt::debug_write(b"[ipc] resident db endpoint=26 ready\n");
     loop {
         let mut reply = Message::new(protocol::DATABASE, request.opcode);
-        let status = handle_request(&mut database_state, &request, &mut reply);
+        let status = handle_request(
+            &mut database_state,
+            startup_error,
+            &request,
+            &mut reply,
+        );
         reply.words[5] = status as i64 as u64;
         if microsystem_user_rt::ipc_reply_recv(boot_cap::DATABASE_ENDPOINT, &reply, &mut request, 0)
             .is_err()
@@ -62,7 +71,12 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn handle_request(database_state: &mut Database, request: &Message, reply: &mut Message) -> Status {
+fn handle_request(
+    database_state: &mut Database,
+    startup_error: Option<Status>,
+    request: &Message,
+    reply: &mut Message,
+) -> Status {
     if request.protocol != protocol::DATABASE
         || request.caps[0] != boot_cap::SHARED_FILESYSTEM_FRAME
     {
@@ -71,6 +85,9 @@ fn handle_request(database_state: &mut Database, request: &Message, reply: &mut 
     match request.opcode {
         value if value == database::Operation::Ping as u16 => write_command_response(reply, 0),
         value if value == database::Operation::Execute as u16 => {
+            if let Some(status) = startup_error {
+                return write_status_error(reply, status);
+            }
             let length = match usize::try_from(request.words[0]) {
                 Ok(length) if length <= SHARED_BYTES => length,
                 _ => return Status::Invalid,
@@ -141,7 +158,9 @@ fn load_database() -> Result<Database, Status> {
         if chunk_length == 0 || chunk_length > SHARED_BYTES || chunk_length > length - offset {
             return Err(Status::Corrupt);
         }
-        let chunk = unsafe { core::slice::from_raw_parts(SHARED_DATA as *const u8, chunk_length) };
+        let chunk = unsafe {
+            core::slice::from_raw_parts(FILESYSTEM_DATA as *const u8, chunk_length)
+        };
         snapshot.extend_from_slice(chunk);
         offset += chunk_length;
     }
@@ -368,10 +387,10 @@ fn fs_request(
         return Err(Status::Invalid);
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(path.as_ptr(), SHARED_DATA as *mut u8, path.len());
+        core::ptr::copy_nonoverlapping(path.as_ptr(), FILESYSTEM_DATA as *mut u8, path.len());
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
-            (SHARED_DATA + path.len()) as *mut u8,
+            (FILESYSTEM_DATA + path.len()) as *mut u8,
             data.len(),
         );
         microsystem_user_rt::fence();
@@ -380,7 +399,7 @@ fn fs_request(
     request.words[0] = path.len() as u64;
     request.words[1] = data.len() as u64;
     request.words[2] = offset;
-    request.caps[0] = boot_cap::SHARED_FILESYSTEM_FRAME;
+    request.caps[0] = boot_cap::DATABASE_FILESYSTEM_FRAME;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
     microsystem_user_rt::ipc_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0)?;
     if reply.protocol != protocol::FILESYSTEM {

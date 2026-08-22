@@ -51,25 +51,25 @@ client; a subsequent click can reuse the slot.
 
 ### Visual presentation
 
-The 1024×768 desktop is code-drawn in windowd with a layered navy background,
-fine vertical separators and a darker taskbar. Windows use an offset drop
-shadow, a bordered 28-pixel title bar and separate active/inactive chrome; the
-active title color is `#1e3b63` with a brighter border/accent, while inactive
-titles use muted text. The title controls are explicit 12×12 `X`, `-` and `+`
-buttons, and the bottom-right resize grip is rendered as three small corner
-marks. Focus is also reflected by the taskbar button fill and its bottom accent
-strip, so a minimized window remains discoverable without changing the window
-protocol or geometry contract.
+The 1024×768 desktop is code-drawn in windowd with a layered light-blue
+gradient, a pale system bar and a centered Dock-like task area. Windows use
+rounded corners, an offset drop shadow, a bordered 28-pixel title bar and
+separate active/inactive chrome; the active title surface is `#f7f9fc` with a
+macOS blue focus border, while inactive titles use a muted gray surface. The
+title controls are left-aligned 12×12 red, yellow and green traffic lights, and
+the bottom-right resize grip remains available. Focus is also reflected by the
+Dock button fill and its blue accent strip, so a minimized window remains
+discoverable without changing the window protocol or geometry contract.
 
 The five launcher cards use distinct code-drawn symbols (terminal prompt,
 folder, meter bars, reader pages and editor sheet) rather than a shared generic
 glyph. The built-in Terminal, Files and Monitor clients draw bounded content
-panels: a dark console with an accent rail, a places/sidebar and file rows, and
-CPU/memory/storage meters. Mica's retained widgets use the same navy panel/input
-palette; focused buttons, text inputs, checkboxes and lists receive a two-pixel
-accent outline, while selected list rows use the dark accent fill. These are
-renderer-level visuals only; the GUI ABI, launch endpoint, capability boundary
-and validated display-list commands remain unchanged.
+panels: a dark console with an accent rail, a light places/sidebar and file rows,
+and CPU/memory/storage meters. Mica's retained widgets use the same light panel,
+input and system-blue palette; focused buttons, text inputs, checkboxes and
+lists receive a two-pixel accent outline, while selected list rows use a pale
+blue fill. These are renderer-level visuals only; the GUI ABI, launch endpoint,
+capability boundary and validated display-list commands remain unchanged.
 
 The Terminal command surface is `ls/list [path]`, `cat/read <path>`,
 `stat <path>`, `touch/create <path>`, `cp <source> <destination>`,
