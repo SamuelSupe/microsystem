@@ -173,6 +173,9 @@ fn handle(
                 return Status::Invalid;
             }
             let bytes = words_as_bytes(&request.words[1..5]);
+            #[cfg(target_arch = "x86_64")]
+            let _ = microsystem_user_rt::debug_write(&bytes[..length]);
+            #[cfg(not(target_arch = "x86_64"))]
             for &byte in &bytes[..length] {
                 put(uart, byte);
             }
@@ -193,6 +196,7 @@ fn words_as_bytes(words: &[u64]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn put(uart: usize, byte: u8) {
     #[cfg(target_arch = "aarch64")]
     while read32(uart + FLAGS) & TX_FULL != 0 {
@@ -217,6 +221,11 @@ fn get(uart: usize) -> Option<u8> {
         None
     } else {
         Some(read8(uart + DATA))
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = uart;
+        microsystem_user_rt::debug_read()
     }
 }
 

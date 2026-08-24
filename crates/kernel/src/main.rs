@@ -18,8 +18,12 @@ mod rtc;
 mod service_runtime;
 #[cfg(target_arch = "aarch64")]
 mod smmu;
+#[cfg(target_arch = "x86_64")]
+mod vtd;
 #[cfg(target_arch = "riscv64")]
 pub(crate) use riscv_iommu as smmu;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use vtd as smmu;
 mod uart;
 
 use core::panic::PanicInfo;
@@ -49,6 +53,10 @@ fn interrupt_bases(platform: &dtb::PlatformInfo) -> (usize, usize) {
     #[cfg(target_arch = "riscv64")]
     {
         (platform.clint_base, platform.plic_base)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        (platform.gicd_base, platform.gicr_base)
     }
 }
 
@@ -111,6 +119,11 @@ extern "C" fn kernel_main(dtb_physical: usize) -> ! {
             #[cfg(target_arch = "riscv64")]
             kprintln!(
                 "[irq] PLIC/SBI timer cpu0 frequency={}Hz slice=5ms",
+                frequency
+            );
+            #[cfg(target_arch = "x86_64")]
+            kprintln!(
+                "[irq] local-APIC timer cpu0 frequency={}Hz slice=5ms",
                 frequency
             );
             frequency
@@ -265,6 +278,8 @@ extern "C" fn kernel_main(dtb_physical: usize) -> ! {
         rr.fp_simd_mismatches[1],
         if cfg!(target_arch = "aarch64") {
             "q-regs=q0-q31 fpcr-fpsr=true"
+        } else if cfg!(target_arch = "x86_64") {
+            "x87-sse=fxsave64 true"
         } else {
             "fd-regs=f0-f31 fcsr=true"
         }
@@ -360,6 +375,23 @@ extern "C" fn rust_lower_sync(
             );
             return action;
         }
+        #[cfg(target_arch = "x86_64")]
+        kprintln!(
+            "[fault] user exception ESR={:#x} error={:#x} ELR={:#x} FAR={:#x} cs={:#x} rsp={:#x} frame={:#x} x0={:#x} x1={:#x} x2={:#x} x8={:#x} ttbr0={:#x}; task terminated",
+            esr,
+            frame.error,
+            elr,
+            far,
+            frame.cs,
+            frame.rsp,
+            frame as *const arch::selected::preempt::ExceptionFrame as usize,
+            frame.registers[0],
+            frame.registers[1],
+            frame.registers[2],
+            frame.registers[8],
+            arch::selected::current_ttbr0()
+        );
+        #[cfg(not(target_arch = "x86_64"))]
         kprintln!(
             "[fault] user exception ESR={:#x} ELR={:#x} FAR={:#x} x0={:#x} x1={:#x} x2={:#x} x8={:#x} ttbr0={:#x}; task terminated",
             esr,
@@ -495,6 +527,21 @@ extern "C" fn rust_lower_sync(
             if arg1 == 0 && frame.registers[2] == 1 {
                 service_runtime::mark_current_online();
                 frame.registers[0] = 0;
+                return 0;
+            }
+            if arg1 == 0 && frame.registers[2] == 2 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    frame.registers[0] = if service_runtime::current_task_owns_console() {
+                        uart::get().map_or(u64::MAX, u64::from)
+                    } else {
+                        microsystem_abi::Status::AccessDenied as i64 as u64
+                    };
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    frame.registers[0] = u64::MAX;
+                }
                 return 0;
             }
             let Ok(length) = usize::try_from(arg1) else {

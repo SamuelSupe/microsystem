@@ -29,6 +29,9 @@ const CPU_COUNT: usize = 2;
 const IDLE_START: usize = APPLICATION_START + APPLICATION_COUNT;
 const TASK_COUNT: usize = IDLE_START + CPU_COUNT;
 
+#[cfg(target_arch = "x86_64")]
+const IMAGE_BYTES: usize = 0x100000;
+#[cfg(not(target_arch = "x86_64"))]
 const IMAGE_BYTES: usize = 0xe0000;
 const HEAP_BYTES: usize = 0x100000;
 const HEAP_START: u64 = 0x0068_0000;
@@ -137,6 +140,8 @@ const DATABASE_ENDPOINT_NODE: u32 = 46;
 
 #[repr(C, align(4096))]
 struct TaskMemory {
+    #[cfg(target_arch = "x86_64")]
+    level0: [u64; 512],
     level1: [u64; 512],
     level2: [u64; 512],
     level3: [u64; 512],
@@ -1375,7 +1380,7 @@ pub fn notify_device_irq() {
 }
 
 pub fn on_timer(frame: &mut ExceptionFrame) {
-    if !active_on_current_cpu() || preempt::exception_level() != 0 {
+    if !active_on_current_cpu() || !preempt::interrupted_user(frame) {
         return;
     }
     let _guard = lock_state();
@@ -1385,7 +1390,7 @@ pub fn on_timer(frame: &mut ExceptionFrame) {
 }
 
 pub fn on_reschedule(frame: &mut ExceptionFrame) {
-    if !active_on_current_cpu() || preempt::exception_level() != 0 {
+    if !active_on_current_cpu() || !preempt::interrupted_user(frame) {
         return;
     }
     let _guard = lock_state();
@@ -1603,7 +1608,7 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
         let index = task - APPLICATION_START;
         let tables = unsafe { &mut *CAPS.0.get() };
         tables[task] = CapabilityTable::new();
-        let install = if let (Some(launch), Some(capabilities)) = (launch, launch_caps) {
+        let mut install = if let (Some(launch), Some(capabilities)) = (launch, launch_caps) {
             install_launch_capabilities(
                 &mut tables[task],
                 launch,
@@ -1620,6 +1625,10 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
                 PROCESS_ENDPOINT_NODE,
             )
         };
+        #[cfg(target_arch = "x86_64")]
+        if install.is_ok() {
+            install = prepare_x86_application_entry(task, &mut state.contexts[task]);
+        }
         if let Err(status) = install {
             tables[task] = CapabilityTable::new();
             unsafe { (&mut *STARTS.0.get())[task] = Start::EMPTY };
@@ -1645,6 +1654,47 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
     arch::send_reschedule(1);
     arch::send_event();
     Ok(pid)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn prepare_x86_application_entry(task: usize, context: &mut Context) -> Result<(), Status> {
+    // ExceptionFrame keeps syscall arguments contiguous through r10, while a
+    // fresh SysV function expects its fourth argument in rcx and the rest on
+    // a callee-aligned stack.
+    let arguments = [
+        context.registers[0],
+        context.registers[1],
+        context.registers[2],
+        context.registers[3],
+        context.registers[4],
+        context.registers[5],
+        context.registers[6],
+        context.registers[7],
+        context.registers[8],
+        context.registers[9],
+        context.registers[10],
+    ];
+    let memory = task_memory_mut(task).ok_or(Status::Fault)?;
+    let stack_words = [
+        0,
+        arguments[6],
+        arguments[7],
+        arguments[8],
+        arguments[9],
+        arguments[10],
+        0,
+    ];
+    let stack_start = STACK_BYTES - stack_words.len() * mem::size_of::<u64>();
+    for (index, word) in stack_words.into_iter().enumerate() {
+        let offset = stack_start + index * mem::size_of::<u64>();
+        memory.stack[offset..offset + mem::size_of::<u64>()].copy_from_slice(&word.to_ne_bytes());
+    }
+    context.registers[3] = 0;
+    context.registers[6] = 0;
+    context.registers[7] = arguments[3];
+    context.registers[8..11].fill(0);
+    context.sp_el0 = STACK_TOP - (stack_words.len() * mem::size_of::<u64>()) as u64;
+    Ok(())
 }
 
 fn validate_launch_capabilities(
@@ -1990,6 +2040,15 @@ pub fn copy_user_read(pointer: u64, output: &mut [u8]) -> Result<(), Status> {
 pub fn active_on_current_cpu() -> bool {
     let cpu = arch::cpu_id();
     cpu < CPU_COUNT && ACTIVE_CPUS.load(Ordering::Acquire) & (1 << cpu) != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn current_task_owns_console() -> bool {
+    if !active_on_current_cpu() {
+        return false;
+    }
+    let _guard = lock_state();
+    current_task(unsafe { &*STATE.0.get() }) == CONSOLE_TASK
 }
 
 pub fn active_cpu_mask() -> u32 {
@@ -4018,6 +4077,8 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         }
     }
     let memory = unsafe { slot.as_mut() }.ok_or(())?;
+    #[cfg(target_arch = "x86_64")]
+    memory.level0.fill(0);
     memory.level1.fill(0);
     memory.level2.fill(0);
     memory.level3.fill(0);
@@ -4038,6 +4099,8 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    let level0_physical = physical(memory.level0.as_ptr() as usize);
     let level1_physical = physical(memory.level1.as_ptr() as usize);
     let level2_physical = physical(memory.level2.as_ptr() as usize);
     let level3_physical = physical(memory.level3.as_ptr() as usize);
@@ -4045,10 +4108,19 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     let image_physical = physical(memory.image.as_ptr() as usize);
     let stack_physical = physical(memory.stack.as_ptr() as usize);
     let heap_physical = physical(memory.heap.as_ptr() as usize);
-    memory.level1[0] = crate::arch::page_table_branch(level2_physical);
-    memory.level1[256] = crate::arch::kernel_mmio_entry();
-    memory.level1[257] = crate::arch::kernel_pci_mmio_entry();
-    memory.level1[258] = crate::arch::kernel_high_half_entry();
+    #[cfg(target_arch = "x86_64")]
+    {
+        memory.level0[0] = crate::arch::page_table_branch(level1_physical);
+        memory.level0[256] = crate::arch::kernel_high_half_entry();
+        memory.level1[0] = crate::arch::page_table_branch(level2_physical);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        memory.level1[0] = crate::arch::page_table_branch(level2_physical);
+        memory.level1[256] = crate::arch::kernel_mmio_entry();
+        memory.level1[257] = crate::arch::kernel_pci_mmio_entry();
+        memory.level1[258] = crate::arch::kernel_high_half_entry();
+    }
     memory.level2[2] = crate::arch::page_table_branch(level3_physical);
     memory.level2[3] = crate::arch::page_table_branch(level3_high_physical);
     if uses_large_window(task) {
@@ -4199,10 +4271,31 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     }
 
     let starts = unsafe { &mut *STARTS.0.get() };
+    #[cfg(target_arch = "x86_64")]
+    let stack = {
+        // Resident services also enter as SysV callees even when they have no
+        // stack arguments.
+        memory.stack[STACK_BYTES - mem::size_of::<u64>()..].fill(0);
+        STACK_TOP - mem::size_of::<u64>() as u64
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let stack = STACK_TOP;
     starts[task] = Start {
         entry: image.entry(),
-        stack: STACK_TOP,
-        ttbr0: crate::arch::address_space_root(level1_physical, ASID_BASE + task as u16),
+        stack,
+        ttbr0: crate::arch::address_space_root(
+            {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    level0_physical
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    level1_physical
+                }
+            },
+            ASID_BASE + task as u16,
+        ),
     };
     Ok(())
 }

@@ -150,7 +150,7 @@ pub fn fill(output: &mut [u8]) -> Result<(), ()> {
             fault.address
         );
     } else {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         crate::kprintln!(
             "[rng] fill timeout avail={} used={} status={:#x} queue-enabled={} event=none",
             available,

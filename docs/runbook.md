@@ -1,10 +1,11 @@
 # Runbook and acceptance model
 
-This runbook describes the current AArch64 and RV64GC OrbStack/QEMU paths. The
-recorded evidence includes AArch64 build and serial shutdown, and a RISC-V QEMU
-`virt` run through serial shutdown and the IOMMU/device gates below. This
-documentation pass does not rerun the end-to-end tests. The exact full test
-matrices remain `validation in progress`.
+This runbook describes the current AArch64, RV64GC, and x86_64 OrbStack/QEMU
+paths. The recorded evidence includes AArch64 build and serial shutdown, a
+RISC-V QEMU `virt` run through serial shutdown and the IOMMU/device gates below,
+and a focused x86_64 QEMU acceptance through resident services, VirtIO-blk,
+MFS, and serial-shell shutdown. This documentation pass does not rerun the
+end-to-end tests. The exact full test matrices remain `validation in progress`.
 
 ## Build and run
 
@@ -22,6 +23,9 @@ make gui                 # GUI profile, VNC/QMP as printed by xtask
 make ssh                 # SSH acceptance client
 ARCH=aarch64 make test   # validation in progress
 ARCH=riscv64 make test   # validation in progress
+ARCH=x86_64 make build
+ARCH=x86_64 make run      # serial shell; QEMU Q35 profile
+ARCH=x86_64 make test     # validation in progress; not run
 ```
 
 `make test` is the unified gate. It builds the image, runs host tests and then
@@ -29,17 +33,19 @@ the normal, power-cut, fault-injection/recovery, MFS1 crash campaign, GUI, SSH,
 and Mica stages. The test harness uses the repository's OrbStack image and QEMU
 configuration; a host KVM accelerator is not required.
 
-## Target matrix and current RISC-V validation
+## Target matrix and current validation
 
 | Target | Current status | Evidence boundary |
 | --- | --- | --- |
 | AArch64 + QEMU `virt-7.2` | Build and serial run reach shutdown | `make test` built-in host suites `81/81`; separate shell parser `6/6`; `87/87` combined recorded checks. |
 | RV64GC + QEMU `virt` | Serial run reaches shutdown | OpenSBI M-mode → S-mode, Sv39, two harts, PLIC/SBI, PCI VirtIO and RISC-V IOMMU gates are verified below. |
+| x86_64 + QEMU Q35 | Focused QEMU acceptance passed | `x86_64-unknown-none`, GRUB Multiboot2 ISO, two vCPUs, local APIC/IOAPIC, Intel VT-d, VirtIO-blk INTx, block/MFS I/O, resident services, and shell shutdown. The full `make ARCH=x86_64 test` matrix is not run. |
 
-The Makefile and `xtask` select the target, QEMU binary, default OpenSBI firmware
-and `iommu-sys=on` from `ARCH`. The validated RISC-V chain is RV64GC → QEMU
-`virt` → OpenSBI M-mode → S-mode → Sv39 → two harts → PLIC/SBI → PCI VirtIO →
-RISC-V IOMMU.
+The Makefile and `xtask` select the target and QEMU profile from `ARCH`. For
+RISC-V, that profile includes the default OpenSBI firmware and `iommu-sys=on`;
+the validated RISC-V chain is RV64GC → QEMU `virt` → OpenSBI M-mode → S-mode →
+Sv39 → two harts → PLIC/SBI → PCI VirtIO → RISC-V IOMMU. x86_64 selects the Q35,
+local APIC/IOAPIC, Intel VT-d, and VirtIO profile described below.
 
 ```sh
 ARCH=riscv64 make build
@@ -76,6 +82,38 @@ firmware-owned hart, timer/IPI and reset services. The repository does not ship
 a checked-in OpenSBI image. The current run validates the default firmware path;
 the full architecture matrices remain in progress.
 
+### x86_64 Q35/Multiboot2/VT-d acceptance
+
+The x86_64 target is `x86_64-unknown-none`. `xtask` packages the kernel as a
+GRUB Multiboot2 ISO and boots it on QEMU Q35 with two vCPUs, local APIC/IOAPIC
+interrupt routing, Intel VT-d, and VirtIO devices. The focused acceptance used
+the serial path:
+
+```sh
+ARCH=x86_64 make build
+ARCH=x86_64 make run
+```
+
+`ARCH=x86_64 make build` passed; the recorded acceptance used the equivalent
+QEMU profile with a temporary raw disk so the existing build disk was not
+locked.
+
+The recorded run passed the SMP/RR/IPC gates and resident EL0 readiness, then
+reported the blocked VT-d fault probe, firmware-routed PCI INTx line 11, and
+two VirtIO-blk INTx completions:
+
+```text
+[iommu] fault-probe blocked=true sentinel=true event=0x1 stream-id=0x10 iova=0x798000 completion-error=false
+[irq] virtio-blk INTx pin=1 ioapic-id=11 bound cpu0
+[irq] virtio-blk INTx completions=2
+[user] block driver queue0 read+write sector=0 mfs1=true flush=ok
+[service] resident EL0 ready=8/8 online=8/8 switches=827090
+```
+
+The same run mounted and recovered MFS1, reached `micro> help`, accepted
+`micro> shutdown`, and exited through the guest success shutdown code. The
+full `make ARCH=x86_64 test` matrix has not been run and is not a PASS result.
+
 ## Final gate
 
 | Evidence | Result |
@@ -84,11 +122,14 @@ the full architecture matrices remain in progress.
 | AArch64 serial run | reached `[system] shutdown` |
 | RV64GC QEMU `virt` serial run | reached `[system] shutdown` |
 | RISC-V IOMMU fault probe | `blocked=true sentinel=true event=0xf stream-id=0x10 completion-error=false` |
+| x86_64 `make build` | passed |
+| x86_64 focused QEMU acceptance | passed; resident, VT-d, INTx, block/MFS, shell `help`/`shutdown`; guest exit `33` |
 | `make test` built-in host suites | `81/81` (`22+9+6+9+11+24`) |
 | Separate shell-parser run | `6/6` |
 | Combined recorded host checks | `87/87` |
 | `make ARCH=aarch64 test` | `validation in progress` |
 | `make ARCH=riscv64 test` | `validation in progress` |
+| `make ARCH=x86_64 test` | `validation in progress` (not run) |
 
 The retained AArch64 normal, power-cut, fault-cut plus GC, GUI, SSH, and Mica
 stages passed. Its final `make fsck` also exited zero:

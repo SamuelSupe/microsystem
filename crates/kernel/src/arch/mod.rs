@@ -7,6 +7,9 @@ pub use aarch64 as selected;
 #[cfg(target_arch = "riscv64")]
 pub use riscv64 as selected;
 
+#[cfg(target_arch = "x86_64")]
+pub use x86_64 as selected;
+
 pub fn phys_to_virt(physical: u64) -> usize {
     selected::phys_to_virt(physical)
 }
@@ -89,3 +92,6 @@ pub fn kernel_pci_mmio_entry() -> u64 {
 
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;

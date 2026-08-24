@@ -32,8 +32,22 @@ case "$MICROSYSTEM_ARCH" in
     )
     MICROSYSTEM_VIRTIO_PCI_OPTIONS='disable-legacy=on,iommu_platform=on,romfile=,'
     ;;
+  x86_64)
+    MICROSYSTEM_TARGET='x86_64-unknown-none'
+    MICROSYSTEM_QEMU_BINARY='qemu-system-x86_64'
+    MICROSYSTEM_QEMU_PLATFORM_ARGS=(
+      -machine 'q35,kernel-irqchip=split'
+      -cpu 'qemu64,+x2apic'
+      -device 'intel-iommu,intremap=on,caching-mode=on,device-iotlb=on'
+      -device 'isa-debug-exit,iobase=0xf4,iosize=0x04'
+    )
+    MICROSYSTEM_QEMU_BOOT_ARGS=(
+      -no-reboot
+    )
+    MICROSYSTEM_VIRTIO_PCI_OPTIONS='disable-legacy=on,iommu_platform=on,romfile=,'
+    ;;
   *)
-    echo "qemu-arch: ARCH must be aarch64 or riscv64 (got $MICROSYSTEM_ARCH)" >&2
+    echo "qemu-arch: ARCH must be aarch64, riscv64, or x86_64 (got $MICROSYSTEM_ARCH)" >&2
     return 2 2>/dev/null || exit 2
     ;;
 esac

@@ -60,13 +60,18 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
         transport.notify_multiplier
     );
     let pin = pci::interrupt_pin(platform.pcie_base, device);
+    #[cfg(not(target_arch = "x86_64"))]
     let irq = platform
         .intx_irq(device.slot, pin)
         .ok_or(Status::NotFound)?;
+    #[cfg(target_arch = "x86_64")]
+    let irq = pci::interrupt_line(platform.pcie_base, device).ok_or(Status::NotFound)?;
     #[cfg(target_arch = "aarch64")]
     let irq_result = arch::selected::bind_device_irq(platform.gicd_base, irq, transport.isr);
     #[cfg(target_arch = "riscv64")]
     let irq_result = arch::selected::bind_device_irq(platform.plic_base, irq, transport.isr);
+    #[cfg(target_arch = "x86_64")]
+    let irq_result = arch::selected::bind_device_irq(platform.gicr_base, irq, transport.isr);
     irq_result.map_err(|_| Status::Io)?;
 
     let requester_id = device.requester_id();
@@ -75,6 +80,8 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     let iommu_base = platform.smmu_base;
     #[cfg(target_arch = "riscv64")]
     let iommu_base = platform.riscv_iommu_base;
+    #[cfg(target_arch = "x86_64")]
+    let iommu_base = platform.smmu_base;
     let domain = smmu::create_domain(
         iommu_base,
         stream_id,
@@ -97,6 +104,8 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     let iommu_name = "SMMUv3";
     #[cfg(target_arch = "riscv64")]
     let iommu_name = "RISC-V";
+    #[cfg(target_arch = "x86_64")]
+    let iommu_name = "Intel VT-d";
     kprintln!(
         "[iommu] {} domain stream-id={:#x} iova={:#x} idr0={:#x} idr5={:#x} gerror={:#x} cmdq=true",
         iommu_name,
@@ -141,6 +150,8 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     let expected_fault = 0x10;
     #[cfg(target_arch = "riscv64")]
     let expected_fault = 0x0f;
+    #[cfg(target_arch = "x86_64")]
+    let expected_fault = 0x01;
     let blocked = event.event_type == expected_fault
         && event.address == probe.attempted_iova
         && probe.sentinel_intact;
@@ -171,6 +182,12 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     #[cfg(target_arch = "riscv64")]
     kprintln!(
         "[irq] virtio-blk INTx pin={} plic-id={} bound cpu0",
+        pin,
+        irq
+    );
+    #[cfg(target_arch = "x86_64")]
+    kprintln!(
+        "[irq] virtio-blk INTx pin={} ioapic-id={} bound cpu0",
         pin,
         irq
     );

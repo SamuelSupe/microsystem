@@ -5,6 +5,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 static UART_BASE: AtomicUsize = AtomicUsize::new(0xffff_ff80_0900_0000);
 #[cfg(target_arch = "riscv64")]
 static UART_BASE: AtomicUsize = AtomicUsize::new(0xffff_ffc0_1000_0000);
+#[cfg(target_arch = "x86_64")]
+static UART_BASE: AtomicUsize = AtomicUsize::new(0x3f8);
 static PRINT_NEXT: AtomicUsize = AtomicUsize::new(0);
 static PRINT_SERVING: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "aarch64")]
@@ -19,6 +21,8 @@ const TX_OFFSET: usize = 0x00;
 const READY_OFFSET: usize = 0x05;
 #[cfg(target_arch = "riscv64")]
 const READY_MASK: u32 = 1 << 5;
+#[cfg(target_arch = "x86_64")]
+const TX_OFFSET: usize = 0x00;
 
 pub struct Uart;
 
@@ -33,6 +37,17 @@ impl Uart {
         unsafe {
             core::ptr::read_volatile((base + offset) as *const u32)
         }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let value: u8;
+            core::arch::asm!(
+                "in al, dx",
+                in("dx") (base + offset) as u16,
+                out("al") value,
+                options(nomem, nostack, preserves_flags)
+            );
+            value as u32
+        }
     }
     fn write_reg(offset: usize, value: u32) {
         let base = UART_BASE.load(Ordering::Relaxed);
@@ -43,6 +58,15 @@ impl Uart {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             core::ptr::write_volatile((base + offset) as *mut u32, value)
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") (base + offset) as u16,
+                in("al") value as u8,
+                options(nomem, nostack, preserves_flags)
+            )
         }
     }
 
@@ -55,16 +79,28 @@ impl Uart {
         while Self::read_reg(READY_OFFSET) & READY_MASK == 0 {
             core::hint::spin_loop();
         }
+        #[cfg(target_arch = "x86_64")]
+        while Self::read_reg(5) & (1 << 5) == 0 {
+            core::hint::spin_loop();
+        }
         Self::write_reg(TX_OFFSET, byte as u32);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get() -> Option<u8> {
+        (Self::read_reg(5) & 1 != 0).then(|| Self::read_reg(0) as u8)
     }
 }
 
 pub fn set_physical_base(physical: usize) {
     if physical != 0 {
+        #[cfg(not(target_arch = "x86_64"))]
         UART_BASE.store(
             crate::arch::phys_to_virt(physical as u64),
             Ordering::Relaxed,
         );
+        #[cfg(target_arch = "x86_64")]
+        UART_BASE.store(physical, Ordering::Relaxed);
     }
 }
 
@@ -87,6 +123,26 @@ pub fn print(args: fmt::Arguments<'_>) {
     }
     let _ = Uart.write_fmt(args);
     PRINT_SERVING.store(ticket.wrapping_add(1), Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn emergency_write(bytes: &[u8]) {
+    let port = UART_BASE.load(Ordering::Relaxed) as u16;
+    for byte in bytes {
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") port,
+                in("al") *byte,
+                options(nomem, nostack, preserves_flags)
+            )
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn get() -> Option<u8> {
+    Uart::get()
 }
 
 #[macro_export]

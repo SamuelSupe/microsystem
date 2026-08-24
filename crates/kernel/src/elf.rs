@@ -2,6 +2,7 @@ use microsystem_abi::Status;
 
 pub const EM_AARCH64: u16 = 183;
 pub const EM_RISCV: u16 = 243;
+pub const EM_X86_64: u16 = 62;
 pub const ET_EXEC: u16 = 2;
 pub const PT_LOAD: u32 = 1;
 pub const PF_X: u32 = 1;
@@ -13,7 +14,13 @@ pub const USER_MAX: u64 = 0x0000_007f_ffff_0000;
 const EXPECTED_MACHINE: u16 = EM_AARCH64;
 #[cfg(target_arch = "riscv64")]
 const EXPECTED_MACHINE: u16 = EM_RISCV;
-#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_MACHINE: u16 = EM_X86_64;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "x86_64"
+)))]
 const EXPECTED_MACHINE: u16 = EM_AARCH64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

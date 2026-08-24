@@ -1,10 +1,12 @@
 # Architecture
 
-MicroSystem targets QEMU `virt` profiles on AArch64 and RV64GC. The AArch64
-profile uses `virt-7.2`, two CPUs, 4 KiB pages and 256 MiB RAM; the RISC-V
-profile uses RV64GC, two harts and QEMU `virt`. Each kernel consumes the DTB for
-its UART, interrupt controller, PCIe/VirtIO and IOMMU resources; device policy
-is not encoded as a portable Linux device model.
+MicroSystem targets QEMU `virt` profiles on AArch64 and RV64GC, plus an x86_64
+Q35 profile. The AArch64 profile uses `virt-7.2`, two CPUs, 4 KiB pages and
+256 MiB RAM; the RISC-V profile uses RV64GC, two harts and QEMU `virt`; the
+x86_64 profile uses two vCPUs, Q35, local APIC/IOAPIC routing, Intel VT-d, and
+VirtIO. Each kernel consumes the platform's boot resource description for its
+UART, interrupt controller, PCIe/VirtIO and IOMMU resources; device policy is
+not encoded as a portable Linux device model.
 
 ## Target status and validation
 
@@ -55,7 +57,29 @@ without a completion error.
 
 Evidence remains profile-specific: the listed RISC-V gates are current QEMU
 evidence, while the exact `make ARCH=aarch64 test` and
-`make ARCH=riscv64 test` full matrices remain `validation in progress`.
+`make ARCH=riscv64 test` full matrices remain `validation in progress`. The
+x86_64 focused QEMU acceptance is passed, but `make ARCH=x86_64 test` has not
+been run and is not a PASS result.
+
+### x86_64 Q35/Multiboot2/VT-d contract
+
+The x86_64 build target is `x86_64-unknown-none`. `xtask` places the kernel in
+a GRUB Multiboot2 ISO, which QEMU boots on Q35 with two vCPUs. The x86_64
+mechanism path uses long mode, the local APIC timer, IOAPIC INTx routing, Intel
+VT-d for DMA isolation, and VirtIO for block, network, and RNG devices. PCI
+interrupt routing reads the firmware-provided PCI Interrupt Line; the accepted
+VirtIO-blk run bound line 11 to `ioapic-id=11` and observed two INTx
+completions.
+
+`ARCH=x86_64 make build` passed; the full `make ARCH=x86_64 test` matrix has not
+been run and is not a PASS result.
+
+The supported serial command shape is:
+
+```sh
+ARCH=x86_64 make build
+ARCH=x86_64 make run
+```
 
 ## Boot and address spaces
 
@@ -65,7 +89,10 @@ bounded SMMUv3 domain. On RISC-V, S-mode performs the corresponding DTB,
 Sv39, PLIC/SBI, PCI VirtIO and RISC-V IOMMU setup. Both paths prepare init/root
 and one idle task per CPU/hart; init then starts resident EL0 services by bootfs
 name, and each service is re-parsed as a static ELF64 `ET_EXEC` image with
-page-granular W^X checks.
+page-granular W^X checks. On x86_64, the Multiboot2 entry installs long-mode
+high-half/user mappings, initializes the local APIC timer and IOAPIC, creates the
+Intel VT-d domain, and prepares the same init/root and resident EL0 service
+layout.
 
 The bootfs has 25 entries (24 static ELF files and `etc/services`).
 `SERVICE_COUNT=13` and the service-slot order is:
@@ -95,7 +122,8 @@ mappings and ASIDs are invalidated on exit/reuse.
 The trusted computing base keeps only mechanisms that must touch hardware:
 
 - page-table writes, EL0 address-space setup and W^X validation;
-- GIC/INTx routing, IRQ acknowledgement and SMMUv3 domain/fault handling;
+- GIC, local APIC/IOAPIC, and INTx routing, IRQ acknowledgement, and SMMUv3,
+  RISC-V IOMMU, or Intel VT-d domain/fault handling;
 - bounded VirtIO activation/probe and capability creation;
 - scheduling, timer, IPC, capability derivation/revoke and resource cleanup;
 - PL031 realtime reads for syscall 31.

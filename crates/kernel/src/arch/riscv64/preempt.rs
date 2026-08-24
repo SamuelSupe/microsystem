@@ -162,6 +162,10 @@ pub(crate) fn exception_level() -> u64 {
     u64::from(value & SSTATUS_SPP != 0)
 }
 
+pub(crate) fn interrupted_user(frame: &ExceptionFrame) -> bool {
+    frame.from_user()
+}
+
 pub(crate) fn syscall_number(frame: &ExceptionFrame) -> u64 {
     frame.syscall_number()
 }

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="930" viewBox="0 0 1400 930" role="img" aria-labelledby="title desc">
   <title id="title">MicroSystem system architecture</title>
-  <desc id="desc">A layered architecture from QEMU AArch64 and RV64GC hardware profiles through the EL1 or S-mode microkernel and isolated EL0 or U-mode services to Mica applications.</desc>
+  <desc id="desc">A layered architecture from QEMU AArch64, RV64GC and x86_64 hardware profiles through the EL1, S-mode or long-mode microkernel and isolated EL0 or U-mode services to Mica applications.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#071326"/>
@@ -37,36 +37,36 @@
   <rect width="1400" height="930" rx="28" fill="url(#bg)"/>
   <path d="M0 170 H1400 M0 410 H1400 M0 735 H1400" stroke="#28415f" stroke-width="1" opacity=".55"/>
   <text x="70" y="70" class="label" font-size="30">MicroSystem · layered capability architecture</text>
-  <text x="70" y="103" class="small">AArch64 + RV64GC research OS · QEMU virt profiles · mechanisms in EL1/S-mode, policy in isolated EL0/U-mode services</text>
+  <text x="70" y="103" class="small">AArch64 + RV64GC + x86_64 research OS · QEMU virt/Q35 profiles · mechanisms in EL1/S-mode/long mode, policy in isolated EL0/U-mode services</text>
 
   <text x="70" y="151" class="tiny" letter-spacing="2">HARDWARE PROFILE</text>
   <g filter="url(#shadow)">
     <rect x="70" y="180" width="1260" height="150" rx="18" fill="#13243b" stroke="#34567e" stroke-width="2"/>
     <rect x="100" y="215" width="205" height="80" rx="12" fill="#1b3351"/>
-    <text x="125" y="247" class="box-title">QEMU virt profiles</text>
+    <text x="125" y="247" class="box-title">QEMU virt / Q35</text>
     <text x="125" y="272" class="box-text">2 CPUs · 256 MiB RAM</text>
     <rect x="335" y="215" width="205" height="80" rx="12" fill="#1b3351"/>
     <text x="360" y="247" class="box-title">VirtIO</text>
     <text x="360" y="272" class="box-text">block · net · GPU · input</text>
     <rect x="570" y="215" width="205" height="80" rx="12" fill="#1b3351"/>
     <text x="595" y="247" class="box-title">Interrupt / DMA</text>
-    <text x="595" y="272" class="box-text">GICv3/PLIC · SMMUv3/RV IOMMU</text>
+    <text x="595" y="272" class="box-text">GICv3 · PLIC · APIC/IOAPIC</text>
     <rect x="805" y="215" width="205" height="80" rx="12" fill="#1b3351"/>
     <text x="830" y="247" class="box-title">Firmware data</text>
-    <text x="830" y="272" class="box-text">DTB · PL031 · UART</text>
+    <text x="830" y="272" class="box-text">DTB/PCI · PL031 · UART</text>
     <rect x="1040" y="215" width="260" height="80" rx="12" fill="#1b3351"/>
-    <text x="1065" y="247" class="box-title">AArch64 + RV64GC</text>
-    <text x="1065" y="272" class="box-text">4 KiB pages · EL1/S-mode</text>
+    <text x="1065" y="247" class="box-title">AArch64 · RV64GC · x86_64</text>
+    <text x="1065" y="272" class="box-text">EL1 · S-mode · long mode</text>
   </g>
 
   <path d="M700 330 V382" stroke="#82b9ff" stroke-width="3" marker-end="url(#arrow)"/>
   <text x="720" y="363" class="tiny">hardware mechanisms only</text>
 
-  <text x="70" y="402" class="tiny" letter-spacing="2">EL1 / S-MODE TRUSTED CORE</text>
+  <text x="70" y="402" class="tiny" letter-spacing="2">EL1 / S-MODE / LONG-MODE TRUSTED CORE</text>
   <g filter="url(#shadow)">
     <rect x="70" y="430" width="1260" height="220" rx="18" fill="url(#kernel)" stroke="#5f9ee7" stroke-width="2"/>
     <text x="105" y="470" class="box-title" font-size="23">Microkernel · minimal trusted computing base</text>
-    <text x="105" y="498" class="box-text">Boot, MMU/Sv39, scheduling, capability enforcement, IPC, IRQ routing, IOMMU setup, W^X ELF loading, resource limits</text>
+    <text x="105" y="498" class="box-text">Boot, MMU/Sv39, scheduling, capability enforcement, IPC, IRQ routing, IOMMU/VT-d setup, W^X ELF loading, resource limits</text>
     <rect x="105" y="530" width="250" height="76" rx="10" fill="#214a78"/>
     <text x="130" y="560" class="box-title">Memory &amp; tasks</text>
     <text x="130" y="584" class="box-text">MMU · ASID · scheduler</text>
@@ -75,7 +75,7 @@
     <text x="405" y="584" class="box-text">derive · revoke · endpoints</text>
     <rect x="655" y="530" width="250" height="76" rx="10" fill="#214a78"/>
     <text x="680" y="560" class="box-title">Device boundary</text>
-    <text x="680" y="584" class="box-text">DTB · PCI · IRQ · SMMU/RV IOMMU</text>
+    <text x="680" y="584" class="box-text">DTB/PCI · IRQ · SMMU/RV IOMMU/VT-d</text>
     <rect x="930" y="530" width="365" height="76" rx="10" fill="#214a78"/>
     <text x="955" y="560" class="box-title">EL0 launch &amp; cleanup</text>
     <text x="955" y="584" class="box-text">static ELF bootfs · W^X · bounded slots</text>

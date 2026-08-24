@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 enum Architecture {
     Aarch64,
     Riscv64,
+    X86_64,
 }
 
 impl Architecture {
@@ -21,7 +22,10 @@ impl Architecture {
         {
             "aarch64" => Ok(Self::Aarch64),
             "riscv64" => Ok(Self::Riscv64),
-            arch => Err(format!("ARCH must be aarch64 or riscv64 (got {arch})")),
+            "x86_64" => Ok(Self::X86_64),
+            arch => Err(format!(
+                "ARCH must be aarch64, riscv64, or x86_64 (got {arch})"
+            )),
         }
     }
 
@@ -29,6 +33,7 @@ impl Architecture {
         match self {
             Self::Aarch64 => "aarch64-unknown-none-softfloat",
             Self::Riscv64 => "riscv64gc-unknown-none-elf",
+            Self::X86_64 => "x86_64-unknown-none",
         }
     }
 
@@ -36,6 +41,7 @@ impl Architecture {
         match self {
             Self::Aarch64 => "qemu-system-aarch64",
             Self::Riscv64 => "qemu-system-riscv64",
+            Self::X86_64 => "qemu-system-x86_64",
         }
     }
 
@@ -43,6 +49,7 @@ impl Architecture {
         match self {
             Self::Aarch64 => "disable-legacy=on,iommu_platform=on,romfile=",
             Self::Riscv64 => "disable-legacy=on,iommu_platform=on,romfile=",
+            Self::X86_64 => "disable-legacy=on,iommu_platform=on,romfile=",
         }
     }
 }
@@ -58,7 +65,7 @@ fn main() -> ExitCode {
         "fsck" => fsck(),
         _ => {
             eprintln!(
-                "usage: ARCH=aarch64|riscv64 cargo run -p xtask -- <build|run|qemu|gui|test|fsck>"
+                "usage: ARCH=aarch64|riscv64|x86_64 cargo run -p xtask -- <build|run|qemu|gui|test|fsck>"
             );
             Ok(())
         }
@@ -138,6 +145,9 @@ fn build(arch: Architecture) -> Result<(), String> {
         "--features",
         "baremetal",
     ]))?;
+    if matches!(arch, Architecture::X86_64) {
+        create_x86_boot_iso(arch)?;
+    }
     run(Command::new("cargo").args(["build", "--release", "-p", "mfsctl"]))?;
     let disk = disk_path();
     if !disk.exists() {
@@ -623,8 +633,72 @@ fn qemu_command(arch: Architecture, gui: bool) -> Command {
             }
             command.arg("-no-reboot");
         }
+        Architecture::X86_64 => {
+            command.args([
+                "-machine",
+                "q35,kernel-irqchip=split",
+                "-cpu",
+                "qemu64,+x2apic",
+                "-accel",
+                "tcg,thread=multi",
+                "-smp",
+                "2",
+                "-m",
+                "256M",
+                "-device",
+                "intel-iommu,intremap=on,caching-mode=on,device-iotlb=on",
+                "-device",
+                "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            ]);
+            if gui {
+                command.args([
+                    "-display",
+                    "none",
+                    "-vnc",
+                    "0.0.0.0:0",
+                    "-serial",
+                    "stdio",
+                    "-monitor",
+                    "none",
+                    "-qmp",
+                    "unix:target/gui-qmp.sock,server=on,wait=off",
+                ]);
+            } else {
+                command.arg("-nographic");
+            }
+            command.arg("-no-reboot");
+        }
     }
     command
+}
+
+fn create_x86_boot_iso(arch: Architecture) -> Result<(), String> {
+    let root = Path::new("build/x86_64-iso");
+    let boot = root.join("boot");
+    let grub = boot.join("grub");
+    fs::create_dir_all(&grub).map_err(|error| error.to_string())?;
+    fs::copy(kernel_path(arch), boot.join("microsystem-kernel"))
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        grub.join("grub.cfg"),
+        "set timeout=0\nset default=0\nmenuentry \"MicroSystem\" {\n    multiboot2 /boot/microsystem-kernel\n    boot\n}\n",
+    )
+    .map_err(|error| error.to_string())?;
+    run(Command::new("grub-mkrescue").args([
+        "-o",
+        "build/microsystem-x86_64.iso",
+        root.to_str().ok_or("invalid x86_64 ISO staging path")?,
+    ]))
+}
+
+fn add_boot_image(command: &mut Command, arch: Architecture, kernel: &str) -> Result<(), String> {
+    if matches!(arch, Architecture::X86_64) {
+        create_x86_boot_iso(arch)?;
+        command.args(["-boot", "d", "-cdrom", "build/microsystem-x86_64.iso"]);
+    } else {
+        command.args(["-kernel", kernel]);
+    }
+    Ok(())
 }
 
 fn run_qemu(arch: Architecture) -> Result<(), String> {
@@ -648,9 +722,8 @@ fn run_qemu(arch: Architecture) -> Result<(), String> {
         arch.virtio_pci_options()
     );
     let mut command = qemu_command(arch, false);
+    add_boot_image(&mut command, arch, kernel)?;
     command
-        .arg("-kernel")
-        .arg(kernel)
         .arg("-drive")
         .arg(drive)
         .arg("-device")
@@ -702,9 +775,8 @@ fn run_qemu_gui(arch: Architecture) -> Result<(), String> {
         arch.virtio_pci_options()
     );
     let mut command = qemu_command(arch, true);
+    add_boot_image(&mut command, arch, kernel)?;
     command
-        .arg("-kernel")
-        .arg(kernel)
         .arg("-drive")
         .arg(drive)
         .arg("-device")
@@ -807,7 +879,9 @@ fn host_binary(name: &str) -> PathBuf {
 }
 
 fn disk_path() -> PathBuf {
-    PathBuf::from("build/microsystem.img")
+    std::env::var_os("MICROSYSTEM_DISK_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("build/microsystem.img"))
 }
 
 fn run(command: &mut Command) -> Result<(), String> {

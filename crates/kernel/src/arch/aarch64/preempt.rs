@@ -277,6 +277,10 @@ pub(crate) fn exception_level() -> u64 {
     value & 0xf
 }
 
+pub(crate) fn interrupted_user(_frame: &ExceptionFrame) -> bool {
+    exception_level() == 0
+}
+
 fn write_elr(value: u64) {
     unsafe { asm!("msr elr_el1, {0}", in(reg) value, options(nostack)) }
 }

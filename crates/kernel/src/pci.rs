@@ -160,6 +160,12 @@ pub fn interrupt_pin(ecam_physical: usize, device: Device) -> u8 {
     read8(ecam_physical, device.slot, device.function, 0x3d)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn interrupt_line(ecam_physical: usize, device: Device) -> Option<u32> {
+    let line = read8(ecam_physical, device.slot, device.function, 0x3c);
+    (line < 24).then_some(u32::from(line))
+}
+
 pub fn inspect_configured_virtio_block(
     ecam_physical: usize,
     device: Device,

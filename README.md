@@ -1,10 +1,10 @@
 # MicroSystem
 
-![Targets](https://img.shields.io/badge/targets-AArch64%20%7C%20RV64GC%20%2B%20QEMU-2563eb)
+![Targets](https://img.shields.io/badge/targets-AArch64%20%7C%20RV64GC%20%7C%20x86_64%20%2B%20QEMU-2563eb)
 ![Rust](https://img.shields.io/badge/implementation-Rust%202024-f97316)
 ![Status](https://img.shields.io/badge/status-research%20prototype-7c3aed)
 
-> An AI-assisted attempt to implement a complete operating-system ecosystem — from an AArch64 microkernel to storage, networking, SSH, GUI, a user-space database, and a capability-aware scripting runtime.
+> An AI-assisted attempt to implement a complete operating-system ecosystem — from a multi-architecture microkernel to storage, networking, SSH, GUI, a user-space database, and a capability-aware scripting runtime.
 
 [简体中文](README.zh-CN.md) · **English**
 
@@ -12,7 +12,7 @@ MicroSystem is a small, explicit, end-to-end operating-system experiment. The go
 
 ## Current target and status
 
-Both boot profiles have real QEMU serial evidence. The validated RISC-V chain is
+All three boot profiles have real QEMU serial evidence. The validated RISC-V chain is
 RV64GC on QEMU `virt`, default OpenSBI M-mode handoff to S-mode, Sv39, two harts,
 PLIC/SBI timer and interrupt services, PCI VirtIO, and the RISC-V IOMMU. Its
 serial run reaches `[system] shutdown`.
@@ -29,6 +29,14 @@ recorded host checks are `87/87`. This does not mean `make test` itself reports
 
 The exact `make ARCH=aarch64 test` and `make ARCH=riscv64 test` full matrices
 remain `validation in progress`; their in-flight state is not a PASS result.
+
+The x86_64 path has also passed a focused QEMU serial acceptance run. It uses the
+`x86_64-unknown-none` target, a GRUB Multiboot2 ISO, QEMU Q35 with two vCPUs,
+local APIC/IOAPIC routing, Intel VT-d, and VirtIO devices. `ARCH=x86_64 make
+build` passed; the acceptance run reached SMP/RR/IPC, resident EL0 services,
+the blocked-DMA probe, VirtIO-blk INTx completions, block/MFS I/O, and the
+serial shell's `help` and `shutdown`. The full `make ARCH=x86_64 test` matrix
+has not been run and is not claimed as PASS.
 
 The latest source snapshot also includes a resident EL0 `db` service and the
 `microsystem-sql` library. It exposes a bounded CRUD subset through the serial
@@ -52,7 +60,8 @@ The image below is a real GUI frame captured from the repository's QEMU GUI prof
 
 ## System architecture
 
-The design keeps hardware mechanisms in AArch64 EL1 or RISC-V S-mode and pushes
+The design keeps hardware mechanisms in AArch64 EL1, RISC-V S-mode, or x86_64
+long mode and pushes
 policy into isolated EL0/U-mode services. Applications use brokered IPC and
 capabilities rather than receiving raw framebuffer, block, network, DMA, or IRQ
 access.
@@ -62,9 +71,9 @@ access.
 The main path is:
 
 ```text
-QEMU virt-7.2 hardware
+QEMU virt / Q35 hardware profiles
           ↓
-EL1 microkernel: MMU · scheduling · IPC · capabilities · IRQ/IOMMU
+EL1 / S-mode / long-mode microkernel: MMU · scheduling · IPC · capabilities · IRQ/IOMMU
           ↓
 EL0 services: init · devmgr · block · MFS1 · db · netd · sshd · windowd
           ↓
@@ -75,15 +84,16 @@ Mica scripts and GUI applications: Counter · Reader · Editor · Terminal
 
 | Layer | Current experiment |
 | --- | --- |
-| Kernel | AArch64 EL1 and RV64GC S-mode boot, MMU/Sv39, GICv3 or PLIC/SBI timer/interrupts, scheduling, ASIDs, W^X ELF loading, capability derivation/revoke, and bounded resource cleanup |
-| Isolation | DTB-driven PCI VirtIO discovery, SMMUv3 or RISC-V IOMMU domain setup, device grants, and strict privileged-mechanism / user-policy boundaries |
+| Kernel | AArch64 EL1, RV64GC S-mode, and x86_64 long-mode boot; MMU/Sv39, GICv3, PLIC/SBI, or local APIC/IOAPIC timer/interrupts; scheduling, ASIDs, W^X ELF loading, capability derivation/revoke, and bounded resource cleanup |
+| Isolation | DTB-driven or PCI-config-driven VirtIO discovery, SMMUv3, RISC-V IOMMU, or Intel VT-d domain setup, device grants, and strict privileged-mechanism / user-policy boundaries |
 | Storage | MFS1 transactional filesystem, metadata mirrors, fsck, offline narrow repair, power-cut and deterministic fault-injection paths |
 | Database | Resident EL0 `db` service, bounded `microsystem-sql` CRUD subset, 4 KiB IPC responses, 4,096-row global budget, MSQLDB1 snapshots, CRC32C validation, atomic MFS1 persistence, and fail-closed corruption handling |
 | Network and access | EL0 `netd`, endpoint-brokered networking, bounded HTTP/HTTPS access, SSH sessions, and policy intersection for scripts |
 | Desktop | VirtIO-GPU/input profile, code-drawn 1024×768 desktop, retained GUI command stream, window management, input batching, damage culling, Terminal, Files, Monitor, Reader, and Editor |
 | Runtime | Mica lexer/compiler/VM, capability-aware permissions, filesystem/network/GUI brokers, and bounded application slots |
 
-The repository targets QEMU `virt-7.2` AArch64 and RV64GC QEMU `virt` profiles.
+The repository targets QEMU `virt-7.2` AArch64, RV64GC QEMU `virt`, and x86_64
+Q35 profiles.
 It is a research prototype, not a Linux/POSIX distribution, general-purpose
 desktop, or promise of arbitrary real-hardware and ELF compatibility.
 
@@ -96,11 +106,18 @@ docker context show                         # expected: orbstack
 make build
 make test
 make fsck
+ARCH=x86_64 make build
+ARCH=x86_64 make run                 # x86_64 Q35 serial path
 ```
 
 The commands above are the supported AArch64 path. `ARCH=riscv64 make build`
 and `ARCH=riscv64 make run` select the validated RISC-V target/QEMU path. The
-lower-level command shape is:
+x86_64 commands `ARCH=x86_64 make build` and `ARCH=x86_64 make run` select the
+x86_64 target and serial QEMU path. The x86_64 profile uses a GRUB Multiboot2
+ISO and Q35 with two vCPUs, local APIC/IOAPIC, Intel VT-d, and VirtIO. Its
+focused acceptance
+passed, while the full `ARCH=x86_64 make test` matrix remains unrun. The
+lower-level RISC-V command shape is:
 
 ```sh
 ARCH=riscv64 cargo build --release \
@@ -197,10 +214,13 @@ mica --gui --timeout 86400s --allow gui.window --allow net.browse \
 
 The repository contains the detailed runbook and raw workflow results. Current
 evidence records the RISC-V QEMU serial/IOMMU/device gates above, AArch64 build
-and serial shutdown, `81/81` built-in `make test` host suites, and a separate
+and serial shutdown, and the focused x86_64 QEMU acceptance (including
+resident services, Intel VT-d, VirtIO-blk INTx, block/MFS I/O, and shell
+shutdown). It also records `81/81` built-in `make test` host suites and a separate
 shell-parser run of `6/6` (`87/87` combined recorded host checks). The exact
-`make ARCH=aarch64 test` and `make ARCH=riscv64 test` matrices are still
-`validation in progress`; this documentation pass does not rerun them. See
+`make ARCH=aarch64 test`, `make ARCH=riscv64 test`, and `make ARCH=x86_64 test`
+matrices are still `validation in progress`; this documentation pass does not
+rerun them. See
 [`docs/runbook.md`](docs/runbook.md) and
 [`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md)
 for retained provenance and limits.
@@ -208,7 +228,7 @@ for retained provenance and limits.
 ## Repository map
 
 ```text
-crates/kernel/     EL1 kernel and AArch64 boot/runtime mechanisms
+crates/kernel/     EL1, S-mode, and x86_64 boot/runtime mechanisms
 crates/mfs1/       MFS1 filesystem implementation
 crates/sql/        bounded SQL parser, executor, and MSQLDB1 snapshot format
 crates/mica/       Mica language, VM, permissions, and standard library

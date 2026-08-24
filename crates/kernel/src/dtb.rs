@@ -28,6 +28,7 @@ pub struct PlatformInfo {
     pub has_pcie: bool,
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 pub fn discover(physical: usize) -> PlatformInfo {
     let pointer = crate::arch::phys_to_virt(physical as u64) as *const u8;
     let header = unsafe { core::slice::from_raw_parts(pointer, 40) };
@@ -105,6 +106,42 @@ pub fn discover(physical: usize) -> PlatformInfo {
         iommu_map_mask,
         pcie_intx,
         has_pcie: pcie_base != 0,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn discover(_physical: usize) -> PlatformInfo {
+    let mut pcie_intx = [0u32; 16];
+    for slot in 0..4 {
+        for pin in 0..4 {
+            pcie_intx[slot * 4 + pin] = 16 + ((slot + pin) & 3) as u32;
+        }
+    }
+    PlatformInfo {
+        valid: true,
+        bytes: 0,
+        cpus: 2,
+        ram_base: 0,
+        ram_bytes: 256 * 1024 * 1024,
+        uart_base: 0x3f8,
+        rtc_base: 0,
+        clint_base: 0,
+        plic_base: 0,
+        plic_bytes: 0,
+        gicd_base: 0xfee0_0000,
+        gicr_base: 0xfec0_0000,
+        smmu_base: 0xfed9_0000,
+        riscv_iommu_base: 0,
+        riscv_iommu_bytes: 0,
+        pcie_base: 0xb000_0000,
+        pcie_mmio_base: 0xc000_0000,
+        pcie_mmio_bytes: 0x1000_0000,
+        iommu_rid_base: 0,
+        iommu_sid_base: 0,
+        iommu_map_length: 0x1_0000,
+        iommu_map_mask: 0xffff,
+        pcie_intx,
+        has_pcie: true,
     }
 }
 

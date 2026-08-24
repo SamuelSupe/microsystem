@@ -4,7 +4,11 @@ use microsystem_abi::{
     CapHandle, Message, ObjectType, Rights, Status, Syscall, SystemControlOperation, SystemStats,
 };
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "x86_64"
+))]
 mod allocator {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ptr;
@@ -206,7 +210,11 @@ mod allocator {
     }
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "x86_64"
+))]
 #[global_allocator]
 static USER_ALLOCATOR: allocator::FreeList = allocator::FreeList;
 
@@ -242,7 +250,26 @@ pub unsafe fn syscall(number: Syscall, args: [u64; 6]) -> i64 {
     a0 as i64
 }
 
-#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn syscall(number: Syscall, args: [u64; 6]) -> i64 {
+    let mut result = args[0];
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") number as u64 => _,
+            inout("rdi") result, in("rsi") args[1], in("rdx") args[2],
+            in("r10") args[3], in("r8") args[4], in("r9") args[5],
+            options(nostack)
+        );
+    }
+    result as i64
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "x86_64"
+)))]
 pub unsafe fn syscall(_number: Syscall, _args: [u64; 6]) -> i64 {
     Status::NotSupported as i64
 }
@@ -257,7 +284,15 @@ pub fn fence() {
     unsafe {
         core::arch::asm!("fence rw, rw", options(nostack));
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
@@ -271,7 +306,15 @@ pub fn fence_store() {
     unsafe {
         core::arch::asm!("fence w, w", options(nostack));
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
 }
 
@@ -285,7 +328,15 @@ pub fn fence_load() {
     unsafe {
         core::arch::asm!("fence r, r", options(nostack));
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("lfence", options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 }
 
@@ -299,7 +350,15 @@ pub fn wait_for_event() {
     {
         let _ = yield_now();
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     core::hint::spin_loop();
 }
 
@@ -320,7 +379,20 @@ pub unsafe fn fault_probe(address: u64) {
             options(nostack)
         );
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "mov rax, qword ptr [{address}]",
+            address = in(reg) address,
+            out("rax") _,
+            options(nostack, readonly)
+        );
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     unsafe {
         core::ptr::read_volatile(address as *const u8);
     }
@@ -335,7 +407,15 @@ pub unsafe fn privileged_probe() {
     unsafe {
         core::arch::asm!("csrw satp, x0", options(nostack));
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov cr3, rax", in("rax") 0u64, options(nostack));
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     core::hint::spin_loop();
 }
 
@@ -360,6 +440,11 @@ pub fn debug_write(bytes: &[u8]) -> Result<(), Status> {
     } else {
         Err(Status::AccessDenied)
     }
+}
+
+pub fn debug_read() -> Option<u8> {
+    let result = unsafe { syscall(Syscall::DebugWrite, [0, 0, 2, 0, 0, 0]) };
+    u8::try_from(result).ok()
 }
 
 pub fn debug_write_u64(prefix: &[u8], value: u64, suffix: &[u8]) -> Result<(), Status> {

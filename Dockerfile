@@ -8,14 +8,23 @@ RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' \
         ca-certificates \
         cpio \
         curl \
+        grub-common \
         ipxe-qemu \
         make \
         qemu-efi-aarch64 \
         opensbi \
+        xorriso \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         -t bookworm-backports \
         qemu-system-misc \
         qemu-system-arm \
+        qemu-system-x86 \
+    && dpkg --add-architecture amd64 \
+    && apt-get update \
+    && cd /tmp \
+    && apt-get download grub-pc-bin:amd64 \
+    && dpkg-deb --extract grub-pc-bin_*_amd64.deb / \
+    && rm -f grub-pc-bin_*_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 ARG HOST_CA_DIGEST=none
@@ -32,6 +41,7 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/microsystem-ca-bundle.pem \
 RUN RUSTUP_USE_CURL=1 rustup target add \
         aarch64-unknown-none-softfloat \
         riscv64gc-unknown-none-elf \
+        x86_64-unknown-none \
         --toolchain 1.97.1
 
 WORKDIR /workspace

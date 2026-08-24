@@ -1,31 +1,55 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# End-to-end boot gate for both architecture profiles.  The image is intentionally
+# End-to-end boot gate for all architecture profiles.  The image is intentionally
 # driven through the public make entrypoint so this check exercises the same
 # OrbStack/QEMU command developers use locally.
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/qemu-arch.sh"
 
-if [[ "$MICROSYSTEM_ARCH" == "riscv64" ]]; then
-  irq_timer_marker='\[irq\][[:space:]]+PLIC/SBI[[:space:]]+timer[[:space:]]+cpu0'
-  intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+plic-id=[0-9]+[[:space:]]+bound[[:space:]]+cpu0'
-  iommu_domain_marker='\[iommu\][[:space:]]+RISC-V[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
-  iommu_fault_event='0xf'
-  fp_state_marker='fd-regs=f0-f31[[:space:]]+fcsr=true'
-  fp_state_label='fd-regs=f0-f31 fcsr=true'
-else
-  irq_timer_marker='\[irq\][[:space:]]+GICv3[[:space:]]+timer[[:space:]]+cpu0'
-  intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+gic-id=37[[:space:]]+bound[[:space:]]+cpu0'
-  iommu_domain_marker='\[iommu\][[:space:]]+SMMUv3[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
-  iommu_fault_event='0x10'
-  fp_state_marker='q-regs=q0-q31[[:space:]]+fpcr-fpsr=true'
-  fp_state_label='q-regs=q0-q31 fpcr-fpsr=true'
-fi
+case "$MICROSYSTEM_ARCH" in
+  riscv64)
+    irq_timer_marker='\[irq\][[:space:]]+PLIC/SBI[[:space:]]+timer[[:space:]]+cpu0'
+    intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+plic-id=[0-9]+[[:space:]]+bound[[:space:]]+cpu0'
+    iommu_domain_marker='\[iommu\][[:space:]]+RISC-V[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
+    iommu_fault_event='0xf'
+    fp_state_marker='fd-regs=f0-f31[[:space:]]+fcsr=true'
+    fp_state_label='fd-regs=f0-f31 fcsr=true'
+    ipc_request='0x1234'
+    ipc_reply='0x2468'
+    task_memory_bytes='0x205000'
+    ;;
+  x86_64)
+    irq_timer_marker='\[irq\][[:space:]]+local-APIC[[:space:]]+timer[[:space:]]+cpu0'
+    intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+ioapic-id=[0-9]+[[:space:]]+bound[[:space:]]+cpu0'
+    iommu_domain_marker='\[iommu\][[:space:]]+Intel[[:space:]]+VT-d[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
+    iommu_fault_event='0x1'
+    fp_state_marker='x87-sse=fxsave64[[:space:]]+true'
+    fp_state_label='x87-sse=fxsave64 true'
+    ipc_request='0xcafe'
+    ipc_reply='0xbeef'
+    task_memory_bytes='0x226000'
+    ;;
+  *)
+    irq_timer_marker='\[irq\][[:space:]]+GICv3[[:space:]]+timer[[:space:]]+cpu0'
+    intx_marker='\[irq\][[:space:]]+virtio-blk[[:space:]]+INTx[[:space:]]+pin=1[[:space:]]+gic-id=37[[:space:]]+bound[[:space:]]+cpu0'
+    iommu_domain_marker='\[iommu\][[:space:]]+SMMUv3[[:space:]]+domain[[:space:]]+stream-id=0x10[[:space:]]+iova=0x100000[[:space:]][^[:cntrl:]]*cmdq=true'
+    iommu_fault_event='0x10'
+    fp_state_marker='q-regs=q0-q31[[:space:]]+fpcr-fpsr=true'
+    fp_state_label='q-regs=q0-q31 fpcr-fpsr=true'
+    ipc_request='0x1234'
+    ipc_reply='0x2468'
+    task_memory_bytes='0x205000'
+    ;;
+esac
 
 timeout_seconds="${MICROSYSTEM_QEMU_TIMEOUT:-120}"
 input_delay="${MICROSYSTEM_COMMAND_DELAY:-1}"
+boot_input_delay="${MICROSYSTEM_BOOT_INPUT_DELAY:-$input_delay}"
+if [[ "$MICROSYSTEM_ARCH" == "x86_64" && -z "${MICROSYSTEM_BOOT_INPUT_DELAY:-}" ]]; then
+  boot_input_delay=6
+fi
 log_file="${MICROSYSTEM_QEMU_LOG:-$repo_root/target/smoke-qemu.log}"
 mkdir -p "$(dirname -- "$log_file")"
 
@@ -43,10 +67,11 @@ if [[ -f /.dockerenv || "${MICROSYSTEM_IN_CONTAINER:-0}" == "1" ]]; then
 fi
 run_command=(make run)
 if (( inside_container )); then
-  # The host `make build` stage already produced the AArch64 ELF and disk.
+  # The host `make build` stage already produced the selected-architecture ELF and disk.
   # `qemu` deliberately skips the cross-build, which is unavailable in the
   # runtime image when rustup cannot fetch the bare-metal target.
   run_command=(cargo run -p xtask -- qemu)
+  cargo build -p xtask >/dev/null
 elif ! command -v docker >/dev/null 2>&1; then
   echo "smoke-qemu: docker is required (run through OrbStack)" >&2
   exit 2
@@ -62,7 +87,7 @@ send_input() {
   # Let QEMU finish booting both cores before the first line arrives.  Without
   # this pre-roll the host pipe can queue the complete transcript while the
   # guest is still enabling the secondary timer.
-  sleep "$input_delay"
+  sleep "$boot_input_delay"
   printf 'help\n'
   sleep "$input_delay"
   printf 'pwd\n'
@@ -265,6 +290,15 @@ if ! grep -Eqi -- "$recovery_marker" "$log_file" \
   fi
 fi
 
+# x86 console output goes through the kernel formatter, which emits CRLF.
+# Keep the stored smoke transcript line-oriented before applying anchored
+# serial milestones.
+if [[ "$MICROSYSTEM_ARCH" == "x86_64" ]]; then
+  normalized_log="${log_file}.normalized"
+  sed 's/\r$//' "$log_file" >"$normalized_log"
+  mv -f -- "$normalized_log" "$log_file"
+fi
+
 # QEMU exits with a non-zero status for some deliberate shutdown paths; the
 # serial milestones are the authoritative part of this smoke gate.
 required_markers=(
@@ -273,7 +307,7 @@ required_markers=(
   "mmu"
   "\\[mm\\][[:space:]]+kernel[[:space:]]+heap[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+bytes=0x8000000"
   "\\[mm\\][[:space:]]+frame[[:space:]]+allocator[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+free=[0-9]+"
-  "\\[mm\\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=0x[[:xdigit:]]+[[:space:]]+allocated=0x[[:xdigit:]]+"
+  "\\[mm\\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=$task_memory_bytes[[:space:]]+allocated=$task_memory_bytes"
   "$irq_timer_marker"
   "\\[boot\\][^[:cntrl:]]*iommu-map="
   "timer=true"
@@ -415,7 +449,7 @@ required_markers=(
   "\\[proc\\][[:space:]]+bootfs[[:space:]]+name-based[[:space:]]+loader[[:space:]]+program=counter[[:space:]]+pid=[0-9]+[[:space:]]+static-elf=true"
   "run:[[:space:]]+missing:[[:space:]]+not[[:space:]]+found"
   "\\[mmu\\][[:space:]]+round-robin[[:space:]]+address-spaces=2[[:space:]]+asids=\\[1,2\\]"
-  "\\[ipc\\][[:space:]]+call/recv/reply[[:space:]]+endpoint=1[[:space:]]+request=0x1234[[:space:]]+reply=0x2468[[:space:]]+asids=\\[3,4\\]"
+  "\\[ipc\\][[:space:]]+call/recv/reply[[:space:]]+endpoint=1[[:space:]]+request=$ipc_request[[:space:]]+reply=$ipc_reply[[:space:]]+asids=\\[3,4\\]"
   "\\[sched\\][[:space:]]+fp-simd[[:space:]]+context-isolation=true[[:space:]]+tasks=2[[:space:]]+context-switches=[0-9]+[[:space:]]+checks=\\[[0-9]+,[0-9]+\\][[:space:]]+mismatches=\\[0,0\\][[:space:]]+$fp_state_marker[[:space:]]+signatures=\\[0x11,0x22\\]"
   "root[[:space:]-]+task"
   "block"
@@ -663,6 +697,13 @@ fi
 if [[ "$MICROSYSTEM_ARCH" == "riscv64" ]]; then
   if (( privileged_esr != 2 )); then
     printf 'smoke-qemu: privileged fault scause=%s, expected illegal-instruction cause 0x2: %s\n' \
+      "$privileged_esr" "$privileged_fault_line" >&2
+    tail -n 120 "$log_file" >&2 || true
+    exit 1
+  fi
+elif [[ "$MICROSYSTEM_ARCH" == "x86_64" ]]; then
+  if (( privileged_esr != 0xd )); then
+    printf 'smoke-qemu: privileged fault vector=%s, expected general-protection vector 0xd: %s\n' \
       "$privileged_esr" "$privileged_fault_line" >&2
     tail -n 120 "$log_file" >&2 || true
     exit 1

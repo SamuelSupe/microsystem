@@ -1208,6 +1208,11 @@ fn launch_script_session(
     let (_allow_random, allow_stats, allow_gui, token) = match inspect_script_permissions(region) {
         Ok(permissions) => permissions,
         Err(status) => {
+            let _ = microsystem_user_rt::debug_write_u64(
+                b"[mica] launch rejected stage=permissions status=",
+                (status as i64).unsigned_abs(),
+                b"\n",
+            );
             let _ = microsystem_user_rt::cap_delete(region);
             return status;
         }
@@ -1221,10 +1226,20 @@ fn launch_script_session(
         };
     }
     if let Err(status) = register_script_filesystem(region, token) {
+        let _ = microsystem_user_rt::debug_write_u64(
+            b"[mica] launch rejected stage=filesystem status=",
+            (status as i64).unsigned_abs(),
+            b"\n",
+        );
         let _ = microsystem_user_rt::cap_delete(region);
         return status;
     }
     if let Err(status) = register_script_network(region, token) {
+        let _ = microsystem_user_rt::debug_write_u64(
+            b"[mica] launch rejected stage=network status=",
+            (status as i64).unsigned_abs(),
+            b"\n",
+        );
         unregister_script_filesystem(token);
         let _ = microsystem_user_rt::cap_delete(region);
         return status;
@@ -1358,6 +1373,11 @@ fn launch_script_session(
     let pid = match microsystem_user_rt::thread_start_ex_v2(&launch) {
         Ok(pid) => pid,
         Err(status) => {
+            let _ = microsystem_user_rt::debug_write_u64(
+                b"[mica] launch rejected stage=thread status=",
+                (status as i64).unsigned_abs(),
+                b"\n",
+            );
             if let Some((commands, events, endpoint_slot)) = gui_resources {
                 release_gui_endpoint(endpoint_slot, token);
                 let _ = microsystem_user_rt::cap_delete(events);

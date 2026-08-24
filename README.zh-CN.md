@@ -1,10 +1,10 @@
 # MicroSystem
 
-![Targets](https://img.shields.io/badge/targets-AArch64%20%7C%20RV64GC%20%2B%20QEMU-2563eb)
+![Targets](https://img.shields.io/badge/targets-AArch64%20%7C%20RV64GC%20%7C%20x86_64%20%2B%20QEMU-2563eb)
 ![Rust](https://img.shields.io/badge/implementation-Rust%202024-f97316)
 ![Status](https://img.shields.io/badge/status-research%20prototype-7c3aed)
 
-> 一次由 AI 辅助、从 AArch64 微内核延伸到存储、网络、SSH、GUI、用户态数据库与能力感知脚本运行时的完整操作系统生态实现尝试。
+> 一次由 AI 辅助、从多架构微内核延伸到存储、网络、SSH、GUI、用户态数据库与能力感知脚本运行时的完整操作系统生态实现尝试。
 
 **简体中文** · [English](README.md)
 
@@ -12,7 +12,7 @@ MicroSystem 是一个小型、明确、端到端的操作系统实验。它并�
 
 ## 当前目标与实现状态
 
-两个启动 profile 都已有真实 QEMU 串口证据。当前已验证的 RISC-V 链路是
+三个启动 profile 都已有真实 QEMU 串口证据。当前已验证的 RISC-V 链路是
 RV64GC、QEMU `virt`、默认 OpenSBI 的 M-mode → S-mode 交接、Sv39、双 hart、
 PLIC/SBI 定时器与中断服务、PCI VirtIO，以及 RISC-V IOMMU；串口完整到达
 `[system] shutdown`。
@@ -28,6 +28,13 @@ host suites 合计 `81/81`（`22+9+6+9+11+24`）；另行运行的 shell parser 
 
 精确的 `make ARCH=aarch64 test` 与 `make ARCH=riscv64 test` 完整矩阵仍是
 `validation in progress`；执行中的状态不得写成 PASS。
+
+x86_64 路径也已通过聚焦的 QEMU 串口验收。它使用
+`x86_64-unknown-none` target、GRUB Multiboot2 ISO、带两个 vCPU 的 QEMU Q35、
+local APIC/IOAPIC 路由、Intel VT-d 与 VirtIO 设备。`ARCH=x86_64 make build`
+已通过；聚焦验收已到达 SMP/RR/IPC、常驻 EL0 服务、DMA 阻断探针、VirtIO-blk
+INTx completion、block/MFS I/O，以及串口 shell 的 `help` 和 `shutdown`。
+完整的 `make ARCH=x86_64 test` 矩阵尚未执行，不能宣称 PASS。
 
 最新源码还加入了常驻 EL0 `db` 服务和 `microsystem-sql` 库：通过串口 shell
 的 `sql` 命令提供有界 CRUD SQL 子集，使用 capability 约束的 protocol 10
@@ -49,7 +56,8 @@ GUI ABI 与 capability 边界保持不变；下面仓库内的 PNG 是此前的 
 
 ## 系统架构
 
-设计将必须接触硬件的机制保留在 AArch64 EL1 或 RISC-V S-mode，并把设备
+设计将必须接触硬件的机制保留在 AArch64 EL1、RISC-V S-mode 或 x86_64
+long mode，并把设备
 策略放到相互隔离的 EL0/U-mode 服务中。应用通过 broker IPC 与 capability
 使用资源，不直接获得原始 framebuffer、块设备、网络、DMA 或 IRQ 权限。
 
@@ -58,9 +66,9 @@ GUI ABI 与 capability 边界保持不变；下面仓库内的 PNG 是此前的 
 主路径如下：
 
 ```text
-QEMU virt-7.2 硬件
+QEMU virt / Q35 硬件 profile
           ↓
-EL1 微内核：MMU · 调度 · IPC · capability · IRQ/IOMMU
+EL1 / S-mode / long mode 微内核：MMU · 调度 · IPC · capability · IRQ/IOMMU
           ↓
 EL0 服务：init · devmgr · block · MFS1 · db · netd · sshd · windowd
           ↓
@@ -71,15 +79,16 @@ Mica 脚本与 GUI 应用：Counter · Reader · Editor · Terminal
 
 | 层次 | 当前实验内容 |
 | --- | --- |
-| 内核 | AArch64 EL1 与 RV64GC S-mode 启动、MMU/Sv39、GICv3 或 PLIC/SBI 定时器/中断、调度、ASID、带 W^X 校验的 ELF 加载、capability 派生/撤销与有界资源回收 |
-| 隔离 | 基于 DTB 的 PCI VirtIO 发现、SMMUv3 或 RISC-V IOMMU 域设置、设备授予，以及严格的特权机制 / 用户策略边界 |
+| 内核 | AArch64 EL1、RV64GC S-mode 与 x86_64 long mode 启动；MMU/Sv39、GICv3、PLIC/SBI 或 local APIC/IOAPIC 定时器/中断；调度、ASID、带 W^X 校验的 ELF 加载、capability 派生/撤销与有界资源回收 |
+| 隔离 | 基于 DTB 或 PCI config 的 VirtIO 发现、SMMUv3、RISC-V IOMMU 或 Intel VT-d 域设置、设备授予，以及严格的特权机制 / 用户策略边界 |
 | 存储 | MFS1 事务文件系统、元数据镜像、fsck、受限离线修复，以及断电和确定性故障注入路径 |
 | 数据库 | 常驻 EL0 `db` 服务、有界 `microsystem-sql` CRUD 子集、4 KiB IPC 响应、全局 4,096 行预算、MSQLDB1 snapshot、CRC32C 校验、MFS1 原子持久化，以及损坏时 fail-closed |
 | 网络与访问 | EL0 `netd`、端点 broker 网络、有限 HTTP/HTTPS 访问、SSH 会话，以及脚本权限交集策略 |
 | 桌面 | VirtIO-GPU/输入设备 profile、代码绘制的 1024×768 桌面、保留式 GUI 命令流、窗口管理、输入批处理、damage culling，以及 Terminal、Files、Monitor、Reader、Editor |
 | 运行时 | Mica 词法器/编译器/VM、能力感知权限、文件系统/网络/GUI broker，以及有界应用槽位 |
 
-当前仓库面向 QEMU `virt-7.2` AArch64 与 RV64GC QEMU `virt` profile。它是
+当前仓库面向 QEMU `virt-7.2` AArch64、RV64GC QEMU `virt` 与 x86_64 Q35
+profile。它是
 研究型原型，不是 Linux/POSIX 发行版、通用桌面系统，也不承诺任意真实硬件
 或 ELF 兼容性。
 
@@ -92,11 +101,16 @@ docker context show                         # 预期：orbstack
 make build
 make test
 make fsck
+ARCH=x86_64 make build
+ARCH=x86_64 make run                 # x86_64 Q35 串口路径
 ```
 
 上面的命令是 AArch64 路径。`ARCH=riscv64 make build` 和
-`ARCH=riscv64 make run` 会选择当前已验证的 RISC-V target/QEMU 路径。下面
-是实际的低层命令形状：
+`ARCH=riscv64 make run` 会选择当前已验证的 RISC-V target/QEMU 路径；
+`ARCH=x86_64 make build` 和 `ARCH=x86_64 make run` 会选择 x86_64 target 与
+串口 QEMU 路径。x86_64 profile 使用 GRUB Multiboot2 ISO、Q35、两个 vCPU、
+local APIC/IOAPIC、Intel VT-d 与 VirtIO。其聚焦验收已通过，但完整的
+`ARCH=x86_64 make test` 矩阵仍未执行。下面是 RISC-V 的低层命令形状：
 
 ```sh
 ARCH=riscv64 cargo build --release \
@@ -183,16 +197,20 @@ mica --gui --timeout 86400s --allow gui.window --allow net.browse \
 ## 已记录的验收证据
 
 仓库保留了详细 runbook 与原始 workflow 结果。当前证据包括上面的 RISC-V
-QEMU 串口/IOMMU/设备 gate、AArch64 build 与串口 shutdown、`make test` 内建
-host suites `81/81`，以及另行 shell parser `6/6`（合并记录 `87/87`）。精确的 `make ARCH=aarch64 test` 与
-`make ARCH=riscv64 test` 完整矩阵仍为 `validation in progress`；本次文档
-更新不重跑它们。证据来源与边界见 [`docs/runbook.md`](docs/runbook.md) 和
+QEMU 串口/IOMMU/设备 gate、AArch64 build 与串口 shutdown，以及聚焦的 x86_64
+QEMU 验收（常驻服务、Intel VT-d、VirtIO-blk INTx、block/MFS I/O 与 shell
+shutdown）。此外还有 `make test` 内建
+host suites `81/81`，以及另行 shell parser `6/6`（合并记录 `87/87`）。精确的
+`make ARCH=aarch64 test`、`make ARCH=riscv64 test` 与 `make ARCH=x86_64 test` 的
+完整矩阵仍为
+`validation in progress`；本次文档更新不重跑它们。证据来源与边界见
+[`docs/runbook.md`](docs/runbook.md) 和
 [`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md)。
 
 ## 仓库结构
 
 ```text
-crates/kernel/     EL1 内核与 AArch64 启动/运行机制
+crates/kernel/     EL1、S-mode 与 x86_64 启动/运行机制
 crates/mfs1/       MFS1 文件系统实现
 crates/sql/        有界 SQL parser、executor 与 MSQLDB1 snapshot 格式
 crates/mica/       Mica 语言、VM、权限与标准库
