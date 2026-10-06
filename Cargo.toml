@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/abi",
     "crates/gui",
+    "crates/identity",
     "crates/kernel",
     "crates/mica",
     "crates/mfs1",
@@ -23,6 +24,7 @@ members = [
     "services/terminal",
     "services/files",
     "services/monitor",
+    "services/memoryprobe",
     "services/mica",
     "services/netd",
     "services/sshd",

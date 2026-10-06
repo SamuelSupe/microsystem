@@ -10,6 +10,9 @@ pub enum Command<'a> {
     Clear,
     History,
     Ps,
+    Service(&'a str),
+    App(&'a str),
+    User(&'a str),
     Uptime,
     Date,
     SystemInfo,
@@ -38,8 +41,28 @@ pub enum Command<'a> {
     Find(&'a str),
     Tree(&'a str),
     Du(&'a str),
-    Df,
+    Df(&'a str),
     Stat(&'a str),
+    Mounts,
+    Mount {
+        image: &'a str,
+        point: &'a str,
+        readonly: bool,
+    },
+    Unmount(&'a str),
+    VolumeCreate {
+        image: &'a str,
+        mib: u32,
+    },
+    Chmod {
+        mode: u32,
+        path: &'a str,
+    },
+    Chown {
+        uid: u32,
+        gid: u32,
+        path: &'a str,
+    },
     Touch(&'a str),
     Copy {
         source: &'a str,
@@ -47,6 +70,10 @@ pub enum Command<'a> {
         recursive: bool,
     },
     Write {
+        path: &'a str,
+        value: &'a str,
+    },
+    Append {
         path: &'a str,
         value: &'a str,
     },
@@ -69,6 +96,7 @@ pub enum Command<'a> {
     Curl(&'a str),
     Nslookup(&'a str),
     Netstat,
+    Network(&'a str),
     Run(&'a str),
     MicaEval(&'a str),
     MicaFile(&'a str),
@@ -88,13 +116,327 @@ pub enum ParseError {
     Invalid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppCommand<'a> {
+    List,
+    Info(&'a str),
+    Run(&'a str),
+    Exec(&'a str),
+    Rollback(&'a str),
+    Install {
+        name: &'a str,
+        version: &'a str,
+        source: &'a str,
+        pages: u32,
+        permissions: u64,
+    },
+}
+
+pub fn app_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 48
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+pub fn parse_app(input: &str) -> Result<AppCommand<'_>, ParseError> {
+    let (operation, rest) = required_argument(if input.trim().is_empty() {
+        "list"
+    } else {
+        input
+    })?;
+    match operation {
+        "list" if rest.is_empty() => Ok(AppCommand::List),
+        "info" | "run" | "rollback" => {
+            let name = one_argument(rest)?;
+            if !app_identifier(name) {
+                return Err(ParseError::Invalid);
+            }
+            Ok(match operation {
+                "info" => AppCommand::Info(name),
+                "run" => AppCommand::Run(name),
+                _ => AppCommand::Rollback(name),
+            })
+        }
+        "exec" => {
+            let path = one_argument(rest)?;
+            if !path.starts_with('/') || path.len() > 255 {
+                return Err(ParseError::Invalid);
+            }
+            Ok(AppCommand::Exec(path))
+        }
+        "install" | "update" => {
+            let (name, rest) = required_argument(rest)?;
+            let (version, rest) = required_argument(rest)?;
+            let (source, rest) = required_argument(rest)?;
+            if !app_identifier(name)
+                || !app_identifier(version)
+                || !source.starts_with('/')
+                || source.len() > 255
+            {
+                return Err(ParseError::Invalid);
+            }
+            let (pages, rest) = if rest.is_empty() {
+                (microsystem_abi::virtual_memory::PAGE_BUDGET, "")
+            } else {
+                let (pages, rest) = required_argument(rest)?;
+                (pages.parse::<u32>().map_err(|_| ParseError::Invalid)?, rest)
+            };
+            if pages == 0 || pages > microsystem_abi::virtual_memory::PAGE_BUDGET {
+                return Err(ParseError::Invalid);
+            }
+            let permissions = match if rest.is_empty() {
+                "none"
+            } else {
+                one_argument(rest)?
+            } {
+                "none" => 0,
+                "random" => microsystem_abi::application::RANDOM,
+                "stats" => microsystem_abi::application::SYSTEM_INFO,
+                "all" => {
+                    microsystem_abi::application::RANDOM | microsystem_abi::application::SYSTEM_INFO
+                }
+                _ => return Err(ParseError::Invalid),
+            };
+            Ok(AppCommand::Install {
+                name,
+                version,
+                source,
+                pages,
+                permissions,
+            })
+        }
+        _ => Err(ParseError::Invalid),
+    }
+}
+
+#[cfg(feature = "user-bin")]
+pub fn network_command(
+    arguments: &str,
+    frame: microsystem_abi::CapHandle,
+    address: usize,
+    output: &mut impl core::fmt::Write,
+) -> Result<(), microsystem_abi::Status> {
+    use microsystem_abi::{Message, Status, boot_cap, network, protocol};
+    if arguments.len() > 512 {
+        return Err(Status::Invalid);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(arguments.as_ptr(), address as *mut u8, arguments.len());
+    }
+    microsystem_user_rt::fence();
+    let mut request = Message::new(protocol::NETWORK, network::Operation::Configure as u16);
+    request.words[0] = arguments.len() as u64;
+    request.caps[0] = frame;
+    let mut reply = Message::new(protocol::NETWORK, 0);
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(15_000_000_000);
+    microsystem_user_rt::ipc_call(boot_cap::NETWORK_ENDPOINT, &request, &mut reply, deadline)?;
+    if reply.words[5] as i64 != 0 {
+        return Err(match reply.words[5] as i64 {
+            -3 => Status::AccessDenied,
+            -1 => Status::Invalid,
+            _ => Status::Io,
+        });
+    }
+    let length = reply.words[0] as usize;
+    if length > 4096 {
+        return Err(Status::Corrupt);
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+    let text = core::str::from_utf8(bytes).map_err(|_| Status::Corrupt)?;
+    output.write_str(text).map_err(|_| Status::Io)
+}
+
+#[cfg(feature = "user-bin")]
+pub fn identity_command(
+    arguments: &str,
+    frame: microsystem_abi::CapHandle,
+    address: usize,
+    output: &mut impl core::fmt::Write,
+) -> Result<(), microsystem_abi::Status> {
+    use microsystem_abi::{Message, Status, boot_cap, identity, protocol};
+    if arguments.len() > 512 {
+        return Err(Status::Invalid);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(arguments.as_ptr(), address as *mut u8, arguments.len());
+    }
+    let mut request = Message::new(protocol::IDENTITY, identity::Operation::Command as u16);
+    request.words[0] = arguments.len() as u64;
+    request.caps[0] = frame;
+    let mut reply = Message::new(protocol::IDENTITY, 0);
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(120_000_000_000);
+    microsystem_user_rt::ipc_call(boot_cap::IDENTITY_ENDPOINT, &request, &mut reply, deadline)?;
+    if reply.words[0] > 4096 {
+        return Err(Status::Corrupt);
+    }
+    if reply.words[0] == 0 && reply.words[5] != 0 {
+        return Err(Status::AccessDenied);
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts(address as *const u8, reply.words[0] as usize) };
+    output
+        .write_str(core::str::from_utf8(bytes).map_err(|_| Status::Corrupt)?)
+        .map_err(|_| Status::Io)
+}
+
+#[cfg(feature = "user-bin")]
+pub fn app_command(
+    arguments: &str,
+    frame: microsystem_abi::CapHandle,
+    address: usize,
+    output: &mut impl core::fmt::Write,
+) -> Result<(), microsystem_abi::Status> {
+    use microsystem_abi::{Message, Status, application, boot_cap, protocol};
+    parse_app(arguments).map_err(|_| Status::Invalid)?;
+    if arguments.len() > 512 {
+        return Err(Status::Invalid);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(arguments.as_ptr(), address as *mut u8, arguments.len());
+    }
+    let mut request = Message::new(
+        protocol::APPLICATION,
+        application::Operation::Command as u16,
+    );
+    request.words[0] = arguments.len() as u64;
+    request.caps[0] = frame;
+    let mut reply = Message::new(0, 0);
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(120_000_000_000);
+    microsystem_user_rt::ipc_call(
+        boot_cap::APPLICATION_ENDPOINT,
+        &request,
+        &mut reply,
+        deadline,
+    )?;
+    if reply.protocol != protocol::APPLICATION || reply.words[0] > 4096 {
+        return Err(Status::Corrupt);
+    }
+    if reply.words[5] != 0 && reply.words[0] == 0 {
+        let _ = writeln!(output, "app: failed status={}", reply.words[5] as i64);
+        return Ok(());
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts(address as *const u8, reply.words[0] as usize) };
+    let text = core::str::from_utf8(bytes).map_err(|_| Status::Corrupt)?;
+    let _ = output.write_str(text);
+    Ok(())
+}
+
+pub fn parse_service(
+    arguments: &str,
+) -> Result<(microsystem_abi::service::Operation, Option<usize>), ParseError> {
+    use microsystem_abi::service::{NAMES, Operation};
+    let mut words = arguments.split_ascii_whitespace();
+    let operation = match words.next().unwrap_or("list") {
+        "list" | "status" => Operation::List,
+        "restart" => Operation::Restart,
+        "stop" => Operation::Stop,
+        _ => return Err(ParseError::Invalid),
+    };
+    let task = words
+        .next()
+        .map(|name| {
+            NAMES
+                .iter()
+                .position(|candidate| *candidate == name)
+                .ok_or(ParseError::Invalid)
+        })
+        .transpose()?;
+    if words.next().is_some() || (operation != Operation::List && task.is_none()) {
+        return Err(ParseError::Invalid);
+    }
+    Ok((operation, task))
+}
+
+#[cfg(feature = "user-bin")]
+pub fn service_command(
+    arguments: &str,
+    output: &mut impl core::fmt::Write,
+) -> Result<(), microsystem_abi::Status> {
+    use microsystem_abi::{Message, Status, boot_cap, protocol, service};
+    let (operation, selected) = parse_service(arguments).map_err(|_| Status::Invalid)?;
+    for task in 0..service::NAMES.len() {
+        if selected.is_some_and(|selected| selected != task) {
+            continue;
+        }
+        let mut request = Message::new(protocol::SERVICE, operation as u16);
+        request.words[0] = (task + 1) as u64;
+        let mut reply = Message::new(0, 0);
+        let deadline = microsystem_user_rt::clock_now()?.saturating_add(5_000_000_000);
+        microsystem_user_rt::ipc_call(boot_cap::SERVICE_ENDPOINT, &request, &mut reply, deadline)?;
+        if reply.protocol != protocol::SERVICE || reply.opcode != operation as u16 {
+            return Err(Status::Corrupt);
+        }
+        if reply.words[5] != 0 {
+            let _ = writeln!(
+                output,
+                "service: {} failed status={}",
+                service::NAMES[task],
+                reply.words[5] as i64
+            );
+        } else if operation == service::Operation::List {
+            let state = match reply.words[1] as u16 {
+                service::STOPPED => "stopped",
+                service::STARTING => "starting",
+                service::ONLINE => "online",
+                service::STOPPING => "stopping",
+                service::QUIESCE_FAILED => "quiesce-failed",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                output,
+                "{} {} starts={} exit={} held={}",
+                service::NAMES[task],
+                state,
+                reply.words[2],
+                reply.words[3] as i64,
+                reply.words[4]
+            );
+        } else {
+            let _ = writeln!(output, "service: {} accepted", service::NAMES[task]);
+        }
+    }
+    Ok(())
+}
+
+/// The FNV-1a identifier used by the boot archive's name-based ELF loader.
+pub fn program_id(name: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+pub fn program_name(program: u64) -> Option<&'static str> {
+    [
+        "counter",
+        "spinner",
+        "privprobe",
+        "resourceprobe",
+        "resourcefault",
+        "resourcekill",
+        "badptr",
+        "crossptr",
+        "pageprobe",
+        "mica",
+    ]
+    .into_iter()
+    .find(|name| program_id(name) == program)
+}
+
 pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
     let line = line.trim();
     if line.is_empty() {
         return Ok(Command::Empty);
     }
     let (name, rest) = line
-        .split_once(' ')
+        .split_once(|ch: char| ch.is_ascii_whitespace())
         .map(|(a, b)| (a, b.trim()))
         .unwrap_or((line, ""));
     if name == "fs" {
@@ -102,7 +444,7 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
             return Err(ParseError::MissingArgument);
         }
         let (subcommand, arguments) = rest
-            .split_once(' ')
+            .split_once(|ch: char| ch.is_ascii_whitespace())
             .map(|(a, b)| (a, b.trim()))
             .unwrap_or((rest, ""));
         return parse_filesystem_command(subcommand, arguments);
@@ -119,6 +461,14 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
         "clear" if rest.is_empty() => Ok(Command::Clear),
         "history" if rest.is_empty() => Ok(Command::History),
         "ps" if rest.is_empty() => Ok(Command::Ps),
+        "service" => {
+            parse_service(rest)?;
+            Ok(Command::Service(rest))
+        }
+        "app" => {
+            parse_app(rest)?;
+            Ok(Command::App(rest))
+        }
         "uptime" if rest.is_empty() => Ok(Command::Uptime),
         "date" if rest.is_empty() => Ok(Command::Date),
         "free" | "sysinfo" if rest.is_empty() => Ok(Command::SystemInfo),
@@ -146,11 +496,27 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
         "find" => Ok(Command::Find(optional_path(rest)?)),
         "tree" => Ok(Command::Tree(optional_path(rest)?)),
         "du" => Ok(Command::Du(optional_path(rest)?)),
-        "df" if rest.is_empty() => Ok(Command::Df),
+        "df" => Ok(Command::Df(optional_path(rest)?)),
         "stat" => parse_filesystem_command("stat", rest),
+        "mount" | "umount" | "mkvol" => parse_filesystem_command(name, rest),
+        "volume" => {
+            let (command, arguments) = rest
+                .split_once(|ch: char| ch.is_ascii_whitespace())
+                .unwrap_or((rest, ""));
+            match command {
+                "" | "list" if arguments.trim().is_empty() => Ok(Command::Mounts),
+                "create" => parse_filesystem_command("mkvol", arguments.trim()),
+                "mount" => parse_filesystem_command("mount", arguments.trim()),
+                "unmount" => parse_filesystem_command("umount", arguments.trim()),
+                _ => Err(ParseError::Invalid),
+            }
+        }
+        "chmod" => parse_filesystem_command("chmod", rest),
+        "chown" => parse_filesystem_command("chown", rest),
         "touch" | "create" => parse_filesystem_command("touch", rest),
         "cp" => parse_filesystem_command("cp", rest),
         "write" => parse_filesystem_command("write", rest),
+        "append" => parse_filesystem_command("append", rest),
         "mkdir" => parse_filesystem_command("mkdir", rest),
         "rmdir" => parse_filesystem_command("rmdir", rest),
         "mv" | "rename" => parse_filesystem_command("mv", rest),
@@ -162,6 +528,9 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
         "curl" if !rest.is_empty() => Ok(Command::Curl(rest)),
         "nslookup" => Ok(Command::Nslookup(one_argument(rest)?)),
         "netstat" if rest.is_empty() => Ok(Command::Netstat),
+        "net" => Ok(Command::Network(rest)),
+        "user" => Ok(Command::User(rest)),
+        "whoami" if rest.is_empty() => Ok(Command::User("whoami")),
         "run" if !rest.is_empty() => Ok(Command::Run(rest)),
         "mica" if rest.is_empty() => Ok(Command::MicaRepl),
         "mica" if rest.starts_with("--") => Ok(Command::MicaArgs(rest)),
@@ -197,7 +566,7 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError> {
 fn parse_filesystem_command<'a>(name: &str, rest: &'a str) -> Result<Command<'a>, ParseError> {
     match name {
         "help" if rest.is_empty() => Ok(Command::FsHelp),
-        "ls" | "list" => Ok(Command::Ls(if rest.is_empty() { "." } else { rest })),
+        "ls" | "list" => Ok(Command::Ls(optional_path(rest)?)),
         "cat" | "read" => Ok(Command::Cat(one_argument(rest)?)),
         "head" => parse_head_tail(rest, true),
         "tail" => parse_head_tail(rest, false),
@@ -210,8 +579,48 @@ fn parse_filesystem_command<'a>(name: &str, rest: &'a str) -> Result<Command<'a>
         "find" => Ok(Command::Find(optional_path(rest)?)),
         "tree" => Ok(Command::Tree(optional_path(rest)?)),
         "du" => Ok(Command::Du(optional_path(rest)?)),
-        "df" if rest.is_empty() => Ok(Command::Df),
+        "df" => Ok(Command::Df(optional_path(rest)?)),
         "stat" => Ok(Command::Stat(one_argument(rest)?)),
+        "mount" if rest.is_empty() => Ok(Command::Mounts),
+        "mount" => {
+            let (image, rest) = required_argument(rest)?;
+            let (point, rest) = required_argument(rest)?;
+            let readonly = match rest {
+                "" | "rw" => false,
+                "ro" => true,
+                _ => return Err(ParseError::Invalid),
+            };
+            Ok(Command::Mount {
+                image,
+                point,
+                readonly,
+            })
+        }
+        "umount" => Ok(Command::Unmount(one_argument(rest)?)),
+        "mkvol" => {
+            let (image, mib) = two_arguments(rest)?;
+            let mib = mib.parse::<u32>().map_err(|_| ParseError::Invalid)?;
+            if !(3..=8).contains(&mib) {
+                return Err(ParseError::Invalid);
+            }
+            Ok(Command::VolumeCreate { image, mib })
+        }
+        "chmod" => {
+            let (mode, path) = two_arguments(rest)?;
+            let mode = u32::from_str_radix(mode.strip_prefix("0o").unwrap_or(mode), 8)
+                .map_err(|_| ParseError::Invalid)?;
+            if mode > 0o777 {
+                return Err(ParseError::Invalid);
+            }
+            Ok(Command::Chmod { mode, path })
+        }
+        "chown" => {
+            let (owner, path) = two_arguments(rest)?;
+            let (uid, gid) = owner.split_once(':').ok_or(ParseError::Invalid)?;
+            let uid = uid.parse().map_err(|_| ParseError::Invalid)?;
+            let gid = gid.parse().map_err(|_| ParseError::Invalid)?;
+            Ok(Command::Chown { uid, gid, path })
+        }
         "touch" | "create" => Ok(Command::Touch(one_argument(rest)?)),
         "cp" => {
             let (recursive, arguments) = strip_recursive_flag(rest);
@@ -222,13 +631,21 @@ fn parse_filesystem_command<'a>(name: &str, rest: &'a str) -> Result<Command<'a>
                 recursive,
             })
         }
-        "write" => {
-            let (path, value) = rest.split_once(' ').ok_or(ParseError::MissingArgument)?;
-            if path.is_empty() || value.is_empty() {
-                Err(ParseError::MissingArgument)
-            } else {
-                Ok(Command::Write { path, value })
+        "write" | "append" => {
+            let (path, rest) = required_argument(rest)?;
+            if path.is_empty() || rest.is_empty() {
+                return Err(ParseError::MissingArgument);
             }
+            let value = if rest.starts_with(['\'', '"']) {
+                one_argument(rest)?
+            } else {
+                rest
+            };
+            Ok(if name == "write" {
+                Command::Write { path, value }
+            } else {
+                Command::Append { path, value }
+            })
         }
         "mkdir" => {
             let (parents, path) = strip_flag(rest, "-p");
@@ -260,20 +677,19 @@ fn parse_filesystem_command<'a>(name: &str, rest: &'a str) -> Result<Command<'a>
 }
 
 fn parse_head_tail(rest: &str, head: bool) -> Result<Command<'_>, ParseError> {
-    let mut words = rest.split_whitespace();
-    let first = words.next().ok_or(ParseError::MissingArgument)?;
+    let (first, rest) = required_argument(rest)?;
     let (lines, path) = if first == "-n" {
-        let lines = words
-            .next()
-            .ok_or(ParseError::MissingArgument)?
-            .parse::<usize>()
-            .map_err(|_| ParseError::Invalid)?;
-        let path = words.next().ok_or(ParseError::MissingArgument)?;
+        let (lines, rest) = required_argument(rest)?;
+        let lines = lines.parse::<usize>().map_err(|_| ParseError::Invalid)?;
+        let path = one_argument(rest)?;
         (lines, path)
     } else {
+        if !rest.is_empty() {
+            return Err(ParseError::Invalid);
+        }
         (10, first)
     };
-    if lines == 0 || words.next().is_some() {
+    if lines == 0 {
         return Err(ParseError::Invalid);
     }
     Ok(if head {
@@ -313,9 +729,8 @@ fn strip_recursive_flag(rest: &str) -> (bool, &str) {
 }
 
 fn one_argument(rest: &str) -> Result<&str, ParseError> {
-    let mut arguments = rest.split_whitespace();
-    let argument = arguments.next().ok_or(ParseError::MissingArgument)?;
-    if arguments.next().is_some() {
+    let (argument, rest) = required_argument(rest)?;
+    if !rest.is_empty() {
         Err(ParseError::Invalid)
     } else {
         Ok(argument)
@@ -323,24 +738,53 @@ fn one_argument(rest: &str) -> Result<&str, ParseError> {
 }
 
 fn two_arguments(rest: &str) -> Result<(&str, &str), ParseError> {
-    let mut arguments = rest.split_whitespace();
-    let first = arguments.next().ok_or(ParseError::MissingArgument)?;
-    let second = arguments.next().ok_or(ParseError::MissingArgument)?;
-    if arguments.next().is_some() {
-        Err(ParseError::Invalid)
-    } else {
-        Ok((first, second))
-    }
+    let (first, rest) = required_argument(rest)?;
+    Ok((first, one_argument(rest)?))
 }
 
 fn one_or_two_arguments(rest: &str) -> Result<(&str, Option<&str>), ParseError> {
-    let mut arguments = rest.split_whitespace();
-    let first = arguments.next().ok_or(ParseError::MissingArgument)?;
-    let second = arguments.next();
-    if arguments.next().is_some() {
-        Err(ParseError::Invalid)
+    let (first, rest) = required_argument(rest)?;
+    Ok((
+        first,
+        if rest.is_empty() {
+            None
+        } else {
+            Some(one_argument(rest)?)
+        },
+    ))
+}
+
+fn required_argument(input: &str) -> Result<(&str, &str), ParseError> {
+    let input = input.trim_start();
+    let Some(first) = input.as_bytes().first().copied() else {
+        return Err(ParseError::MissingArgument);
+    };
+    if input.as_bytes().contains(&0) {
+        return Err(ParseError::Invalid);
+    }
+    if first == b'\'' || first == b'"' {
+        let end = input[1..]
+            .find(first as char)
+            .map(|end| end + 1)
+            .ok_or(ParseError::Invalid)?;
+        let rest = &input[end + 1..];
+        if rest
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            return Err(ParseError::Invalid);
+        }
+        Ok((&input[1..end], rest.trim_start()))
     } else {
-        Ok((first, second))
+        let end = input
+            .find(|ch: char| ch.is_ascii_whitespace())
+            .unwrap_or(input.len());
+        let argument = &input[..end];
+        if argument.contains(['\'', '"']) {
+            return Err(ParseError::Invalid);
+        }
+        Ok((argument, input[end..].trim_start()))
     }
 }
 
@@ -405,7 +849,58 @@ fn pop_component(output: &[u8; 256], length: &mut usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, ParseError, parse, resolve_path};
+    use super::{Command, ParseError, parse, parse_service, resolve_path};
+
+    #[test]
+    fn native_install_paths_permissions_and_budgets_have_an_explicit_boundary() {
+        use super::{AppCommand, parse_app};
+        assert_eq!(
+            parse_app("install example v2 '/data/my app.elf' 8 stats"),
+            Ok(AppCommand::Install {
+                name: "example",
+                version: "v2",
+                source: "/data/my app.elf",
+                pages: 8,
+                permissions: 2
+            })
+        );
+        assert_eq!(
+            parse_app("rollback example"),
+            Ok(AppCommand::Rollback("example"))
+        );
+        for command in [
+            "install ../x v1 /data/app.elf",
+            "install x .. /data/app.elf",
+            "install x v1 relative",
+            "install x v1 /data/app.elf 0",
+            "install x v1 /data/app.elf 4097",
+            "install x v1 /data/app.elf 8 admin",
+            "run example extra",
+        ] {
+            assert!(parse_app(command).is_err());
+        }
+    }
+
+    #[test]
+    fn service_management_requires_a_known_service_and_an_explicit_mutation_target() {
+        use microsystem_abi::service::Operation;
+        assert_eq!(parse_service(""), Ok((Operation::List, None)));
+        assert_eq!(parse_service("status mfs"), Ok((Operation::List, Some(3))));
+        assert_eq!(
+            parse_service("restart terminal"),
+            Ok((Operation::Restart, Some(7)))
+        );
+        assert_eq!(parse_service("stop block"), Ok((Operation::Stop, Some(2))));
+        for arguments in [
+            "restart",
+            "stop",
+            "restart all",
+            "status mfs extra",
+            "unknown mfs",
+        ] {
+            assert_eq!(parse_service(arguments), Err(ParseError::Invalid));
+        }
+    }
 
     #[test]
     fn parses_terminal_filesystem_commands_and_arguments() {
@@ -565,14 +1060,126 @@ mod tests {
     }
 
     #[test]
+    fn quoted_file_arguments_work_across_aliases_and_options() {
+        assert_eq!(
+            parse("volume create '/volumes/data image' 4"),
+            Ok(Command::VolumeCreate {
+                image: "/volumes/data image",
+                mib: 4
+            })
+        );
+        assert_eq!(
+            parse("mount '/volumes/data image' /mnt/data ro"),
+            Ok(Command::Mount {
+                image: "/volumes/data image",
+                point: "/mnt/data",
+                readonly: true
+            })
+        );
+        assert_eq!(
+            parse("fs umount /mnt/data"),
+            Ok(Command::Unmount("/mnt/data"))
+        );
+        assert_eq!(parse("volume list"), Ok(Command::Mounts));
+        assert_eq!(parse("df /mnt/a"), Ok(Command::Df("/mnt/a")));
+        assert_eq!(parse("mkvol /volumes/data 9"), Err(ParseError::Invalid));
+        assert_eq!(
+            parse("mount /volumes/data /mnt/data ro extra"),
+            Err(ParseError::Invalid)
+        );
+        assert_eq!(
+            parse("chmod 640 '/data/work notes'"),
+            Ok(Command::Chmod {
+                mode: 0o640,
+                path: "/data/work notes"
+            })
+        );
+        assert_eq!(
+            parse("fs chown 1000:42 '/data/work notes'"),
+            Ok(Command::Chown {
+                uid: 1000,
+                gid: 42,
+                path: "/data/work notes"
+            })
+        );
+        assert_eq!(parse("chmod 888 /data/a"), Err(ParseError::Invalid));
+        assert_eq!(parse("chmod 1000 /data/a"), Err(ParseError::Invalid));
+        assert_eq!(
+            parse("chown 4294967296:0 /data/a"),
+            Err(ParseError::Invalid)
+        );
+        assert_eq!(
+            parse("ls \"/data/work notes\""),
+            Ok(Command::Ls("/data/work notes"))
+        );
+        assert_eq!(
+            parse("fs\tcp\t-r\t'/data/work notes'\t\"/data/backup notes\""),
+            Ok(Command::Copy {
+                source: "/data/work notes",
+                destination: "/data/backup notes",
+                recursive: true,
+            })
+        );
+        assert_eq!(
+            parse("head -n 2 '/data/work notes'"),
+            Ok(Command::Head {
+                path: "/data/work notes",
+                lines: 2
+            })
+        );
+        assert_eq!(
+            parse("grep 'hello world' \"/data/work notes\""),
+            Ok(Command::Grep {
+                pattern: "hello world",
+                path: "/data/work notes"
+            })
+        );
+        assert_eq!(
+            parse("write '/data/work notes' hello world"),
+            Ok(Command::Write {
+                path: "/data/work notes",
+                value: "hello world"
+            })
+        );
+        assert_eq!(
+            parse("fs append '/data/work notes' \" and more\""),
+            Ok(Command::Append {
+                path: "/data/work notes",
+                value: " and more"
+            })
+        );
+        assert_eq!(
+            parse("write '/data/empty file' ''"),
+            Ok(Command::Write {
+                path: "/data/empty file",
+                value: ""
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_quotes_and_extra_arguments_cannot_reach_file_mutations() {
+        for command in [
+            "rm '/data/work notes",
+            "rm /data/work\"notes",
+            "rm '/data/a'junk",
+            "mv '/data/work notes' '/data/new notes' extra",
+            "write '/data/work notes' 'unterminated",
+            "ls /data/a /data/b",
+            "append /data/a 'value' extra",
+            "append /data/a value\0",
+        ] {
+            assert_eq!(parse(command), Err(ParseError::Invalid), "{command}");
+        }
+        assert_eq!(parse("append /data/a"), Err(ParseError::MissingArgument));
+    }
+
+    #[test]
     fn rejects_unsupported_or_malformed_extended_commands() {
         for command in [
             "wget http://example.test",
             "ping example.test",
-            "chmod 755 /data/a",
-            "chown root /data/a",
             "ln /data/a /data/b",
-            "mount /dev/vda /mnt",
             "jobs",
         ] {
             assert_eq!(parse(command), Err(ParseError::Unknown), "{command}");
@@ -580,6 +1187,5 @@ mod tests {
         assert_eq!(parse("head -n nope /data/a"), Err(ParseError::Invalid));
         assert_eq!(parse("head -n 0 /data/a"), Err(ParseError::Invalid));
         assert_eq!(parse("kill 1 -9 extra"), Err(ParseError::Invalid));
-        assert_eq!(parse("df /data"), Err(ParseError::Unknown));
     }
 }

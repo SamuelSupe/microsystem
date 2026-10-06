@@ -56,7 +56,7 @@ The image below is a real GUI frame captured from the repository's QEMU GUI prof
 
 ![MicroSystem desktop captured through the GUI/VNC path](docs/assets/microsystem-vnc.png)
 
-*This PNG is a QMP screendump from an earlier VNC-backed GUI run, not a mockup or a screenshot of the VNC client chrome; it was not captured live during this documentation-only publishing pass.*
+*This PNG is a QMP screendump from an earlier VNC-backed GUI run, not a mockup or a screenshot of the VNC client chrome. Current focused functionality checks are recorded in the runbook.*
 
 ## System architecture
 
@@ -141,16 +141,24 @@ Run the serial shell:
 make run
 ```
 
-The shell filesystem commands use absolute paths. Both short forms and the
+The shell filesystem commands accept absolute paths or paths relative to `cd`.
+Both short forms and the
 explicit `fs` namespace are accepted: `ls/list`, `cat/read`, `stat`,
-`touch/create`, `cp`, `write`, `mkdir`, `rmdir`, `mv/rename`,
+`touch/create`, `cp`, `write`, `append`, `mkdir`, `rmdir`, `mv/rename`,
 `rm/remove/unlink`, `fsync`, and `sync`. File transfers are bounded by
 the 4 KiB filesystem shared frame.
+
+Whole file arguments can use single or double quotes: `write "work notes" "hello"`,
+`append "work notes" " world"`, and `grep "hello world" "work notes"`.
+Quoting does not add escapes, expansion or concatenation. `append` creates a
+missing file and appends in one serialized service request; use `fsync` or `sync`
+for durability. `mv file directory` moves into the directory and refuses to
+overwrite an existing target.
 
 The complete serial shell surface is `help`, `pwd`, `cd`, `echo`, `clear`,
 `history`, `ps`, `kill`, `wait`, `uptime`, `sleep`, `date`, `free`, `sysinfo`,
 the filesystem commands above plus `head`, `tail`, `wc`, `hexdump/xxd`, `grep`,
-`find`, `tree`, `du`, and `df`, network `curl`, `nslookup`, and `netstat`,
+`find`, `tree`, `du`, and `df`, network `curl`, `nslookup`, `netstat`, and `net`,
 program commands `run` and `mica`, and system commands `exit`, `shutdown`,
 `poweroff`, and `reboot`. `fs <command>` exposes the filesystem namespace with
 the same aliases; `head/tail -n N`, `mkdir -p`, `cp -r`, and `rm -r` are bounded
@@ -190,10 +198,51 @@ Responses are limited to 32 KiB; console output must be UTF-8, and `-o` writes
 an absolute MFS path atomically with fsync. Raw TCP/UDP, POST/PUT/PATCH/DELETE,
 and the low-level TLS broker are outside this command's boundary.
 
-The GUI Terminal and serial shell share the filesystem parser, aliases, absolute
-path semantics, and MFS broker behavior. GUI Terminal exposes the filesystem
-subset through its bounded terminal frame; process, network, Mica, and power
-commands remain serial-shell commands.
+The GUI Terminal and serial shell share the filesystem parser, aliases, quoted
+arguments, working-directory path resolution and MFS broker behavior. GUI
+Terminal also provides application `ps`, `kill`/`wait`, system/time/history
+commands, `netstat` and power control through its bounded frame. DNS, curl, SQL
+and Mica execution use the serial shell.
+
+Both shells support `service list`, `service status NAME`, `service stop NAME`
+and `service restart NAME`. Init supervises service recovery with dependency
+ordering and bounded retries. Terminal `sleep`/`wait` run asynchronously and
+can be interrupted with Ctrl+C while desktop input remains active. Native
+process capacity is 16. User heaps and anonymous regions are demand-backed;
+the allocator can grow beyond its initial heap and reclaim large allocations.
+Run the AArch64 service/cancellation gate with `make test-recovery`; it uses an
+isolated disk copy. The full maturity implementation is tracked in
+[the working ledger](.workflow/os-maturity/plan.md).
+
+Accounts, roles, per-user file/process permissions, public-key management,
+SSH host-key rotation and local audit are described in [identity.md](docs/identity.md).
+Use `user list`, `whoami`, `user add alice operator`, `user key-add alice HEX`,
+`user switch alice` and `user audit`. Run its isolated-disk gate with
+`make test-identity`. The serial console is trusted root; remote login is key-only.
+
+Mica GUI applications support four independent windows, a shared UTF-8 clipboard
+and dictionary Pinyin composition (Ctrl+Space). Ctrl+A then Ctrl+C/X/V edits
+text-input selections; Terminal uses Ctrl+Shift+C/V for its current input line.
+Run the repeated multi-window, clipboard and Chinese-input gate with
+`make test-desktop`. See [desktop contracts](docs/gui.md) for limits and the
+editable dictionary.
+
+Install and run an on-disk static ELF:
+
+```text
+app install example v1 /.system/examples/native/counter.elf 64 stats
+app run example
+app update example v2 /.system/examples/native/counter.elf 64 all
+app rollback example
+app info example
+```
+
+Versions carry an ELF checksum and capability policy. `64` allows 64 additional
+anonymous pages above the initial 1 MiB heap; `stats` grants system counters,
+and `all` grants system counters and randomness. The manager supports 16 native
+process slots, checks installed data before launch, and preserves running
+images during updates. `app exec /absolute/program.elf` runs an unregistered
+static image with the default memory budget and no information caps.
 
 Run the GUI profile. The QEMU command prints the VNC/QMP endpoints; the default VNC port is `5900`.
 
@@ -207,23 +256,28 @@ Example Mica programs:
 mica -e 'print(40 + 2)'
 mica --gui --timeout 86400s --allow gui.window /mica/gui-counter.mica
 mica --gui --timeout 86400s --allow gui.window --allow net.browse \
+  --allow fs.write:/data \
   /.system/examples/mica/browser.mica -- https://example.com/
 ```
 
+The Reader follows up to eight HTTP(S) redirects. Clicking Save atomically writes
+the raw response (up to 32,512 bytes) below `/data`; page links remain same-origin.
+
 ## Recorded acceptance evidence
 
-The repository contains the detailed runbook and raw workflow results. Current
+The repository contains the detailed runbook and raw workflow results. Earlier
 evidence records the RISC-V QEMU serial/IOMMU/device gates above, AArch64 build
 and serial shutdown, and the focused x86_64 QEMU acceptance (including
 resident services, Intel VT-d, VirtIO-blk INTx, block/MFS I/O, and shell
 shutdown). It also records `81/81` built-in `make test` host suites and a separate
 shell-parser run of `6/6` (`87/87` combined recorded host checks). The exact
 `make ARCH=aarch64 test`, `make ARCH=riscv64 test`, and `make ARCH=x86_64 test`
-matrices are still `validation in progress`; this documentation pass does not
-rerun them. See
-[`docs/runbook.md`](docs/runbook.md) and
-[`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md)
-for retained provenance and limits.
+matrices have not all passed for the current functionality changes. The latest
+AArch64 matrix passed host suites and serial smoke, then failed at power-cut
+persistence; mounted-volume restart recovery also remains unresolved. Focused
+checks and remaining qualification are recorded in [`docs/runbook.md`](docs/runbook.md).
+Older matrix evidence remains in
+[`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md).
 
 ## Repository map
 

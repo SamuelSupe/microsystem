@@ -21,13 +21,25 @@ fn run() -> Result<(), String> {
         Some("mkfs") if args.len() == 4 => {
             let mib: u64 = args[3].parse().map_err(|_| "invalid MiB size")?;
             let device = FileDevice::create(&args[2], mib)?;
-            let fs = format(device).map_err(display)?;
+            let mut fs = format(device).map_err(display)?;
+            fs.set_timestamp(unix_time()?);
+            let mut attributes = fs.attributes("/").map_err(display)?;
+            attributes.created = unix_time()?;
+            attributes.modified = attributes.created;
+            attributes.accessed = attributes.created;
+            fs.set_attributes("/", attributes).map_err(display)?;
+            fs.sync().map_err(display)?;
             println!("formatted {} blocks generation={}", fs.stats().total_blocks, fs.stats().generation);
             Ok(())
         }
-        Some("put") if args.len() == 5 => {
+        Some("put" | "seed") if args.len() == 5 => {
             let data = fs::read(&args[3]).map_err(|e| e.to_string())?;
             let mut fs = FileSystem::mount(FileDevice::open(&args[2])?).map_err(display)?;
+            if args[1] == "seed" && fs.read(&args[4]).is_ok_and(|existing| existing == data) {
+                println!("unchanged {}", args[4]);
+                return Ok(());
+            }
+            fs.set_timestamp(unix_time()?);
             fs.put(&args[4], &data).map_err(display)?;
             fs.fsync(&args[4]).map_err(display)?;
             println!("wrote {} bytes to {}", data.len(), args[4]);
@@ -35,6 +47,7 @@ fn run() -> Result<(), String> {
         }
         Some("mkdir") if args.len() == 4 => {
             let mut fs = FileSystem::mount(FileDevice::open(&args[2])?).map_err(display)?;
+            fs.set_timestamp(unix_time()?);
             match fs.mkdir(&args[3]) {
                 Ok(()) | Err(Error::AlreadyExists) => {}
                 Err(error) => return Err(display(error)),
@@ -85,12 +98,25 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        _ => Err("usage: mfsctl <mkfs IMAGE MIB|mkdir IMAGE PATH|put IMAGE SOURCE DEST|ls IMAGE [PATH]|inspect IMAGE|fsck IMAGE|repair IMAGE>".into()),
+        Some("gc") if args.len() == 3 => {
+            let mut fs = FileSystem::mount(FileDevice::open(&args[2])?).map_err(display)?;
+            fs.gc().map_err(display)?;
+            println!("compacted generation={} used_blocks={}", fs.stats().generation, fs.stats().used_blocks);
+            Ok(())
+        }
+        _ => Err("usage: mfsctl <mkfs IMAGE MIB|mkdir IMAGE PATH|put IMAGE SOURCE DEST|seed IMAGE SOURCE DEST|gc IMAGE|ls IMAGE [PATH]|inspect IMAGE|fsck IMAGE|repair IMAGE>".into()),
     }
 }
 
 fn display(error: Error) -> String {
     error.to_string()
+}
+
+fn unix_time() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| error.to_string())
 }
 
 struct FileDevice {

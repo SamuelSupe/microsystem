@@ -581,6 +581,7 @@ name = "microsystem-db"
 version = "0.1.0"
 dependencies = [
  "microsystem-abi",
+ "microsystem-identity",
  "microsystem-sql",
  "microsystem-user-rt",
 ]
@@ -609,11 +610,19 @@ dependencies = [
  "mfs1",
  "microsystem-abi",
  "microsystem-block",
+ "microsystem-identity",
  "microsystem-user-rt",
 ]
 
 [[package]]
 name = "microsystem-gui"
+version = "0.1.0"
+dependencies = [
+ "microsystem-abi",
+]
+
+[[package]]
+name = "microsystem-identity"
 version = "0.1.0"
 dependencies = [
  "microsystem-abi",
@@ -632,7 +641,11 @@ version = "0.1.0"
 dependencies = [
  "microsystem-abi",
  "microsystem-block",
+ "microsystem-identity",
+ "microsystem-kernel",
+ "microsystem-shell",
  "microsystem-user-rt",
+ "sha2",
 ]
 
 [[package]]
@@ -641,6 +654,14 @@ version = "0.1.0"
 dependencies = [
  "fdt",
  "microsystem-abi",
+]
+
+[[package]]
+name = "microsystem-memoryprobe"
+version = "0.1.0"
+dependencies = [
+ "microsystem-abi",
+ "microsystem-user-rt",
 ]
 
 [[package]]
@@ -681,6 +702,7 @@ name = "microsystem-netd"
 version = "0.1.0"
 dependencies = [
  "microsystem-abi",
+ "microsystem-identity",
  "microsystem-user-rt",
  "smoltcp",
 ]
@@ -689,6 +711,7 @@ dependencies = [
 name = "microsystem-pageprobe"
 version = "0.1.0"
 dependencies = [
+ "microsystem-abi",
  "microsystem-user-rt",
 ]
 
@@ -696,6 +719,7 @@ dependencies = [
 name = "microsystem-privprobe"
 version = "0.1.0"
 dependencies = [
+ "microsystem-abi",
  "microsystem-user-rt",
 ]
 
@@ -750,6 +774,7 @@ version = "0.1.0"
 dependencies = [
  "embedded-io-async 0.6.1",
  "microsystem-abi",
+ "microsystem-identity",
  "microsystem-mica",
  "microsystem-shell",
  "microsystem-user-rt",
@@ -763,6 +788,7 @@ version = "0.1.0"
 dependencies = [
  "microsystem-abi",
  "microsystem-fs",
+ "microsystem-identity",
  "microsystem-shell",
  "microsystem-user-rt",
 ]

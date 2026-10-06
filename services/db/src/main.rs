@@ -21,8 +21,7 @@ const DATABASE_TEMP_PATH: &str = "/.system/db/main.db.tmp";
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let _ = microsystem_user_rt::debug_write(b"[user] db service ELF entered EL0\n");
-    let (mut database_state, startup_error) =
-        match ensure_storage().and_then(|_| load_database()) {
+    let (mut database_state, startup_error) = match ensure_storage().and_then(|_| load_database()) {
         Ok(database) => {
             let _ = microsystem_user_rt::debug_write(
                 b"[user] msql snapshot loaded path=/.system/db/main.db\n",
@@ -50,18 +49,13 @@ pub extern "C" fn _start() -> ! {
     };
     let _ = microsystem_user_rt::service_online();
     let mut request = Message::new(protocol::DATABASE, 0);
+    let _ = microsystem_user_rt::debug_write(b"[ipc] resident db endpoint=26 ready\n");
     if microsystem_user_rt::ipc_recv(boot_cap::DATABASE_ENDPOINT, &mut request, 0).is_err() {
         microsystem_user_rt::exit(4);
     }
-    let _ = microsystem_user_rt::debug_write(b"[ipc] resident db endpoint=26 ready\n");
     loop {
         let mut reply = Message::new(protocol::DATABASE, request.opcode);
-        let status = handle_request(
-            &mut database_state,
-            startup_error,
-            &request,
-            &mut reply,
-        );
+        let status = handle_request(&mut database_state, startup_error, &request, &mut reply);
         reply.words[5] = status as i64 as u64;
         if microsystem_user_rt::ipc_reply_recv(boot_cap::DATABASE_ENDPOINT, &reply, &mut request, 0)
             .is_err()
@@ -85,6 +79,19 @@ fn handle_request(
     match request.opcode {
         value if value == database::Operation::Ping as u16 => write_command_response(reply, 0),
         value if value == database::Operation::Execute as u16 => {
+            let actor = unsafe {
+                microsystem_identity::read_shared(microsystem_abi::identity::SNAPSHOT_VA)
+            }
+            .and_then(|state| {
+                state.actor(
+                    microsystem_user_rt::ipc_peer()? as u32,
+                    request.words[3],
+                    microsystem_user_rt::clock_now()?,
+                )
+            });
+            if !actor.is_ok_and(|actor| actor.administrator()) {
+                return write_status_error(reply, Status::AccessDenied);
+            }
             if let Some(status) = startup_error {
                 return write_status_error(reply, status);
             }
@@ -97,6 +104,11 @@ fn handle_request(
                 Ok(sql) => sql,
                 Err(_) => return write_error_response(reply, SqlError::InvalidLiteral),
             };
+            match database_state.execute_query(sql) {
+                Ok(execution) => return write_execution_response(reply, &execution),
+                Err(SqlError::Unsupported) => {}
+                Err(error) => return write_error_response(reply, error),
+            }
             let mut candidate = database_state.clone();
             let execution = match candidate.execute(sql) {
                 Ok(execution) => execution,
@@ -158,9 +170,8 @@ fn load_database() -> Result<Database, Status> {
         if chunk_length == 0 || chunk_length > SHARED_BYTES || chunk_length > length - offset {
             return Err(Status::Corrupt);
         }
-        let chunk = unsafe {
-            core::slice::from_raw_parts(FILESYSTEM_DATA as *const u8, chunk_length)
-        };
+        let chunk =
+            unsafe { core::slice::from_raw_parts(FILESYSTEM_DATA as *const u8, chunk_length) };
         snapshot.extend_from_slice(chunk);
         offset += chunk_length;
     }

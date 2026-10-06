@@ -7,6 +7,7 @@ rust-version.workspace = true
 build = "../user-build.rs"
 
 [dependencies]
+microsystem-abi = { path = "../../crates/abi" }
 microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
 
 [features]

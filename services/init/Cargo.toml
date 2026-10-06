@@ -7,7 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 microsystem-abi = { path = "../../crates/abi" }
+microsystem-identity = { path = "../../crates/identity" }
 microsystem-block = { path = "../block" }
+microsystem-shell = { path = "../shell" }
+microsystem-kernel = { path = "../../crates/kernel" }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
 
 [features]

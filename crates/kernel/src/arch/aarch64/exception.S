@@ -229,6 +229,8 @@ load_fp_simd_context:
 
 .global enter_user_demo
 enter_user_demo:
+    // ELR/SPSR are also written by IRQ entry. Keep this transition atomic.
+    msr daifset, #0xf
     save_kernel_callee
     bl reset_fp_simd_registers
     mov x9, #0x00600000
@@ -240,6 +242,7 @@ enter_user_demo:
 
 .global enter_user_fault_demo
 enter_user_fault_demo:
+    msr daifset, #0xf
     save_kernel_callee
     bl reset_fp_simd_registers
     mov x9, #0x00600000
@@ -252,6 +255,7 @@ enter_user_fault_demo:
 
 .global enter_user_smp_demo
 enter_user_smp_demo:
+    msr daifset, #0xf
     save_kernel_callee
     bl reset_fp_simd_registers
     mov x9, #0x00600000
@@ -264,6 +268,7 @@ enter_user_smp_demo:
 
 .global enter_user_rr
 enter_user_rr:
+    msr daifset, #0xf
     save_kernel_callee
     bl reset_fp_simd_registers
     mov x9, #0x00600000
@@ -281,6 +286,7 @@ enter_user_rr:
 
 .global enter_user_service
 enter_user_service:
+    msr daifset, #0xf
     save_kernel_callee
     bl reset_fp_simd_registers
     mov x9, #0x00800000

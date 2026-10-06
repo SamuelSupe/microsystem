@@ -1,5 +1,46 @@
 use microsystem_abi::{Message, Status};
 
+/// One asynchronous call per task. A completed reply remains owned by the
+/// caller until acknowledged; a second call cannot overwrite it.
+#[derive(Clone, Copy)]
+pub enum ReplySlot {
+    Idle,
+    Pending(u32),
+    Ready(Message),
+    Failed(Status),
+}
+
+impl ReplySlot {
+    pub fn begin(&mut self, server: u32) -> Result<(), Status> {
+        if !matches!(self, Self::Idle) {
+            return Err(Status::Busy);
+        }
+        *self = Self::Pending(server);
+        Ok(())
+    }
+
+    pub fn waiting_for(&self, server: u32) -> bool {
+        matches!(self, Self::Pending(expected) if *expected == server)
+    }
+
+    pub fn complete(&mut self, server: u32, reply: Message) -> Result<(), Status> {
+        if !self.waiting_for(server) {
+            return Err(Status::AccessDenied);
+        }
+        *self = Self::Ready(reply);
+        Ok(())
+    }
+
+    pub fn result(&self) -> Result<Message, Status> {
+        match self {
+            Self::Idle => Err(Status::NotFound),
+            Self::Pending(_) => Err(Status::Busy),
+            Self::Ready(message) => Ok(*message),
+            Self::Failed(status) => Err(*status),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Envelope {
     pub sender: u32,

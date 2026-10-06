@@ -2,7 +2,9 @@
 
 use microsystem_abi::{Status, gui};
 
-pub const MAX_WINDOWS: usize = 11;
+pub mod composition;
+
+pub const MAX_WINDOWS: usize = 3 + gui::MAX_DYNAMIC_CLIENTS * gui::MAX_CLIENT_WINDOWS;
 pub const TITLE_BYTES: usize = 64;
 pub const TITLE_BAR_HEIGHT: i32 = 28;
 pub const TASKBAR_HEIGHT: i32 = 36;

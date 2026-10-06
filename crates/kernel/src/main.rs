@@ -5,11 +5,14 @@ mod arch;
 mod bootfs;
 mod device_control;
 mod dtb;
+#[cfg(target_arch = "x86_64")]
+mod x86_firmware;
 mod gpu;
 mod input;
 mod kernel_heap;
 mod net;
 mod pci;
+mod pci_bridges;
 mod physical_memory;
 mod random;
 #[cfg(target_arch = "riscv64")]
@@ -148,7 +151,7 @@ extern "C" fn kernel_main(dtb_physical: usize) -> ! {
         hppir
     );
 
-    match physical_memory::initialize(platform.ram_base as u64, platform.ram_bytes as u64) {
+    match physical_memory::initialize(&platform) {
         Ok(layout) => {
             kprintln!(
                 "[mm] kernel heap ready base={:#x} bytes={:#x}",
@@ -364,11 +367,19 @@ extern "C" fn rust_lower_sync(
     far: u64,
 ) -> u64 {
     if !arch::is_syscall(esr) {
-        if let Some((action, pid)) =
-            service_runtime::handle_application_exit(frame, microsystem_abi::Status::Fault as i64)
-        {
+        let fault_status = match service_runtime::handle_page_fault(frame, esr, far) {
+            Some(Ok(())) => return 0,
+            Some(Err(status)) => status,
+            None => microsystem_abi::Status::Fault,
+        };
+        if let Some((action, pid)) = service_runtime::handle_task_exit(frame, fault_status as i64) {
             kprintln!(
-                "[proc] application fault ESR={:#x} FAR={:#x}; pid={} terminated",
+                "[proc] {} fault ESR={:#x} FAR={:#x}; pid={} terminated",
+                if pid < microsystem_abi::process::FIRST_APPLICATION_PID {
+                    "service"
+                } else {
+                    "application"
+                },
                 esr,
                 far,
                 pid
@@ -407,6 +418,9 @@ extern "C" fn rust_lower_sync(
         return 1;
     }
     let syscall = arch::selected::preempt::syscall_number(frame);
+    if let Some(action) = service_runtime::handle_virtual_memory(frame, syscall) {
+        return action;
+    }
     if let Some(action) = arch::selected::preempt::handle_ipc(frame, syscall) {
         return action;
     }
@@ -437,6 +451,10 @@ extern "C" fn rust_lower_sync(
     if let Some(action) = service_runtime::handle_network(frame, syscall) {
         return action;
     }
+    if syscall == 45 {
+        frame.registers[0] = service_runtime::ipc_peer().map(|pid| pid as i64).unwrap_or_else(|status| status as i64) as u64;
+        return 0;
+    }
     if let Some(action) = service_runtime::handle_frame_mapping(frame, syscall) {
         return action;
     }
@@ -456,8 +474,7 @@ extern "C" fn rust_lower_sync(
             0
         }
         1 => {
-            if let Some((action, _)) = service_runtime::handle_application_exit(frame, arg0 as i64)
-            {
+            if let Some((action, _)) = service_runtime::handle_task_exit(frame, arg0 as i64) {
                 return action;
             }
             if let Some((service, success)) = service_runtime::exit_disposition(arg0) {
@@ -503,9 +520,30 @@ extern "C" fn rust_lower_sync(
             };
             0
         }
+        42 => {
+            frame.registers[0] = service_runtime::start_native(
+                arg0,
+                arg1,
+                frame.registers[2],
+                frame.registers[3],
+                frame.registers[4],
+            )
+            .unwrap_or_else(|status| status as i64 as u64);
+            0
+        }
         31 => {
             frame.registers[0] = service_runtime::clock_realtime()
                 .map_or_else(|status| status as i64 as u64, |seconds| seconds);
+            0
+        }
+        35 => {
+            frame.registers[0] = service_runtime::write_service_status(arg0, arg1)
+                .map_or_else(|status| status as i64 as u64, |()| 0);
+            0
+        }
+        36 => {
+            frame.registers[0] = service_runtime::stop_service(arg0, arg1 as i64)
+                .map_or_else(|status| status as i64 as u64, |()| 0);
             0
         }
         20 => {
@@ -524,6 +562,11 @@ extern "C" fn rust_lower_sync(
             0
         }
         19 => {
+            let console_bytes = frame.registers[2] == 3;
+            if console_bytes && !service_runtime::current_task_owns_console() {
+                frame.registers[0] = microsystem_abi::Status::AccessDenied as i64 as u64;
+                return 0;
+            }
             if arg1 == 0 && frame.registers[2] == 1 {
                 service_runtime::mark_current_online();
                 frame.registers[0] = 0;
@@ -567,6 +610,11 @@ extern "C" fn rust_lower_sync(
                 unsafe { core::slice::from_raw_parts(arg0 as *const u8, length) }
             };
             service_runtime::mark_current_ready();
+            if console_bytes {
+                uart::write_bytes(bytes);
+                frame.registers[0] = 0;
+                return 0;
+            }
             if let Ok(text) = core::str::from_utf8(bytes) {
                 kprint!("{}", text);
                 frame.registers[0] = 0;

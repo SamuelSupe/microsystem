@@ -2,7 +2,6 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::preempt::ExceptionFrame;
 
-const LOCAL_APIC_PHYSICAL: u64 = 0xfee0_0000;
 const TIMER_VECTOR: u8 = 0x20;
 const RESCHEDULE_VECTOR: u8 = 0xf1;
 const DEVICE_VECTOR: u8 = 0x31;
@@ -15,6 +14,7 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(1_000_000_000);
 static DEVICE_IRQ: AtomicU32 = AtomicU32::new(0);
 
 pub fn init_interrupts(_base: usize, _aux: usize, _boot_cpu: bool) -> Result<u64, ()> {
+    if _base == 0 { return Err(()); }
     let frequency = tsc_frequency();
     TSC_HZ.store(frequency, Ordering::Release);
     unsafe {
@@ -92,8 +92,9 @@ pub fn send_reschedule(cpu: usize) {
     if cpu >= 2 || cpu == super::cpu_id() {
         return;
     }
+    let Some(target) = super::cpu_apic_id(cpu) else { return; };
     unsafe {
-        write_apic(0x310, (cpu as u32) << 24);
+        write_apic(0x310, target << 24);
         write_apic(0x300, RESCHEDULE_VECTOR as u32 | (1 << 14));
     }
 }
@@ -134,7 +135,7 @@ fn tsc_frequency() -> u64 {
 unsafe fn read_apic(offset: usize) -> u32 {
     unsafe {
         core::ptr::read_volatile(
-            (crate::arch::phys_to_virt(LOCAL_APIC_PHYSICAL) + offset) as *const u32,
+            (crate::arch::phys_to_virt(super::local_apic_base()) + offset) as *const u32,
         )
     }
 }
@@ -142,7 +143,7 @@ unsafe fn read_apic(offset: usize) -> u32 {
 unsafe fn write_apic(offset: usize, value: u32) {
     unsafe {
         core::ptr::write_volatile(
-            (crate::arch::phys_to_virt(LOCAL_APIC_PHYSICAL) + offset) as *mut u32,
+            (crate::arch::phys_to_virt(super::local_apic_base()) + offset) as *mut u32,
             value,
         )
     }

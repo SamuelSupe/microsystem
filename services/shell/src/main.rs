@@ -13,7 +13,7 @@ use microsystem_abi::{
 };
 use microsystem_console::{INLINE_BYTES, Operation as ConsoleOperation};
 use microsystem_fs::Operation as FsOperation;
-use microsystem_shell::{Command, parse, resolve_path};
+use microsystem_shell::{Command, parse, program_id, program_name, resolve_path};
 
 const SHARED_DATA: usize = 0x005e_0000;
 const SHARED_BYTES: usize = 4096;
@@ -23,6 +23,20 @@ const HISTORY_COMMAND_BYTES: usize = 256;
 struct ShellState {
     cwd: String,
     history: Vec<String>,
+}
+
+struct ConsoleWriter;
+impl Write for ConsoleWriter {
+    fn write_fmt(&mut self, arguments: fmt::Arguments<'_>) -> fmt::Result {
+        output(arguments);
+        Ok(())
+    }
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if microsystem_user_rt::debug_write(text.as_bytes()).is_err() {
+            console_write(text.as_bytes());
+        }
+        Ok(())
+    }
 }
 
 impl ShellState {
@@ -61,24 +75,41 @@ pub extern "C" fn _start() -> ! {
     let _ = microsystem_user_rt::debug_write(b"[user] shell service ELF entered EL0\n");
     let request = Message::new(protocol::FILESYSTEM, FsOperation::Stat as u16);
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
-    if microsystem_user_rt::ipc_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0)
-        .is_err()
+    let deadline = microsystem_user_rt::clock_now()
+        .unwrap_or(1)
+        .saturating_add(30_000_000_000);
+    if microsystem_user_rt::ipc_call(
+        boot_cap::FILESYSTEM_ENDPOINT,
+        &request,
+        &mut reply,
+        deadline,
+    )
+    .is_err()
         || reply.protocol != protocol::FILESYSTEM
         || reply.words[0] != 0x4d46_5331
     {
-        microsystem_user_rt::exit(2);
+        let _ = microsystem_user_rt::debug_write(
+            b"[service] shell degraded filesystem-unavailable=true\n",
+        );
+    } else {
+        let _ = microsystem_user_rt::debug_write(b"[ipc] resident shell->mfs magic=MFS1\n");
+        if verify_filesystem_protocol().is_ok() {
+            let _ = microsystem_user_rt::debug_write(
+                b"[ipc] filesystem open/read/write/fsync/sync/stat/readdir/mkdir/rename/unlink protocol=true\n",
+            );
+        } else {
+            let _ = microsystem_user_rt::debug_write(
+                b"[service] shell degraded filesystem-probe-failed=true\n",
+            );
+        }
     }
-    let _ = microsystem_user_rt::debug_write(b"[ipc] resident shell->mfs magic=MFS1\n");
-    if verify_filesystem_protocol().is_err() {
-        microsystem_user_rt::exit(6);
+    if verify_database_protocol().is_ok() {
+        let _ = microsystem_user_rt::debug_write(b"[ipc] resident shell->db ping=true\n");
+    } else {
+        let _ = microsystem_user_rt::debug_write(
+            b"[service] shell degraded database-unavailable=true\n",
+        );
     }
-    let _ = microsystem_user_rt::debug_write(
-        b"[ipc] filesystem open/read/write/fsync/sync/stat/readdir/mkdir/rename/unlink protocol=true\n",
-    );
-    if verify_database_protocol().is_err() {
-        microsystem_user_rt::exit(10);
-    }
-    let _ = microsystem_user_rt::debug_write(b"[ipc] resident shell->db ping=true\n");
     if verify_time_protocol().is_err() {
         microsystem_user_rt::exit(7);
     }
@@ -134,10 +165,10 @@ fn execute(line: &str, state: &mut ShellState) {
         Ok(Command::Empty) => {}
         Ok(Command::Help) => console_write(
             b"shell: help pwd cd echo clear history ps kill wait uptime sleep date free sysinfo\n\
-files: ls cat head tail wc hexdump xxd grep find tree du df stat touch cp write\n\
-       mkdir rmdir mv rm fsync sync (also available through fs <command>)\n\
+files: ls cat head tail wc hexdump xxd grep find tree du df stat chmod chown touch cp write append\n\
+       mkdir rmdir mv rm fsync sync mount umount mkvol volume (also available through fs <command>)\n\
 database: sql <CREATE|DROP|INSERT|SELECT|UPDATE|DELETE statement>\n\
-network: curl nslookup netstat\nprograms: run mica\nsystem: exit shutdown poweroff reboot\n\
+network: curl nslookup netstat net [status|config|dhcp|static|default|reset]\nprograms: run mica app [list|info|install|update|rollback|run|exec]\nuser [list|whoami|add|role|enable|disable|keys|key-add|key-remove|switch|logout|audit|host-key]\nstorage: volume [list|create IMAGE MIB|mount IMAGE POINT [ro]|unmount POINT]\nsystem: service [list|status|restart|stop] [NAME], exit shutdown poweroff reboot\n\
 options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n",
         ),
         Ok(Command::Pwd) => output(format_args!("{}\n", state.cwd)),
@@ -194,6 +225,21 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
                     ));
                 }
                 cursor = reply.words[3];
+            }
+        }
+        Ok(Command::Service(arguments)) => {
+            if let Err(status) = microsystem_shell::service_command(arguments, &mut ConsoleWriter) {
+                output(format_args!("service: failed status={}\n", status as i64));
+            }
+        }
+        Ok(Command::User(arguments)) => {
+            if let Err(status) = microsystem_shell::identity_command(arguments, boot_cap::SHARED_FILESYSTEM_FRAME, SHARED_DATA, &mut ConsoleWriter) {
+                output(format_args!("user: failed status={}\n", status as i64));
+            }
+        }
+        Ok(Command::App(arguments)) => {
+            if let Err(status) = microsystem_shell::app_command(arguments, boot_cap::SHARED_FILESYSTEM_FRAME, SHARED_DATA, &mut ConsoleWriter) {
+                output(format_args!("app: failed status={}\n", status as i64));
             }
         }
         Ok(Command::Uptime) => {
@@ -255,7 +301,27 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
                 fs_du(&path);
             }
         }
-        Ok(Command::Df) => fs_df(),
+        Ok(Command::Df(path)) => { if let Some(path) = resolve_command_path(state, "df", path) { fs_df(&path); } }
+        Ok(Command::Mounts) => match fs_request(FsOperation::MountList, "/", &[], 0) {
+            Ok(reply) => {
+                let bytes = unsafe { core::slice::from_raw_parts(SHARED_DATA as *const u8, reply.words[0] as usize) };
+                console_write(bytes);
+            }
+            Err(status) => output(format_args!("volume: list failed status={status:?}\n")),
+        },
+        Ok(Command::VolumeCreate { image, mib }) => {
+            if let Some(image) = resolve_command_path(state, "mkvol", image) {
+                fs_volume_operation(FsOperation::FormatImage, &image, &[], mib as u64);
+            }
+        }
+        Ok(Command::Mount { image, point, readonly }) => {
+            if let (Some(image), Some(point)) = (resolve_command_path(state, "mount", image), resolve_command_path(state, "mount", point)) {
+                fs_volume_operation(FsOperation::MountImage, &image, point.as_bytes(), readonly as u64);
+            }
+        }
+        Ok(Command::Unmount(point)) => {
+            if let Some(point) = resolve_command_path(state, "umount", point) { fs_volume_operation(FsOperation::Unmount, &point, &[], 0); }
+        }
         Ok(Command::Stat(path)) => {
             let Some(path) = resolve_command_path(state, "stat", path) else {
                 return;
@@ -263,11 +329,27 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
             match fs_request(FsOperation::Stat, &path, &[], 0) {
                 Ok(reply) if reply.words[0] == 1 => {
                     output(format_args!("file {} bytes\n", reply.words[1]));
+                    print_attributes(&reply);
                 }
                 Ok(reply) if reply.words[0] == 2 => {
                     output(format_args!("directory {} entries\n", reply.words[1]));
+                    print_attributes(&reply);
                 }
                 _ => console_write(b"stat: failed\n"),
+            }
+        }
+        Ok(Command::Chmod { mode, path }) => {
+            let Some(path) = resolve_command_path(state, "chmod", path) else { return; };
+            match fs_request(FsOperation::Chmod, &path, &[], mode as u64) {
+                Ok(_) => console_write(b"chmod: ok\n"),
+                Err(_) => console_write(b"chmod: failed\n"),
+            }
+        }
+        Ok(Command::Chown { uid, gid, path }) => {
+            let Some(path) = resolve_command_path(state, "chown", path) else { return; };
+            match fs_request(FsOperation::Chown, &path, &[], uid as u64 | ((gid as u64) << 32)) {
+                Ok(_) => console_write(b"chown: ok\n"),
+                Err(_) => console_write(b"chown: failed\n"),
             }
         }
         Ok(Command::Touch(path)) => {
@@ -310,6 +392,16 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
                 console_write(b"write: failed\n");
             }
         }
+        Ok(Command::Append { path, value }) => {
+            let Some(path) = resolve_command_path(state, "append", path) else {
+                return;
+            };
+            if fs_call(FsOperation::Append, &path, value.as_bytes()).is_ok() {
+                console_write(b"append: ok\n");
+            } else {
+                console_write(b"append: failed\n");
+            }
+        }
         Ok(Command::Mkdir { path, parents }) => {
             let Some(path) = resolve_command_path(state, "mkdir", path) else {
                 return;
@@ -345,7 +437,10 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
             let Some(destination) = resolve_command_path(state, "mv", destination) else {
                 return;
             };
-            if fs_call(FsOperation::Rename, &source, destination.as_bytes()).is_ok() {
+            if copy_target(&source, &destination)
+                .and_then(|target| fs_call(FsOperation::Rename, &source, target.as_bytes()))
+                .is_ok()
+            {
                 console_write(b"mv: ok\n");
             } else {
                 console_write(b"mv: failed\n");
@@ -373,13 +468,16 @@ options: head/tail -n N, mkdir -p, cp -r, rm -r, curl [-s] [-i] [-o PATH] URL\n"
         }
         Ok(Command::FsHelp) => console_write(
             b"fs: ls/list [path], cat/read <path>, head/tail [-n N] <path>, wc/hexdump/grep,\n\
-find/tree/du/df, stat, touch/create, cp [-r], write, mkdir [-p], rmdir,\n\
-mv/rename, rm/remove/unlink [-r], fsync, sync\n",
+find/tree/du/df, stat, chmod MODE PATH, chown UID:GID PATH, touch/create, cp [-r], write/append, mkdir [-p], rmdir,\n\
+mv/rename, rm/remove/unlink [-r], fsync, sync, mount IMAGE POINT [ro], umount POINT, mkvol IMAGE MIB\n",
         ),
         Ok(Command::Sql(statement)) => run_sql(statement),
         Ok(Command::Curl(arguments)) => run_curl(arguments, state),
         Ok(Command::Nslookup(host)) => run_nslookup(host),
         Ok(Command::Netstat) => run_netstat(),
+        Ok(Command::Network(arguments)) => {
+            if let Err(status) = microsystem_shell::network_command(arguments, boot_cap::SHARED_FILESYSTEM_FRAME, SHARED_DATA, &mut ConsoleWriter) { output(format_args!("net: {status:?}\n")); }
+        }
         Ok(Command::Run(path)) => {
             let mut request = Message::new(protocol::PROCESS, process::Operation::Spawn as u16);
             request.words[0] = program_id(path);
@@ -1464,33 +1562,11 @@ fn report_completion(program: &str, pid: u64, reply: &Message) {
     output_loader(program, pid);
 }
 
-fn program_id(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
-}
-
 fn output_loader(program: &str, pid: u64) {
     output(format_args!(
         "[proc] bootfs name-based loader program={} pid={} static-elf=true\n",
         program, pid
     ));
-}
-
-fn program_name(program: u64) -> Option<&'static str> {
-    [
-        "counter",
-        "spinner",
-        "privprobe",
-        "resourceprobe",
-        "resourcefault",
-        "resourcekill",
-    ]
-    .into_iter()
-    .find(|name| program_id(name) == program)
 }
 
 fn time_request(operation: time::Operation, argument: u64) -> Result<u64, Status> {
@@ -1525,7 +1601,8 @@ fn db_call(operation: database::Operation, sql: &str) -> Result<Message, Status>
     request.words[0] = sql.len() as u64;
     request.caps[0] = boot_cap::SHARED_FILESYSTEM_FRAME;
     let mut reply = Message::new(protocol::DATABASE, 0);
-    microsystem_user_rt::ipc_call(boot_cap::DATABASE_ENDPOINT, &request, &mut reply, 0)?;
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(5_000_000_000);
+    microsystem_user_rt::ipc_call(boot_cap::DATABASE_ENDPOINT, &request, &mut reply, deadline)?;
     if reply.protocol != protocol::DATABASE {
         return Err(Status::Io);
     }
@@ -2180,8 +2257,8 @@ fn fs_usage(path: &str, depth: usize) -> Result<u64, Status> {
     Ok(bytes)
 }
 
-fn fs_df() {
-    let Ok(reply) = fs_request(FsOperation::Stats, "/", &[], 0) else {
+fn fs_df(path: &str) {
+    let Ok(reply) = fs_request(FsOperation::Stats, path, &[], 0) else {
         console_write(b"df: unavailable\n");
         return;
     };
@@ -2292,6 +2369,23 @@ fn fs_call(operation: FsOperation, path: &str, data: &[u8]) -> Result<usize, Sta
     Ok(reply.words[0] as usize)
 }
 
+fn print_attributes(reply: &Message) {
+    output(format_args!(
+        "mode={:03o} uid={} gid={} modified={}\n",
+        reply.words[2],
+        reply.words[3] as u32,
+        reply.words[3] >> 32,
+        reply.words[4]
+    ));
+}
+
+fn fs_volume_operation(operation: FsOperation, path: &str, data: &[u8], word: u64) {
+    match fs_request(operation, path, data, word) {
+        Ok(_) => console_write(b"volume: ok\n"),
+        Err(status) => output(format_args!("volume: failed status={status:?}\n")),
+    }
+}
+
 fn fs_request(
     operation: FsOperation,
     path: &str,
@@ -2319,14 +2413,29 @@ fn fs_request(
     request.words[2] = descriptor;
     request.caps[0] = boot_cap::SHARED_FILESYSTEM_FRAME;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
-    microsystem_user_rt::ipc_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0)?;
+    let timeout = if operation == FsOperation::FormatImage {
+        120_000_000_000
+    } else {
+        5_000_000_000
+    };
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(timeout);
+    microsystem_user_rt::ipc_call(
+        boot_cap::FILESYSTEM_ENDPOINT,
+        &request,
+        &mut reply,
+        deadline,
+    )?;
     if reply.protocol != protocol::FILESYSTEM {
         return Err(Status::Io);
     }
     let status = status_from_raw(reply.words[5] as i64);
     let returns_shared_bytes = matches!(
         operation,
-        FsOperation::List | FsOperation::Read | FsOperation::ReadRange | FsOperation::Stats
+        FsOperation::List
+            | FsOperation::Read
+            | FsOperation::ReadRange
+            | FsOperation::Stats
+            | FsOperation::MountList
     );
     if status != Status::Ok || (returns_shared_bytes && reply.words[0] as usize > SHARED_BYTES) {
         return Err(if status == Status::Ok {
@@ -2476,18 +2585,20 @@ fn verify_filesystem_protocol() -> Result<(), Status> {
 fn output(arguments: fmt::Arguments<'_>) {
     let mut buffer = Text::new();
     let _ = buffer.write_fmt(arguments);
-    console_write(buffer.as_bytes());
+    if microsystem_user_rt::debug_write(buffer.as_bytes()).is_err() {
+        console_write(buffer.as_bytes());
+    }
 }
 
 struct Text {
-    bytes: [u8; 256],
+    bytes: [u8; 4096],
     length: usize,
 }
 
 impl Text {
     const fn new() -> Self {
         Self {
-            bytes: [0; 256],
+            bytes: [0; 4096],
             length: 0,
         }
     }

@@ -137,15 +137,20 @@ impl Database {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<Execution, Error> {
-        if sql.len() > MAX_SQL_BYTES {
-            return Err(Error::TooLarge);
+        self.execute_statement(parse_statement(sql)?)
+    }
+
+    /// Executes a SELECT statement without cloning or mutating the database.
+    /// Returns `Unsupported` when the input is a valid non-query statement.
+    pub fn execute_query(&self, sql: &str) -> Result<Execution, Error> {
+        match parse_statement(sql)? {
+            Statement::Select {
+                table,
+                columns,
+                predicates,
+            } => self.execute_select(table, columns, predicates),
+            _ => Err(Error::Unsupported),
         }
-        let mut parser = Parser::new(sql)?;
-        let statement = parser.parse_statement()?;
-        if !parser.at_end() {
-            return Err(Error::Syntax);
-        }
-        self.execute_statement(statement)
     }
 
     pub fn encode_snapshot(&self, output: &mut Vec<u8>) -> Result<(), Error> {
@@ -345,28 +350,7 @@ impl Database {
                 table,
                 columns,
                 predicates,
-            } => {
-                let table = self.table(&table)?;
-                let selected = selected_columns(&table.columns, columns.as_ref())?;
-                validate_predicates(&table.columns, &predicates)?;
-                let mut rows = Vec::new();
-                for row in &table.rows {
-                    if predicates_match(&table.columns, row, &predicates)? {
-                        rows.push(selected.iter().map(|&index| row[index].clone()).collect());
-                    }
-                }
-                let output_columns = selected
-                    .iter()
-                    .map(|&index| ColumnInfo {
-                        name: table.columns[index].name.clone(),
-                        ty: table.columns[index].ty,
-                    })
-                    .collect();
-                Ok(Execution::Rows {
-                    columns: output_columns,
-                    rows,
-                })
-            }
+            } => self.execute_select(table, columns, predicates),
             Statement::Update {
                 table,
                 assignments,
@@ -418,6 +402,34 @@ impl Database {
         }
     }
 
+    fn execute_select(
+        &self,
+        table_name: String,
+        columns: Option<Vec<String>>,
+        predicates: Vec<Predicate>,
+    ) -> Result<Execution, Error> {
+        let table = self.table(&table_name)?;
+        let selected = selected_columns(&table.columns, columns.as_ref())?;
+        validate_predicates(&table.columns, &predicates)?;
+        let mut rows = Vec::new();
+        for row in &table.rows {
+            if predicates_match(&table.columns, row, &predicates)? {
+                rows.push(selected.iter().map(|&index| row[index].clone()).collect());
+            }
+        }
+        let output_columns = selected
+            .iter()
+            .map(|&index| ColumnInfo {
+                name: table.columns[index].name.clone(),
+                ty: table.columns[index].ty,
+            })
+            .collect();
+        Ok(Execution::Rows {
+            columns: output_columns,
+            rows,
+        })
+    }
+
     fn table_index(&self, name: &str) -> Result<usize, Error> {
         self.tables
             .iter()
@@ -440,6 +452,18 @@ impl Database {
             total.checked_add(table.rows.len()).ok_or(Error::TooLarge)
         })
     }
+}
+
+fn parse_statement(sql: &str) -> Result<Statement, Error> {
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let mut parser = Parser::new(sql)?;
+    let statement = parser.parse_statement()?;
+    if !parser.at_end() {
+        return Err(Error::Syntax);
+    }
+    Ok(statement)
 }
 
 impl Default for Database {

@@ -7,10 +7,22 @@ is `init console block mfs shell devmgr windowd terminal files monitor sshd netd
 db`; the serial manifest starts `devmgr,console,block,mfs,db,shell,netd,sshd`,
 and GUI adds `windowd,terminal,files,monitor`. The image contains 25 bootfs
 entries (24 static ELFs plus `etc/services`). Dynamic application slots have
-capacity eight and begin at PID 14. The desktop is fixed at 1024×768 XRGB8888
+capacity sixteen and begin at PID 14. The desktop is fixed at 1024×768 XRGB8888
 and is presented through windowd's EL0 VirtIO-GPU path.
 
 ## Device and capability boundary
+
+Terminal commands use asynchronous IPC: while a command waits or sleeps,
+windowd continues processing input, window movement and redraws. Ctrl+C
+cooperatively interrupts `sleep` and `wait`. Only one Terminal command is
+outstanding; the next prompt appears after its reply or a service failure.
+Restarted built-in clients register again and retain their desktop window ID.
+Restarting windowd also restarts its clients and terminates old script windows.
+Both Terminal and serial shell expose `service [list|status|restart|stop] [NAME]`.
+They also expose `app list/info/install/update/rollback/run/exec` for filesystem
+native images. Installed versions have checksums, an additional anonymous-page
+budget and explicit random/stat capability grants. Native stdout uses the serial
+diagnostic channel; Terminal reports its PID and installation result.
 
 Windowd owns the scanout and its GUI memory pool. `devmgr` owns the PCI/BAR,
 queue, DMA and IRQ setup; applications do not receive any of those
@@ -21,9 +33,31 @@ session PID/token; a message cannot forge its client identity. The framebuffer,
 GPU BAR, input queues, DMA, IRQ and raw device syscalls remain inaccessible.
 
 There are three built-in clients (Terminal, Files and Monitor) and up to eight
-dynamic Mica clients, for a desktop capacity of 11 windows. Closing a dynamic
-client unregisters its endpoint and reclaims its command/event resources; the
-slot can be reused.
+dynamic Mica clients. Each dynamic client owns up to four windows, for a desktop
+capacity of 35 windows. Each window has its own display list, sequence, root and
+focus; widgets cannot be shared across windows. Closing a window releases its
+widgets and scene. Ending a client unregisters its endpoint and reclaims all its
+windows and command/event resources; slots can be reused.
+
+The desktop clipboard stores up to 4,096 bytes of UTF-8 text for the current
+windowd session. Mica exposes `gui.clipboard.read()` and `.write(text)`; focused
+text inputs use Ctrl+A followed by Ctrl+C/X/V. Terminal uses Ctrl+Shift+C to copy
+its current input line and Ctrl+Shift+V to paste a single line. Ctrl+C retains
+command cancellation. Clipboard content is shared across GUI clients and is
+cleared when windowd restarts; it is not persisted to disk.
+
+Ctrl+Space toggles basic Pinyin composition. Letters build a preedit string;
+Left/Right choose among up to eight candidates, 1–8 choose directly, Space/Enter
+commits, Backspace edits, and Escape cancels. A focus change discards preedit.
+The overlay displays preedit and candidates using Unifont. The bounded TSV
+dictionary at `/.system/input/pinyin.tsv` contains `pinyin<TAB>text` rows and can
+be edited and fsynced, then loaded by restarting windowd. It is limited to under
+16 KiB, eight candidates per key and eight characters per candidate; missing or
+invalid UTF-8 files use the bundled basic dictionary. This is a deterministic
+dictionary input method; prediction, learning and complex text shaping remain
+outside its contract. Ctrl+Shift+U hexadecimal Unicode entry remains available
+when Pinyin is disabled. Terminal input, deletion and rendering now preserve
+UTF-8 character boundaries.
 
 ### Desktop launchers
 
@@ -42,12 +76,12 @@ word 3, and rejects unknown/non-launchable ids. The effective Mica permissions
 remain the manifest ∩ launcher `--allow` ∩ entry-policy intersection.
 
 The fixed mappings are deliberately narrow: Reader runs the bundled browser
-example with `gui.window` and unscoped `net.browse`; Editor runs the
-bundled editor with `gui.window`, `fs.read:/data` and `fs.write:/data`, passing
-`/data/note.txt`. The window server cannot supply an arbitrary script path or
-policy through this endpoint. Closing a launcher-created window follows the
-same `CloseRequested` and endpoint-reclaim lifecycle as any dynamic Mica
-client; a subsequent click can reuse the slot.
+example with `gui.window`, unscoped `net.browse` and `fs.write:/data`; Editor
+runs the bundled editor with `gui.window`, `fs.read:/data` and
+`fs.write:/data`, passing `/data/note.txt`. The window server cannot supply an
+arbitrary script path or policy through this endpoint. Closing a
+launcher-created window follows the same `CloseRequested` and endpoint-reclaim
+lifecycle as any dynamic Mica client; a subsequent click can reuse the slot.
 
 ### Visual presentation
 
@@ -73,16 +107,26 @@ capability boundary and validated display-list commands remain unchanged.
 
 The Terminal command surface is `ls/list [path]`, `cat/read <path>`,
 `stat <path>`, `touch/create <path>`, `cp <source> <destination>`,
-`write <path> <text>`, `mkdir <path>`, `rmdir <path>`,
+`write <path> <text>`, `append <path> <text>`, `mkdir <path>`, `rmdir <path>`,
 `mv/rename <source> <destination>`, `rm/remove/unlink <path>`, `fsync <path>`
-and `sync`. Paths are absolute and there is no working-directory
-state. Terminal sends filesystem requests through its dedicated
+and `sync`, plus the extended viewing and recursive options shared with the
+serial shell. `pwd` and `cd` maintain a terminal-local working directory;
+relative paths, `.` and `..` resolve against it. Whole arguments may be enclosed
+in single or double quotes, for example `append "work notes" " and more"`.
+Quotes do not perform escaping, expansion or concatenation. `mv file directory`
+moves to `directory/basename(file)` and refuses to overwrite an existing target.
+`ps` lists application PIDs, names, running/exited states and exit statuses
+through the process broker; `free`/`sysinfo` show system counters. Terminal also
+supports `kill`, `wait`, time/history commands, `netstat`, logout and system
+power commands. DNS, curl, SQL and Mica execution require the serial shell.
+Terminal sends filesystem requests through its dedicated
 `TERMINAL_FILESYSTEM_ENDPOINT` and the `GUI_TERMINAL_COMMANDS` 4 KiB shared
 frame; the MFS broker maps that frame at a terminal-only path boundary, separate
 from block DMA and other filesystem payload frames. Each command is limited to
 512 bytes and replies/output to 4 KiB, with the console viewport following the
 newest lines. The serial shell and GUI terminal share the same filesystem
-parser and aliases.
+parser and aliases. The GUI prompt starts on a separate line even when a
+file's content has no trailing newline; this does not modify the file itself.
 
 The materialized-paths review also tightened redraw and event behavior without
 changing the GUI wire contract: windowd dirty-region culling skips
@@ -190,17 +234,26 @@ close request first reaches the script as `CloseRequested`; init allows up to
 two seconds for cleanup before terminating the session and reclaiming all
 resources. The GUI host keeps callback values in its GC roots while yielding.
 
+Focused `text_input` widgets support caret movement with Left/Right and
+Home/End, UTF-8 character deletion with Backspace/Delete, and Ctrl+A to select
+the whole field. Typing replaces a whole-field selection; clicking a field
+focuses it and places the caret at the end. Tab moves focus and Enter submits.
+The toolkit still has no clipboard integration, IME composition or candidate
+window, or pointer-positioned caret.
+
 The shipped `/.system/examples/mica/browser.mica` demonstrates a complete
-single-window application assembled from these widgets. It uses a row of
-buttons and a text input for navigation, a list for paged document lines, and
-callback registration through `widget:set_callback(name, function)`. The
-browser remains subject to the same one-window, bounded-widget and exact
+single-window application assembled from these widgets. It uses a navigation
+row, a save-path row, a list for paged document lines, and callback registration
+through `widget:set_callback(name, function)`. The
+browser remains subject to the same bounded-window, bounded-widget and exact
 `gui.window` permission contract; it does not add a browser-specific drawing
-or input capability. Its fixed entry policy adds only `net.browse`: the Reader
-uses `http.get` for HTTP/HTTPS GET to the dynamic address-bar host. Raw
+or input capability. Its fixed entry policy adds `net.browse` and
+`fs.write:/data`: the Reader uses `http.get` for HTTP/HTTPS GET to the dynamic
+address-bar host and can save the loaded response after an explicit click. Raw
 resolve/TCP/UDP and POST/PUT/PATCH/DELETE remain exact `net.connect` paths;
-page links are same-origin, while an explicit address-bar URL may cross origin.
-TLS roots/time/hostname validation and the existing body/content limits are
+page links are same-origin, while an explicit address-bar URL or redirect may
+cross origin. The Reader follows at most eight HTTP(S) redirects. TLS
+roots/time/hostname validation and the existing body/content limits are
 unchanged.
 
 The shipped `/.system/examples/mica/editor.mica` demonstrates a bounded text
@@ -329,10 +382,8 @@ proved the document load; detached-session stdout was not used as a marker.
 
 ## Deliberate limits
 
-This release is a single-window retained toolkit, not a general desktop
-framework. Dynamic GUI registration is supported, but each app still has one
-top-level window. There are no multi-window apps, popup/modal menus,
-tables/trees/tabs, drag-and-drop, clipboard, IME, complex text shaping,
+The retained toolkit supports four windows per application. There are no popup/modal menus,
+tables/trees/tabs, drag-and-drop, predictive input, complex text shaping,
 arbitrary-font selection, image decoding, transparency, animation timelines,
-3D/GPU acceleration, dynamic native modules or arbitrary native application
-binaries.
+3D/GPU acceleration or dynamic native modules. Filesystem native ELF execution
+uses the `app` manager and currently has no native GUI toolkit binding.

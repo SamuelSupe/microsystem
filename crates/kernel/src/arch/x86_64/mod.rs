@@ -1,6 +1,6 @@
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) mod interrupt;
 pub(crate) mod preempt;
@@ -25,6 +25,17 @@ const PAGE_USER: u64 = 1 << 2;
 const PAGE_WRITE_THROUGH: u64 = 1 << 3;
 const PAGE_CACHE_DISABLE: u64 = 1 << 4;
 const PAGE_NO_EXECUTE: u64 = 1 << 63;
+static LOCAL_APIC: AtomicU64 = AtomicU64::new(0xfee0_0000);
+static CPU_APIC_IDS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(1)];
+
+pub fn local_apic_base() -> u64 { LOCAL_APIC.load(Ordering::Acquire) }
+pub fn hardware_cpu_id(base: u64) -> u32 { unsafe { core::ptr::read_volatile((phys_to_virt(base) + 0x20) as *const u32) >> 24 } }
+pub fn configure_topology(base: u64, bsp: u32, second: Option<u32>) {
+    LOCAL_APIC.store(base, Ordering::Release);
+    CPU_APIC_IDS[0].store(bsp, Ordering::Release);
+    CPU_APIC_IDS[1].store(second.unwrap_or(u32::MAX), Ordering::Release);
+}
+pub fn cpu_apic_id(cpu: usize) -> Option<u32> { CPU_APIC_IDS.get(cpu).map(|id| id.load(Ordering::Acquire)).filter(|id| *id <= 255) }
 
 unsafe extern "C" {
     static boot_pdpt_high: u8;
@@ -310,14 +321,15 @@ extern "C" fn x86_handle_trap(frame: &mut preempt::ExceptionFrame) -> u64 {
 }
 
 pub fn cpu_id() -> usize {
-    let id = unsafe { core::ptr::read_volatile((phys_to_virt(0xfee0_0000) + 0x20) as *const u32) };
-    (id >> 24) as usize
+    let id = hardware_cpu_id(local_apic_base());
+    CPU_APIC_IDS.iter().position(|candidate| candidate.load(Ordering::Acquire) == id).unwrap_or(0)
 }
 
 pub fn psci_cpu_on(cpu: u64) -> i64 {
     if cpu != 1 {
         return -1;
     }
+    let Some(target) = cpu_apic_id(cpu as usize) else { return -1; };
     let source = &raw const ap_trampoline_high;
     let bytes = &raw const ap_trampoline_end_high as usize - source as usize;
     if bytes == 0 || bytes > 4096 {
@@ -326,9 +338,9 @@ pub fn psci_cpu_on(cpu: u64) -> i64 {
     unsafe {
         core::ptr::copy_nonoverlapping(source, phys_to_virt(0x8000) as *mut u8, bytes);
         dma_write_barrier();
-        if !send_startup_ipi(1, 0x0000_c500)
-            || !send_startup_ipi(1, 0x0000_8500)
-            || !send_startup_ipi(1, 0x0000_4608)
+        if !send_startup_ipi(target as usize, 0x0000_c500)
+            || !send_startup_ipi(target as usize, 0x0000_8500)
+            || !send_startup_ipi(target as usize, 0x0000_4608)
         {
             return -1;
         }
@@ -672,7 +684,7 @@ fn read_cr2() -> u64 {
 }
 
 unsafe fn send_startup_ipi(cpu: usize, command: u32) -> bool {
-    let apic = phys_to_virt(0xfee0_0000);
+    let apic = phys_to_virt(local_apic_base());
     unsafe {
         core::ptr::write_volatile((apic + 0x310) as *mut u32, (cpu as u32) << 24);
         core::ptr::write_volatile((apic + 0x300) as *mut u32, command);

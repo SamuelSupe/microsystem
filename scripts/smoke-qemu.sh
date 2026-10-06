@@ -18,7 +18,7 @@ case "$MICROSYSTEM_ARCH" in
     fp_state_label='fd-regs=f0-f31 fcsr=true'
     ipc_request='0x1234'
     ipc_reply='0x2468'
-    task_memory_bytes='0x205000'
+    task_memory_bytes='0x104000'
     ;;
   x86_64)
     irq_timer_marker='\[irq\][[:space:]]+local-APIC[[:space:]]+timer[[:space:]]+cpu0'
@@ -29,7 +29,7 @@ case "$MICROSYSTEM_ARCH" in
     fp_state_label='x87-sse=fxsave64 true'
     ipc_request='0xcafe'
     ipc_reply='0xbeef'
-    task_memory_bytes='0x226000'
+    task_memory_bytes='0x125000'
     ;;
   *)
     irq_timer_marker='\[irq\][[:space:]]+GICv3[[:space:]]+timer[[:space:]]+cpu0'
@@ -40,7 +40,7 @@ case "$MICROSYSTEM_ARCH" in
     fp_state_label='q-regs=q0-q31 fpcr-fpsr=true'
     ipc_request='0x1234'
     ipc_reply='0x2468'
-    task_memory_bytes='0x205000'
+    task_memory_bytes='0x104000'
     ;;
 esac
 
@@ -182,6 +182,28 @@ send_input() {
   sleep "$input_delay"
   printf 'wc /demo/large-copy\n'
   sleep "$input_delay"
+  printf '%s\n' 'mkdir "/demo/work notes"'
+  sleep "$input_delay"
+  printf '%s\n' 'append "/demo/quoted note" "hello"'
+  sleep "$input_delay"
+  printf '%s\n' 'fs append "/demo/quoted note" " quoted world"'
+  sleep "$input_delay"
+  printf '%s\n' 'cp "/demo/quoted note" "/demo/copied note"'
+  sleep "$input_delay"
+  printf '%s\n' 'mv "/demo/copied note" "/demo/work notes"'
+  sleep "$input_delay"
+  printf '%s\n' 'fsync "/demo/work notes/copied note"'
+  sleep "$input_delay"
+  printf '%s\n' 'grep "hello quoted" "/demo/work notes/copied note"'
+  sleep "$input_delay"
+  printf '%s\n' 'append "/demo/work notes/copied note" "bad" extra'
+  sleep "$input_delay"
+  printf '%s\n' 'cat "/demo/work notes/copied note"'
+  sleep "$input_delay"
+  printf '%s\n' 'rm "/demo/quoted note"'
+  sleep "$input_delay"
+  printf '%s\n' 'rm -r "/demo/work notes"'
+  sleep "$input_delay"
   printf 'cat /demo/tree-copy/nested/data\n'
   sleep "$input_delay"
   printf 'rm /demo/tree\n'
@@ -290,22 +312,24 @@ if ! grep -Eqi -- "$recovery_marker" "$log_file" \
   fi
 fi
 
-# x86 console output goes through the kernel formatter, which emits CRLF.
-# Keep the stored smoke transcript line-oriented before applying anchored
-# serial milestones.
-if [[ "$MICROSYSTEM_ARCH" == "x86_64" ]]; then
-  normalized_log="${log_file}.normalized"
-  sed 's/\r$//' "$log_file" >"$normalized_log"
-  mv -f -- "$normalized_log" "$log_file"
-fi
+# All console output shares the formatter's UART lock and emits CRLF.
+normalized_log="${log_file}.normalized"
+sed 's/\r$//' "$log_file" >"$normalized_log"
+mv -f -- "$normalized_log" "$log_file"
 
 # QEMU exits with a non-zero status for some deliberate shutdown paths; the
 # serial milestones are the authoritative part of this smoke gate.
+# Grep reads the copied file before the malformed append; cat reads it after.
+if [[ "$(grep -Ec '^hello quoted world[[:space:]]*$' "$log_file")" != "2" ]]; then
+  echo "smoke-qemu: quoted copy/move content changed after an invalid append" >&2
+  exit 1
+fi
+
 required_markers=(
   "cpu0"
   "cpu1"
   "mmu"
-  "\\[mm\\][[:space:]]+kernel[[:space:]]+heap[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+bytes=0x8000000"
+  "\\[mm\\][[:space:]]+kernel[[:space:]]+heap[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+bytes=0x4000000"
   "\\[mm\\][[:space:]]+frame[[:space:]]+allocator[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+free=[0-9]+"
   "\\[mm\\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=$task_memory_bytes[[:space:]]+allocated=$task_memory_bytes"
   "$irq_timer_marker"
@@ -362,6 +386,8 @@ required_markers=(
   "^/$"
   "^/demo/tree/nested[[:space:]]*$"
   "^smoke-echo[[:space:]]*$"
+  "^append:[[:space:]]+ok[[:space:]]*$"
+  "^hello quoted world[[:space:]]*$"
   "^[[:space:]]+[0-9]+[[:space:]]+pwd[[:space:]]*$"
   "^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+UTC[[:space:]]*$"
   "^cpus=2[[:space:]]+ticks=\[[0-9]+,[0-9]+\]"
@@ -439,7 +465,7 @@ required_markers=(
   "\\[app\\][[:space:]]+counter[[:space:]]+pid=[0-9]+[[:space:]]+started[[:space:]]+at[[:space:]]+EL0"
   "\\[app\\][[:space:]]+counter[[:space:]]+pid=[0-9]+[[:space:]]+completed"
   "\\[isolation\\][[:space:]]+privileged[[:space:]]+instruction[[:space:]]+task[[:space:]]+pid=[0-9]+[[:space:]]+faulted[[:space:]]+status=-8[[:space:]]+reclaimed=true"
-  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=14[[:space:]]+independent-slots=true"
+  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=16[[:space:]]+first-pid=14[[:space:]]+independent-slots=true"
   "\\[sched\\][[:space:]]+application[[:space:]]+spinners[[:space:]]+dual-core=true[[:space:]]+tasks=2[[:space:]]+cpus=2[[:space:]]+cpu-masks-pair=[0-9]{2}"
   # The interactive privprobe command may be split by a concurrent EL0
   # writer; its exact PID/status is checked by the bounded lifecycle below.
@@ -518,7 +544,7 @@ if (( allocator_free == 0 )); then
   exit 1
 fi
 
-kernel_heap_line="$(grep -Eio '\[mm\][[:space:]]+kernel[[:space:]]+heap[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+bytes=0x8000000' "$log_file" | tail -n 1 || true)"
+kernel_heap_line="$(grep -Eio '\[mm\][[:space:]]+kernel[[:space:]]+heap[[:space:]]+ready[[:space:]]+base=0x[[:xdigit:]]+[[:space:]]+bytes=0x4000000' "$log_file" | tail -n 1 || true)"
 kernel_heap_values="$(sed -E 's/.*base=(0x[0-9a-f]+)[[:space:]]+bytes=(0x[0-9a-f]+).*/\1 \2/i' <<< "$kernel_heap_line")"
 read -r kernel_heap_base_hex kernel_heap_bytes_hex <<< "$kernel_heap_values"
 task_memory_line="$(grep -Eio '\[mm\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=0x[[:xdigit:]]+[[:space:]]+allocated=0x[[:xdigit:]]+' "$log_file" | tail -n 1 || true)"
@@ -534,7 +560,7 @@ kernel_heap_base=$((kernel_heap_base_hex))
 kernel_heap_bytes=$((kernel_heap_bytes_hex))
 task_memory_slot_bytes=$((task_memory_slot_bytes_hex))
 task_memory_allocated=$((task_memory_allocated_hex))
-if (( kernel_heap_base % 0x1000 != 0 || kernel_heap_bytes != 0x8000000 )); then
+if (( kernel_heap_base % 0x1000 != 0 || kernel_heap_bytes != 0x4000000 )); then
   echo "smoke-qemu: kernel heap base/size is invalid: $kernel_heap_line" >&2
   tail -n 120 "$log_file" >&2 || true
   exit 1
@@ -739,9 +765,13 @@ if [[ -z "$badptr_app_line" || ! "$badptr_pid" =~ ^[0-9]+$ || ! "$badptr_entry_l
   exit 1
 fi
 
-pageprobe_app_line="$(grep -Eio '\[app\][[:space:]]+page-fault[[:space:]]+probe[[:space:]]+pid=[0-9]+[[:space:]]+entered[[:space:]]+EL0' "$log_file" | head -n 1 || true)"
-pageprobe_pid="$(sed -E 's/.*pid=([0-9]+).*/\1/i' <<< "$pageprobe_app_line")"
-pageprobe_entry_line="$(first_line '\[app\][[:space:]]+page-fault[[:space:]]+probe[[:space:]]+pid=[0-9]+[[:space:]]+entered[[:space:]]+EL0')"
+# The two page probes run concurrently. The primary wait identifies the
+# unmapped-address probe even when the readonly probe prints its entry first.
+pageprobe_wait_marker="$(grep -Eio '\[proc\][[:space:]]+page-fault[[:space:]]+probe[[:space:]]+pid=[0-9]+[[:space:]]+wait-status=-8[[:space:]]+reclaimed=true' "$log_file" | head -n 1 || true)"
+pageprobe_pid="$(sed -E 's/.*pid=([0-9]+).*/\1/i' <<< "$pageprobe_wait_marker")"
+pageprobe_entry_re="\\[app\\][[:space:]]+page-fault[[:space:]]+probe[[:space:]]+pid=$pageprobe_pid[[:space:]]+entered[[:space:]]+EL0"
+pageprobe_app_line="$(grep -Eio "$pageprobe_entry_re" "$log_file" | head -n 1 || true)"
+pageprobe_entry_line="$(first_line "$pageprobe_entry_re")"
 pageprobe_upper_line="$(first_line '\[app\][[:space:]]+resource[[:space:]]+fault[[:space:]]+probe[[:space:]]+pid=[0-9]+[[:space:]]+entered[[:space:]]+EL0')"
 pageprobe_wait_re="\\[proc\\][[:space:]]+page-fault[[:space:]]+probe[[:space:]]+pid=$pageprobe_pid[[:space:]]+wait-status=-8[[:space:]]+reclaimed=true"
 pageprobe_fault_re="\\[proc\\][[:space:]]+application[[:space:]]+fault[[:space:]]+ESR=0x[[:xdigit:]]+[[:space:]]+FAR=0x600000;[[:space:]]+pid=$pageprobe_pid[[:space:]]+terminated"

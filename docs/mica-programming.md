@@ -150,7 +150,7 @@ proc.spawn:counter           named application launch
 proc.kill:counter            named application control
 sys.stats                    system statistics
 random                       random source
-gui.window                   one retained GUI window
+gui.window                   up to four retained GUI windows
 ```
 
 `fs.read` and `fs.write` are absolute path-prefix permissions. `net.connect`
@@ -240,9 +240,13 @@ are not followed. Low-level `net.tls_connect` is deliberately
 `NotSupported`; the trusted HTTPS path lives inside the Mica runtime.
 
 The bundled Reader uses `net.browse` for a bounded HTTP/HTTPS GET to a host
-selected at runtime. Raw `net.resolve`, TCP, UDP, or non-GET operations still
-need their exact permissions. The raw network device belongs only to `netd`;
-Mica receives broker access, never a network device or MMIO capability.
+selected at runtime, and follows up to eight HTTP(S) redirects in the Reader
+UI. Redirects may change host, while links within a page remain same-origin.
+The Reader also has `fs.write:/data` and can atomically save up to 32,512
+response bytes there after an explicit Save click; it has no file-read grant.
+Raw `net.resolve`, TCP, UDP, or non-GET operations still need their exact
+permissions. The raw network device belongs only to `netd`; Mica receives
+broker access, never a network device or MMIO capability.
 
 ## 7. GUI applications
 
@@ -295,7 +299,20 @@ methods include `set_root`, `set_title`, `invalidate`, `present`, `run`, and
 `set_items`, plus `on_click`, `on_change`, `on_submit`, and `on_select`
 callbacks.
 
-One script owns one top-level window. The GUI task receives validated command,
+Focused `text_input` widgets support Left/Right and Home/End caret movement,
+Backspace/Delete by UTF-8 character, and Ctrl+A to select the entire field.
+Typing replaces a whole-field selection. Clicking focuses the field and places
+the caret at the end; Tab moves between interactive widgets and Enter submits.
+Ctrl+C/X/V copies/cuts/pastes a Ctrl+A selection. `gui.clipboard.read()` and
+`gui.clipboard.write(text)` use the shared 4 KiB UTF-8 store. Ctrl+Space toggles
+basic Pinyin composition with a preedit/candidate overlay; Space/Enter commits,
+1–8 selects, Backspace edits and Escape cancels. The editable TSV dictionary
+and its limits are documented in `docs/gui.md`. Partial selection and
+pointer-positioned caret placement are not implemented.
+
+One script owns up to four top-level windows. Widgets belong to one window;
+closing it releases its widgets. `window:run()` dispatches callbacks across all
+windows and returns when the named window closes. The GUI task receives validated command,
 event, and endpoint capabilities only; it never receives the framebuffer,
 GPU, input device, DMA, BAR, or IRQ capability.
 

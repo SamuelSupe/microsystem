@@ -5,6 +5,13 @@ multiboot_header:
 .long 0
 .long multiboot_header_end - multiboot_header
 .long -(0xe85250d6 + (multiboot_header_end - multiboot_header))
+.word 1
+.word 1
+.long 20
+.long 6
+.long 14
+.long 15
+.balign 8
 .word 0
 .word 0
 .long 8
@@ -106,7 +113,8 @@ long_mode_entry:
     movabs $0xffff800000000000, %rax
     add %rax, %rsp
     xor %rbp, %rbp
-    xor %rdi, %rdi
+    movabs $multiboot_info, %rcx
+    mov (%rcx), %rdi
     movabs $kernel_main, %rax
     call *%rax
 6:
@@ -194,6 +202,7 @@ boot_gdt_pointer:
 
 .section .data.boot, "aw"
 .balign 8
+.global multiboot_info
 multiboot_info:
     .quad 0
 

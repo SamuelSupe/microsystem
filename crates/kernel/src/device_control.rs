@@ -20,6 +20,10 @@ pub fn ecam_physical() -> Option<u64> {
     unsafe { (*PLATFORM.0.get()).map(|platform| platform.pcie_base as u64) }
 }
 
+pub fn platform() -> Option<PlatformInfo> {
+    unsafe { *PLATFORM.0.get() }
+}
+
 pub fn pcie_window() -> Option<(u64, u64)> {
     unsafe {
         (*PLATFORM.0.get()).map(|platform| {
@@ -66,14 +70,6 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
         .ok_or(Status::NotFound)?;
     #[cfg(target_arch = "x86_64")]
     let irq = pci::interrupt_line(platform.pcie_base, device).ok_or(Status::NotFound)?;
-    #[cfg(target_arch = "aarch64")]
-    let irq_result = arch::selected::bind_device_irq(platform.gicd_base, irq, transport.isr);
-    #[cfg(target_arch = "riscv64")]
-    let irq_result = arch::selected::bind_device_irq(platform.plic_base, irq, transport.isr);
-    #[cfg(target_arch = "x86_64")]
-    let irq_result = arch::selected::bind_device_irq(platform.gicr_base, irq, transport.isr);
-    irq_result.map_err(|_| Status::Io)?;
-
     let requester_id = device.requester_id();
     let stream_id = platform.stream_id(requester_id).ok_or(Status::NotFound)?;
     #[cfg(target_arch = "aarch64")]
@@ -89,17 +85,6 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
         transport.data_physical(),
     )
     .map_err(|_| Status::Io)?;
-    if pci::virtio_device_at(platform.pcie_base, 6, 0, pci::VIRTIO_NET_MODERN).is_some() {
-        crate::net::activate(platform).map_err(|_| Status::Io)?;
-    }
-    if pci::virtio_device_at(platform.pcie_base, 7, 0, pci::VIRTIO_RNG_MODERN).is_some() {
-        crate::random::activate(platform).map_err(|_| Status::Io)?;
-    }
-    if pci::virtio_device_at(platform.pcie_base, 3, 0, pci::VIRTIO_GPU_MODERN).is_some() {
-        crate::gpu::activate(platform).map_err(|_| Status::Io)?;
-        crate::input::activate(platform).map_err(|_| Status::Io)?;
-        crate::service_runtime::enable_gui_services();
-    }
     #[cfg(target_arch = "aarch64")]
     let iommu_name = "SMMUv3";
     #[cfg(target_arch = "riscv64")]
@@ -167,7 +152,44 @@ pub fn activate(slot: u8, function: u8) -> Result<UserTransportGrant, Status> {
     if !blocked {
         return Err(Status::Io);
     }
-    transport.reset_for_user(platform.pcie_base, device);
+
+    // Stop the deliberate bad-DMA probe before any production queues start.
+    transport
+        .reset_for_user(platform.pcie_base, device)
+        .map_err(|_| Status::Io)?;
+    for _ in 0..256 {
+        let Some(residual) = smmu::take_fault() else {
+            break;
+        };
+        if residual.stream_id != stream_id {
+            kprintln!("[iommu] unexpected fault before production stream={:#x} address={:#x}", residual.stream_id, residual.address);
+            return Err(Status::Io);
+        }
+    }
+    pci::reserve_hotplug_window(
+        platform.pcie_base,
+        platform.pcie_mmio_base,
+        platform.pcie_mmio_bytes,
+    )
+    .map_err(|_| Status::Io)?;
+    if pci::virtio_device_at(platform.pcie_base, 7, 0, pci::VIRTIO_RNG_MODERN).is_some() {
+        crate::random::activate(platform).map_err(|_| Status::Io)?;
+    }
+    if pci::virtio_device_at(platform.pcie_base, 3, 0, pci::VIRTIO_GPU_MODERN).is_some() {
+        crate::gpu::activate(platform).map_err(|_| Status::Io)?;
+        crate::input::activate(platform).map_err(|_| Status::Io)?;
+        crate::service_runtime::enable_gui_services();
+    }
+    crate::net::activate(platform).map_err(|_| Status::Io)?;
+
+    #[cfg(target_arch = "aarch64")]
+    let irq_result = arch::selected::bind_device_irq(platform.gicd_base, irq, transport.isr);
+    #[cfg(target_arch = "riscv64")]
+    let irq_result = arch::selected::bind_device_irq(platform.plic_base, irq, transport.isr);
+    #[cfg(target_arch = "x86_64")]
+    let irq_result = arch::selected::bind_device_irq(platform.gicr_base, irq, transport.isr);
+    irq_result.map_err(|_| Status::Io)?;
+
     #[cfg(target_arch = "riscv64")]
     {
         let drained = domain.drain_faults();

@@ -29,6 +29,9 @@ stale descendants rather than relying on a slot number alone.
 | `SCRIPT` | **8** | Mica script broker |
 | `NETWORK` | **9** | netd and its clients |
 | `DATABASE` | **10** | resident EL0 `db` service |
+| `SERVICE` | **11** | init service supervisor |
+| `APPLICATION` | **12** | init native application manager |
+| `IDENTITY` | **13** | init account and SSH authorization manager |
 
 The script, network and database numbers are intentionally distinct: Mica sends
 process operations through `SCRIPT`, data-plane DNS/TCP/UDP operations go
@@ -41,6 +44,20 @@ The stable syscall numbers relevant to this release are:
 ```text
 ThreadStartEx   30   structured launch from init
 ClockRealtime   31   PL031-backed Unix seconds
+IpcTryCall      32   immediate, capability-free asynchronous request
+IpcPollReply    33   consume the current task's asynchronous reply
+NotificationPoll 34 consume notification bits without blocking
+ServiceStatus   35  init-only InfoV1 snapshot
+ServiceStop     36  init-only service termination
+VirtualMap      37  reserve anonymous virtual memory
+VirtualUnmap    38  release a complete anonymous reservation
+VirtualProtect  39  change a complete reservation's read/write rights
+VirtualStats    40  write virtual_memory::StatsV1
+VirtualResize   41  grow or shrink a complete reservation in place
+ThreadStartNative 42 init-only filesystem ELF snapshot launch
+VirtualCommit   43  materialize a writable heap/anonymous byte range
+NetworkInterfaceInfo 44  netd-only indexed MAC/link/epoch/MTU/PCI information
+IpcPeer         45  PID of the caller awaiting the current task's IPC reply
 ```
 
 The earlier syscall range includes `ClockNow=18`, `ThreadStart=13`,
@@ -61,7 +78,7 @@ frame and dedicated GUI endpoint). Init is the only caller; the accepted
 profile is `THREAD_PROFILE_MICA` and the program must be the bootfs `mica`
 image. V2 is transactional: validation, capability installation and rollback
 cover all nine entries. Ordinary application slots begin at
-`process::FIRST_APPLICATION_PID = 14` and there are eight slots.
+`process::FIRST_APPLICATION_PID = 14` and there are sixteen slots.
 
 `time::Operation` is `Sleep=1`, `Uptime=2`, `Realtime=3`. The TIME endpoint
 currently serves Sleep/Uptime; `Realtime=3` is represented in the ABI and
@@ -69,13 +86,134 @@ Mica/TLS obtain the trusted wall clock directly with syscall 31. The PL031
 driver returns seconds only when the value is at least the kernel's minimum
 valid Unix time; otherwise `ClockRealtime` returns `NotSupported`.
 
+## Asynchronous IPC and service recovery
+
+`IpcTryCall` accepts only messages without transferred caps. It returns `Busy`
+unless the endpoint owner is receiving and the caller's single reply slot is
+empty. Acceptance wakes the server without blocking the caller. `IpcPollReply`
+returns `Busy` while pending, `NotFound` without a request, and consumes a ready
+reply only after a successful copy to the caller. An invalid output pointer
+retains the reply. Server termination completes the slot with `Io`. Caller
+termination detaches the reply; abandoned moved result caps are reclaimed.
+`NotificationPoll` requires `READ`, consumes available bits, and returns `Busy`
+when empty.
+
+`SERVICE_ENDPOINT` (87/1) is held by init, shell and Terminal. Protocol 11 uses
+`List=1`, `Restart=2`, `Stop=3`, with service PID in word 0. List returns PID,
+state, start count, last exit status, administrative hold, and operation status
+in words 0–5. Init itself cannot be stopped or restarted. Other applications
+receive no management endpoint. Syscalls 35/36 remain init-only. `InfoV1`
+includes version, PID, state, program, starts, startup/online times and exit
+status. States are stopped, starting, online, stopping and quiesce-failed.
+
+## Anonymous virtual memory
+
+Syscall 37 receives `[address, bytes, rights]` and returns a base address.
+Address zero selects a free region; explicit addresses must be inside
+`0x0400_0000..0x4000_0000`. Length and address must be page aligned. Each task
+can reserve 32 regions and 4,096 anonymous pages (16 MiB), in addition to its
+legacy heap reservation. Rights are `READ=1` or `READ|WRITE=3`; anonymous
+executable pages are unsupported. Overlap returns `Busy`, quota exhaustion
+`NoMemory`, and region-table exhaustion `NoSpace`.
+
+Physical pages are zeroed and allocated on first access, including validated
+syscall-buffer access. An unsatisfied demand fault terminates its task with
+`NoMemory`; invalid access and write protection remain faults. Syscalls 38/39/41
+operate on the complete reservation identified by its base. Shrinking releases
+discarded pages; growth preserves existing data and reserves zero-filled new
+pages. Conflicting growth leaves the original region unchanged. Exit, fault and
+kill release all resident anonymous and heap pages, including page tables.
+
+`StatsV1` reports reserved/resident pages, region count, page budget, fault count
+and physical allocation failures. Reserved and budget counts include the
+ordinary 1 MiB heap and the extra 32 MiB MFS/database/netd heap when present. The
+user allocator uses anonymous reservations when its initial heap cannot satisfy
+an allocation and releases those reservations on deallocation.
+
+`VirtualCommit` takes an arbitrary writable byte range inside one heap or
+anonymous reservation. It checks the complete physical-page requirement under
+the scheduler lock before materializing the range. `NoMemory` leaves the
+mapping unchanged. User-rt commits allocation storage before returning it, so
+fallible Rust allocations can report physical exhaustion without a subsequent
+write fault. Application allocations preserve 64 physical pages for core
+service recovery.
+
+`DebugWrite=19` additionally accepts mode 3 (argument 2), restricted to the
+console service, for arbitrary byte output under the shared UART print lock.
+This preserves binary/UTF-8 fragments and prevents byte-level interleaving with
+kernel diagnostics. Normal application diagnostic writes remain UTF-8.
+
+## Native application protocol 12
+
+`APPLICATION_ENDPOINT` (89/1) is held by init, shell and Terminal. `Command=1`
+receives a UTF-8 command of at most 512 bytes in cap 0's 4 KiB shared frame.
+Init maps it temporarily and returns at most 4 KiB of text in that frame;
+reply word 0 is output length and word 5 is operation status. The source frame
+remains with the caller. Ordinary and native applications receive no installer
+or service-management endpoint. `ROOT_FILESYSTEM_FRAME` (88/1) is private to
+init/MFS at VA `0x0063_0000`.
+
+`ThreadStartNative=42` receives image pointer, byte length, program identifier,
+additional anonymous-page budget, and permission bits. Init is the only caller.
+The image is copied into a kernel scratch buffer under the scheduler lock,
+validated, and copied into an independent application image. ELF size is at
+most 1 MiB, with load segments bounded by the architecture's image window;
+only target-compatible `ET_EXEC` static ELF is accepted. Interpreter/dynamic
+tables and writable executable segments are rejected. No filesystem, network
+or process-control cap is inherited. Permission bits `RANDOM=1` and
+`SYSTEM_INFO=2` grant only the respective read capability. Profile 2 identifies
+native applications; an image named after a core service still occupies an
+ordinary application slot and never receives service boot grants.
+
 ## Filesystem and script sessions
 
 Filesystem operations are `Stat=1`, `List=2`, `Read=3`, `Write=4`, `Mkdir=5`,
 `Sync=6`, `Open=7`, `Fsync=8`, `Rename=9`, `Unlink=10`, `Close=11`,
-`WriteAtomic=12`, `ReadRange=13`, `Stats=14`, `WriteRange=15`, and
-`Replace=16`. Script registration uses `0x100` and unregistration `0x101`;
+`WriteAtomic=12`, `ReadRange=13`, `Stats=14`, `WriteRange=15`,
+`Replace=16`, `Append=17`, `Copy=18`, `Chmod=19`, `Chown=20`, and `Attributes=21`.
+Script registration uses `0x100` and unregistration `0x101`;
 requests carry `MICAFS01`, and the exact trusted CA read carries `MICACA01`.
+
+`Append` accepts an absolute UTF-8 path and bytes in the normal filesystem
+shared frame (word 0: path length; word 1: data length). It creates an absent
+file or appends at the current EOF inside one serialized service request;
+directories and missing parents fail without changing existing content. Path
+and data together must fit 4 KiB. New files use a durable Put; existing files
+use a durable Patch at EOF. `WriteRange` uses word 2 for its byte offset,
+preserves surrounding bytes and allows extension at EOF (no holes). Both
+operations commit prior buffered mutations and return after the new transaction
+is durable, without rewriting the complete file. Ordinary `Write` remains
+buffered until fsync/sync/maintenance. The token-authenticated Mica file API is
+unchanged.
+
+`Copy=18` receives source path and destination path in the shared frame and
+publishes one file mutation. An existing destination is rejected. This avoids
+rewriting the full growing destination for every 4 KiB installer chunk; fsync
+is still required for durability.
+
+`Chmod=19` uses word 2 for an octal permission value (`0..0o777`). `Chown=20`
+packs uid in word 2 bits 0–31 and gid in bits 32–63. The absolute path is in the
+usual shared payload. Changes are buffered and fsync/sync makes them durable.
+The fixed channel is trusted; script broker requests cannot invoke Chmod/Chown.
+`Attributes=21` returns a 48-byte `AttributesV1` in the shared payload: version,
+mode, uid, gid and four Unix-second timestamps (created, modified, accessed,
+changed). Missing RTC time is zero; read access uses noatime. Ordinary Stat
+retains type/size in words 0–1, adding mode in word 2, packed owner in word 3
+and modification time in word 4.
+
+VFS management uses `MountImage=22`, `Unmount=23`, `FormatImage=24` and
+`MountList=25`. Mount uses the image path as the primary payload and the mount
+point as its secondary bytes; word 2 is 0 for RW or 1 for RO. Unmount uses the
+mount point as its primary path. Format uses the new image path and word 2 for
+3–8 MiB; it refuses existing files. List returns UTF-8 rows in the shared frame
+and their length in word 0. These operations are on the fixed administrative
+channel, not the script broker. A cross-volume rename returns `NotSupported`;
+open descriptors, backing-image mutation and mounted namespace changes return
+`Busy`; read-only mutation returns `AccessDenied`.
+
+Stats uses its primary path to select the containing filesystem (an empty path
+selects root), returning the unchanged `FilesystemStatsV1` layout. The path must
+exist. VFS mount/configuration and image-flush semantics are in `docs/mfs1.md`.
 
 `script::SessionHeaderV1` is version 1 with magic `MICA`:
 
@@ -94,6 +232,23 @@ The session region is per process. MFS and netd map it only while servicing a
 token-authenticated request, then unmap it. The CA bundle is fetched from the
 exact MFS path `/.system/certs/ca-bundle.derpack` with `MICACA01`; it is not a
 shared GUI/FrameRegion data source.
+
+## Identity protocol 13
+
+`Command=1` transfers a 4 KiB command frame and word 0 length (at most 512).
+`AuthorizeSsh=2` uses words 0..3 for the zero-padded 32-byte account name and
+cap 0 for the raw 32-byte Ed25519 key in the SSH shared frame. It is SSHD-only
+and returns a PID-bound cookie in word 0 and UID in word 1. `DropCredential=3`
+invalidates the cookie in word 0. `SessionAccepted=4` records a login only after
+SSHD's transport has verified the signature and accepted a channel.
+
+Fixed filesystem/process requests from SSHD carry their cookie in word 3;
+script filesystem word 3 continues to be the script token. Script registration
+is init-only and word 0 supplies the registered UID. Filesystem descriptors are
+bound to IPC peer and UID. Net/service/app/SQL administrative brokers consult
+the same immutable snapshot. The physical serial shell is trusted root even
+when account storage is corrupt, so it can repair the store. See
+[accounts and recovery](identity.md).
 
 ## Database protocol 10
 
@@ -191,6 +346,9 @@ The fixed boot handles are:
 | `SSH_FILESYSTEM_FRAME` | 71/1 | SSH/MFS payload frame | MFS/sshd only |
 | `SHARED_FILESYSTEM_FRAME` | 25/1 | MFS filesystem payload frame | MFS/shell/db |
 | `DATABASE_FILESYSTEM_FRAME` | 87/1 | database filesystem payload frame | MFS/db only |
+| `NETWORK_FILESYSTEM_FRAME` | 90/1 | network configuration payload frame | MFS/netd only |
+| `IDENTITY_SNAPSHOT` | 91/1 | atomic account/credential snapshot at 0x005d0000 | init write; core brokers readonly; no grant |
+| `IDENTITY_ENDPOINT` | 92/1 | account administration and SSH authorization | init read; shell/Terminal/SSHD write |
 | `GUI_CONFIG_ENDPOINT` | 54/1 | init↔windowd client registry | init `WRITE`; windowd `READ` |
 | `SCRIPT_GUI_COMMANDS` | 72/1 | 64 KiB GUI command FrameRegion | Mica GUI `READ|WRITE|MAP` |
 | `SCRIPT_GUI_EVENTS` | 73/1 | 4 KiB GUI event Frame | Mica GUI `READ|WRITE|MAP` |
@@ -218,13 +376,29 @@ rectangles bound redraws, merged at up to 60 Hz. The six command kinds are
 `Clear`, `FillRect`, `StrokeRect`, `Text`,
 `Icon` and `SetClip`.
 
+Each registered endpoint owns up to four windows. `Present`, `SetTitle` and
+`QueryGeometry` use `words[0]` for the window ID; `WindowAction` uses `words[0]`
+for the action and `words[1]` for the window ID. Zero selects the first owned
+window for legacy clients. An explicit ID must belong to that endpoint.
+Sequences and retained display lists are independent for each window. Events
+carry the target window ID; closing one window does not unregister the client.
+
+`ClipboardWrite=12` reads `words[0]` UTF-8 bytes (0–4096) from the command payload
+at offset 512. Invalid lengths or UTF-8 leave the previous clipboard intact.
+`ClipboardRead=11` writes the current clipboard into that payload and returns
+its byte length in reply `words[0]`. The shared command frame is mapped RW in
+windowd; these operations complete synchronously before the client reuses it
+for Present. Clipboard operations do not modify retained scenes or sequences.
+
 The event ring has `PointerMove`, `PointerButton`, `PointerWheel`, `Key`,
 `TextInput`, `Focus`, `Configure`, `Expose` and `CloseRequested`. Pointer moves
 may be coalesced when full; button, key, configure, expose and close events use
 bounded backpressure. `script::EVENT_GUI` signals the ring. The GUI config
 endpoint (54/1) is write-owned by init and read-owned by windowd; each dynamic
 client gets one identity-bound endpoint, and the desktop supports eight dynamic
-clients in addition to the three built-in windows (11 total).
+clients, with four windows each, in addition to the three built-in windows
+(35 total). The GUI memory pool allows 1,536 pages, covering scanout, retained
+scenes, staging and the input dictionary.
 
 The partial-Present contract is bounded through user-rt, kernel, GPU and windowd;
 pointer movement contributes damage rectangles and input is batched at 16. The
@@ -249,11 +423,11 @@ enables all 13 service slots and reports `ready=13/13 online=13/13`. Service
 address spaces use ASIDs `0x20..0x2c`. Dynamic application slots begin at PID
 14 and are separate from these service slots.
 
-The kernel heap is 128 MiB. Each ordinary task has a 64 KiB stack and 1 MiB
-user heap. MFS has the explicitly provisioned 32 MiB large-heap backing;
+The kernel heap is 64 MiB. Each ordinary task has a 64 KiB stack and a
+1 MiB demand-backed user heap. MFS, database and netd have a 32 MiB demand-backed heap;
 windowd may map the large-window VA for GUI `FrameRegion` mappings without
-receiving that heap backing. The Mica/task image allocation is `0xd0000`
-bytes.
+receiving that heap backing. The ordinary image window is `0xe0000` bytes
+(`0x100000` on x86-64).
 
 ## Compatibility boundary
 

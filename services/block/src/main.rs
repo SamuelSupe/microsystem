@@ -112,13 +112,13 @@ pub extern "C" fn _start() -> ! {
     let mut request = Message::new(protocol::BLOCK, 0);
     let mut configured = Message::new(protocol::BLOCK, Operation::Configure as u16);
     configured.words[5] = Status::Ok as i64 as u64;
+    let _ = microsystem_user_rt::debug_write(b"[ipc] resident block endpoint=2 ready\n");
+    let _ = microsystem_user_rt::service_online();
     if microsystem_user_rt::ipc_reply_recv(boot_cap::BLOCK_ENDPOINT, &configured, &mut request, 0)
         .is_err()
     {
         microsystem_user_rt::exit(2);
     }
-    let _ = microsystem_user_rt::debug_write(b"[ipc] resident block endpoint=2 ready\n");
-    let _ = microsystem_user_rt::service_online();
     loop {
         let mut reply = Message::new(protocol::BLOCK, request.opcode);
         let status = handle_request(
@@ -177,6 +177,10 @@ fn probe_dynamic_frame(config: &TransportConfig) -> Result<(), ()> {
 
 fn configure_queue(common: usize, dma_iova: u64) -> Result<(), ()> {
     unsafe {
+        // The boot queue frame survives service restart, but VirtIO resets its
+        // indices to zero. Old avail/used indices must not be replayed as DMA.
+        core::ptr::write_bytes(QUEUE as *mut u8, 0, 4096);
+        microsystem_user_rt::fence_store();
         write16(common + 22, 0);
         let maximum = read16(common + 24);
         if maximum < 3 {
@@ -366,6 +370,9 @@ fn submit(
     data: Option<(u64, u32)>,
     irq: CapHandle,
 ) -> Result<(), ()> {
+    let deadline = microsystem_user_rt::clock_now()
+        .map_err(|_| ())?
+        .saturating_add(3_000_000_000);
     unsafe {
         write32(QUEUE + HEADER_OFFSET, request_type);
         write32(QUEUE + HEADER_OFFSET + 4, 0);
@@ -404,9 +411,19 @@ fn submit(
                     Err(())
                 };
             }
-            match microsystem_user_rt::notification_wait(boot_cap::BLOCK_IRQ_NOTIFICATION, 0) {
+            let now = microsystem_user_rt::clock_now().map_err(|_| ())?;
+            if now >= deadline {
+                let _ = microsystem_user_rt::debug_write(
+                    b"[block] DMA completion timeout; controller recovery required\n",
+                );
+                microsystem_user_rt::exit(Status::TimedOut as i64 as u64);
+            }
+            match microsystem_user_rt::notification_wait(
+                boot_cap::BLOCK_IRQ_NOTIFICATION,
+                now.saturating_add(1_000_000).min(deadline),
+            ) {
                 Ok(_) => microsystem_user_rt::irq_ack(irq).map_err(|_| ())?,
-                Err(Status::Busy) => {
+                Err(Status::Busy | Status::TimedOut) => {
                     let _ = microsystem_user_rt::yield_now();
                 }
                 Err(_) => return Err(()),

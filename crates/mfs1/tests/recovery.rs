@@ -983,12 +983,106 @@ fn legacy_zero_feature_superblocks_mount_and_gc_upgrades_layout_feature() {
     let active = disk.raw_block(legacy.stats().generation % 2);
     assert_eq!(
         raw_u32(&active, 12),
-        0x3,
-        "GC must upgrade the segment layout and directory features"
+        0xf,
+        "GC must upgrade segment layout, directory, range-write and attribute features"
     );
     let mut upgraded = FileSystem::mount(disk).unwrap();
     assert_eq!(upgraded.read("/legacy").unwrap(), b"v1 payload");
     upgraded.check().unwrap();
+}
+
+#[test]
+fn range_write_cost_tracks_modified_bytes_and_survives_gc() {
+    let disk = MemDisk::new(4096);
+    let mut fs = format(disk.clone()).unwrap();
+    let mut expected = vec![0x31; 4 * 1024 * 1024];
+    fs.put("/large", &expected).unwrap();
+    fs.sync().unwrap();
+    let writes = disk.state.lock().unwrap().writes;
+    fs.write_range("/large", 2 * 1024 * 1024 + 7, &[0xa5; 4096]).unwrap();
+    let delta = disk.state.lock().unwrap().writes - writes;
+    assert!(delta <= 8, "4 KiB patch rewrote {delta} blocks of a 4 MiB file");
+    expected[2 * 1024 * 1024 + 7..2 * 1024 * 1024 + 7 + 4096].fill(0xa5);
+    fs.write_range("/large", expected.len(), b"tail").unwrap();
+    expected.extend_from_slice(b"tail");
+    assert_eq!(fs.write_range("/large", expected.len() + 1, b"hole"), Err(Error::Invalid));
+    assert_eq!(fs.read("/large").unwrap(), expected);
+    let mut remounted = FileSystem::mount(disk.clone()).unwrap();
+    assert_eq!(remounted.read("/large").unwrap(), expected);
+    remounted.gc().unwrap();
+    remounted.check().unwrap();
+    assert_eq!(FileSystem::mount(disk).unwrap().read("/large").unwrap(), expected);
+}
+
+#[test]
+fn range_write_powercut_only_exposes_complete_old_or_new_bytes() {
+    let disk = PowerCutDisk::new(POWER_CUT_BLOCKS);
+    let mut initial = format(disk.clone()).unwrap();
+    let original = vec![0x31; 128 * 1024];
+    initial.put("/range", &original).unwrap();
+    initial.sync().unwrap();
+    disk.crash();
+    let mut expected = original.clone();
+    expected[19..19 + 4096].fill(0xa5);
+    let mut scenarios = Vec::new();
+    for offset in 0..5 {
+        for mode in [FaultMode::Io, FaultMode::ShortWrite { bytes: 137 }, FaultMode::TornSectors { mask: 0x55 }] {
+            scenarios.push((FaultOp::Write, offset, mode));
+        }
+    }
+    scenarios.extend([(FaultOp::Flush, 0, FaultMode::Io), (FaultOp::Flush, 1, FaultMode::Io)]);
+    for (op, offset, mode) in scenarios {
+        let candidate = disk.fork();
+        let mut fs = FileSystem::mount(candidate.clone()).unwrap();
+        candidate.reset_counters();
+        candidate.arm_relative(op, offset, mode);
+        let result = fs.write_range("/range", 19, &[0xa5; 4096]);
+        assert!(candidate.fault_consumed(), "unreached {op:?} {offset} {mode:?}");
+        if result.is_err() { assert_eq!(fs.read("/range").unwrap(), original); }
+        candidate.crash();
+        let mut recovered = FileSystem::mount(candidate).unwrap();
+        let bytes = recovered.read("/range").unwrap();
+        assert!(bytes == original || bytes == expected, "mixed range after {op:?} {offset} {mode:?}");
+        recovered.check().unwrap();
+    }
+}
+
+#[test]
+fn ownership_modes_timestamps_and_renamed_child_fsync_survive_gc() {
+    let disk = MemDisk::new(1024);
+    let mut fs = format(disk.clone()).unwrap();
+    fs.set_timestamp(1234);
+    fs.mkdir("/data").unwrap();
+    fs.put("/data/file", b"first").unwrap();
+    let mut attributes = fs.attributes("/data/file").unwrap();
+    assert_eq!((attributes.mode, attributes.created), (0o644, 1234));
+    fs.set_timestamp(2345);
+    attributes.uid = 1000;
+    attributes.gid = 42;
+    attributes.mode = 0o640;
+    fs.set_attributes("/data/file", attributes).unwrap();
+    fs.set_timestamp(3456);
+    fs.put("/data/file", b"second").unwrap();
+    fs.rename("/data", "/moved").unwrap();
+    fs.fsync("/moved/file").unwrap();
+    let mut expected = attributes;
+    expected.modified = 3456;
+    expected.changed = 3456;
+    let mut recovered = FileSystem::mount(disk.clone()).unwrap();
+    assert_eq!(recovered.read("/moved/file").unwrap(), b"second");
+    assert_eq!(recovered.attributes("/moved/file").unwrap(), expected);
+    assert_eq!(recovered.metadata("/data"), Err(Error::NotFound));
+    let mut invalid = expected;
+    invalid.mode = 0o1000;
+    assert_eq!(recovered.set_attributes("/moved/file", invalid), Err(Error::Invalid));
+    recovered.gc().unwrap();
+    recovered.check().unwrap();
+    let mut final_fs = FileSystem::mount(disk).unwrap();
+    assert_eq!(final_fs.attributes("/moved/file").unwrap(), expected);
+    final_fs.set_timestamp(4567);
+    final_fs.write_range("/moved/file", 0, b"S").unwrap();
+    let patched = final_fs.attributes("/moved/file").unwrap();
+    assert_eq!((patched.uid, patched.gid, patched.mode, patched.created, patched.modified), (1000, 42, 0o640, 1234, 4567));
 }
 
 #[test]
@@ -1241,6 +1335,9 @@ fn randomized_campaign_read_errors_are_observable_and_non_mutating() {
         let disk = baseline.fork();
         disk.arm_relative(FaultOp::Read, offset, FaultMode::Io);
         assert!(matches!(FileSystem::verify(disk.clone()), Err(Error::Io)));
+        disk.clear_fault();
+        disk.arm_relative(FaultOp::Read, offset, FaultMode::Io);
+        assert!(matches!(FileSystem::mount(disk.clone()), Err(Error::Io)));
         disk.clear_fault();
         let mut recovered = FileSystem::mount(disk).unwrap();
         assert_eq!(recovered.read("/a").unwrap(), b"old-a");

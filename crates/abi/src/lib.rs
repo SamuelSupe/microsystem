@@ -137,6 +137,20 @@ pub enum Syscall {
     RandomFill = 29,
     ThreadStartEx = 30,
     ClockRealtime = 31,
+    IpcTryCall = 32,
+    IpcPollReply = 33,
+    NotificationPoll = 34,
+    ServiceStatus = 35,
+    ServiceStop = 36,
+    VirtualMap = 37,
+    VirtualUnmap = 38,
+    VirtualProtect = 39,
+    VirtualStats = 40,
+    VirtualResize = 41,
+    ThreadStartNative = 42,
+    VirtualCommit = 43,
+    NetworkInterfaceInfo = 44,
+    IpcPeer = 45,
 }
 
 #[repr(u64)]
@@ -176,11 +190,104 @@ pub mod protocol {
     pub const SCRIPT: u16 = 8;
     pub const NETWORK: u16 = 9;
     pub const DATABASE: u16 = 10;
+    pub const SERVICE: u16 = 11;
+    pub const APPLICATION: u16 = 12;
+    pub const IDENTITY: u16 = 13;
+}
+
+pub mod service {
+    pub const NAMES: [&str; 13] = [
+        "init", "console", "block", "mfs", "shell", "devmgr", "windowd", "terminal", "files",
+        "monitor", "sshd", "netd", "db",
+    ];
+
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Operation {
+        List = 1,
+        Restart = 2,
+        Stop = 3,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct InfoV1 {
+        pub pid: u32,
+        pub state: u16,
+        pub version: u16,
+        pub program: u64,
+        pub starts: u64,
+        pub started_ns: u64,
+        pub online_ns: u64,
+        pub exit_status: i64,
+    }
+    impl InfoV1 {
+        pub const EMPTY: Self = Self {
+            pid: 0,
+            state: 0,
+            version: 1,
+            program: 0,
+            starts: 0,
+            started_ns: 0,
+            online_ns: 0,
+            exit_status: 0,
+        };
+    }
+    pub const STOPPED: u16 = 0;
+    pub const STARTING: u16 = 1;
+    pub const ONLINE: u16 = 2;
+    pub const STOPPING: u16 = 3;
+    pub const QUIESCE_FAILED: u16 = 4;
+}
+
+pub mod application {
+    pub const MAX_IMAGE_BYTES: usize = 1024 * 1024;
+    pub const RANDOM: u64 = 1;
+    pub const SYSTEM_INFO: u64 = 2;
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Operation {
+        Command = 1,
+    }
+}
+
+pub mod identity {
+    pub const SNAPSHOT_VA: usize = 0x005d_0000;
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Operation {
+        Command = 1,
+        AuthorizeSsh = 2,
+        DropCredential = 3,
+        SessionAccepted = 4,
+    }
+}
+
+pub mod virtual_memory {
+    pub const START: u64 = 0x0400_0000;
+    pub const END: u64 = 0x4000_0000;
+    pub const MAX_REGIONS: usize = 32;
+    pub const PAGE_BUDGET: u32 = 4096;
+    pub const READ: u64 = 1;
+    pub const WRITE: u64 = 2;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct StatsV1 {
+        pub version: u32,
+        pub regions: u32,
+        pub reserved_pages: u32,
+        pub resident_pages: u32,
+        pub page_budget: u32,
+        pub reserved: u32,
+        pub faults: u64,
+        pub allocation_failures: u64,
+    }
 }
 
 pub mod process {
     pub const FIRST_APPLICATION_PID: u64 = 14;
-    pub const MAX_APPLICATIONS: usize = 8;
+    pub const MAX_APPLICATIONS: usize = 16;
 
     #[repr(u16)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,6 +326,61 @@ pub mod filesystem {
         Stats = 14,
         WriteRange = 15,
         Replace = 16,
+        Append = 17,
+        Copy = 18,
+        Chmod = 19,
+        Chown = 20,
+        Attributes = 21,
+        MountImage = 22,
+        Unmount = 23,
+        FormatImage = 24,
+        MountList = 25,
+    }
+
+    impl Operation {
+        pub const fn from_u64(value: u64) -> Option<Self> {
+            match value {
+                1 => Some(Self::Stat),
+                2 => Some(Self::List),
+                3 => Some(Self::Read),
+                4 => Some(Self::Write),
+                5 => Some(Self::Mkdir),
+                6 => Some(Self::Sync),
+                7 => Some(Self::Open),
+                8 => Some(Self::Fsync),
+                9 => Some(Self::Rename),
+                10 => Some(Self::Unlink),
+                11 => Some(Self::Close),
+                12 => Some(Self::WriteAtomic),
+                13 => Some(Self::ReadRange),
+                14 => Some(Self::Stats),
+                15 => Some(Self::WriteRange),
+                16 => Some(Self::Replace),
+                17 => Some(Self::Append),
+                18 => Some(Self::Copy),
+                19 => Some(Self::Chmod),
+                20 => Some(Self::Chown),
+                21 => Some(Self::Attributes),
+                22 => Some(Self::MountImage),
+                23 => Some(Self::Unmount),
+                24 => Some(Self::FormatImage),
+                25 => Some(Self::MountList),
+                _ => None,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct AttributesV1 {
+        pub version: u32,
+        pub mode: u32,
+        pub uid: u32,
+        pub gid: u32,
+        pub created: u64,
+        pub modified: u64,
+        pub accessed: u64,
+        pub changed: u64,
     }
 }
 
@@ -269,6 +431,7 @@ pub const THREAD_LAUNCH_CAPS: usize = 6;
 pub const THREAD_LAUNCH_V2_CAPS: usize = 9;
 pub const THREAD_PROFILE_APPLICATION: u16 = 0;
 pub const THREAD_PROFILE_MICA: u16 = 1;
+pub const THREAD_PROFILE_NATIVE: u16 = 2;
 pub const THREAD_LAUNCH_FLAG_GUI: u32 = 1 << 0;
 
 #[repr(C)]
@@ -296,6 +459,25 @@ pub struct ThreadLaunchV2 {
 }
 
 pub mod network {
+    /// Address word marker: 16 network-order IPv6 bytes follow the hostname in
+    /// TCP/UDP request payloads. Hostname authorization still uses the original name.
+    pub const IPV6_ADDRESS: u64 = 1 << 63;
+    pub const MAX_INTERFACES: usize = 4;
+    pub const HARDWARE_ACTIVE: u16 = 1;
+    pub const HARDWARE_LINK_UP: u16 = 2;
+    pub const HARDWARE_TX_READY: u16 = 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct HardwareInfoV1 {
+        pub version: u32,
+        pub index: u32,
+        pub epoch: u64,
+        pub mac: [u8; 6],
+        pub status: u16,
+        pub mtu: u32,
+        pub requester_id: u32,
+    }
     pub const BROWSE_REQUEST_MAGIC: u64 = u64::from_le_bytes(*b"MICAWEB1");
 
     pub const VERSION: u16 = 1;
@@ -327,6 +509,7 @@ pub mod network {
         SshClose = 19,
         SshStatus = 20,
         Stats = 21,
+        Configure = 22,
     }
 }
 
@@ -417,6 +600,8 @@ pub mod gui {
     pub const EVENT_MAGIC: u32 = u32::from_le_bytes(*b"GUIE");
     pub const EVENT_RING_FLAG_CLOSE_REQUESTED: u32 = 1 << 0;
     pub const MAX_DYNAMIC_CLIENTS: usize = 8;
+    pub const MAX_CLIENT_WINDOWS: usize = 4;
+    pub const CLIPBOARD_BYTES: usize = 4096;
 
     #[repr(u16)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -431,6 +616,8 @@ pub mod gui {
         UnregisterClient = 8,
         EventConsumed = 9,
         LaunchApplication = 10,
+        ClipboardRead = 11,
+        ClipboardWrite = 12,
     }
 
     #[repr(u16)]
@@ -701,7 +888,13 @@ pub mod boot_cap {
     pub const GUI_LAUNCH_ENDPOINT: CapHandle = CapHandle::from_parts(84, 1);
     pub const SHELL_SYSTEM_CONTROL: CapHandle = CapHandle::from_parts(85, 1);
     pub const DATABASE_ENDPOINT: CapHandle = CapHandle::from_parts(86, 1);
+    pub const SERVICE_ENDPOINT: CapHandle = CapHandle::from_parts(87, 1);
     pub const DATABASE_FILESYSTEM_FRAME: CapHandle = CapHandle::from_parts(87, 1);
+    pub const ROOT_FILESYSTEM_FRAME: CapHandle = CapHandle::from_parts(88, 1);
+    pub const APPLICATION_ENDPOINT: CapHandle = CapHandle::from_parts(89, 1);
+    pub const NETWORK_FILESYSTEM_FRAME: CapHandle = CapHandle::from_parts(90, 1);
+    pub const IDENTITY_SNAPSHOT: CapHandle = CapHandle::from_parts(91, 1);
+    pub const IDENTITY_ENDPOINT: CapHandle = CapHandle::from_parts(92, 1);
 
     pub const fn gui_dynamic_endpoint(index: usize) -> CapHandle {
         CapHandle::from_parts(GUI_DYNAMIC_ENDPOINT_BASE + index as u16, 1)

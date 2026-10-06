@@ -53,7 +53,9 @@ mod allocator {
     unsafe impl GlobalAlloc for FreeList {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let _guard = lock();
-            unsafe { initialize() };
+            if !unsafe { initialize() } {
+                return ptr::null_mut();
+            }
             let mut previous = 0;
             let mut current = HEAD.load(Ordering::Relaxed);
             while current != 0 {
@@ -75,6 +77,16 @@ mod allocator {
                         .filter(|suffix| *suffix <= block_end)
                         .unwrap_or(block_end);
                     let keep_suffix = block_end - suffix >= core::mem::size_of::<FreeBlock>();
+                    let committed_end = if keep_suffix {
+                        suffix + core::mem::size_of::<FreeBlock>()
+                    } else {
+                        block_end
+                    };
+                    if super::virtual_commit(current as u64, (committed_end - current) as u64)
+                        .is_err()
+                    {
+                        return ptr::null_mut();
+                    }
                     let next = if keep_suffix { suffix } else { block.next };
                     if keep_suffix {
                         unsafe {
@@ -108,7 +120,41 @@ mod allocator {
                 previous = current;
                 current = block.next;
             }
-            ptr::null_mut()
+            let Some(bytes) = layout
+                .size()
+                .max(1)
+                .checked_add(layout.align())
+                .and_then(|bytes| bytes.checked_add(core::mem::size_of::<AllocationHeader>()))
+                .and_then(|bytes| align_up(bytes, 4096))
+            else {
+                return ptr::null_mut();
+            };
+            let Ok(base) = super::virtual_map(
+                0,
+                bytes as u64,
+                microsystem_abi::virtual_memory::READ | microsystem_abi::virtual_memory::WRITE,
+            ) else {
+                return ptr::null_mut();
+            };
+            if super::virtual_commit(base, bytes as u64).is_err() {
+                let _ = super::virtual_unmap(base);
+                return ptr::null_mut();
+            }
+            let user = align_up(
+                base as usize + core::mem::size_of::<AllocationHeader>(),
+                layout.align(),
+            )
+            .unwrap();
+            unsafe {
+                ptr::write(
+                    (user - core::mem::size_of::<AllocationHeader>()) as *mut AllocationHeader,
+                    AllocationHeader {
+                        start: base as usize,
+                        bytes,
+                    },
+                );
+            }
+            user as *mut u8
         }
 
         unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
@@ -123,6 +169,13 @@ mod allocator {
                         .cast::<AllocationHeader>(),
                 )
             };
+            if (microsystem_abi::virtual_memory::START as usize
+                ..microsystem_abi::virtual_memory::END as usize)
+                .contains(&header.start)
+            {
+                let _ = super::virtual_unmap(header.start as u64);
+                return;
+            }
             if header.start < START
                 || header.bytes < core::mem::size_of::<FreeBlock>()
                 || header
@@ -146,9 +199,12 @@ mod allocator {
         Guard
     }
 
-    unsafe fn initialize() {
-        if INITIALIZED.swap(true, Ordering::AcqRel) {
-            return;
+    unsafe fn initialize() -> bool {
+        if INITIALIZED.load(Ordering::Acquire) {
+            return true;
+        }
+        if super::virtual_commit(START as u64, 4096).is_err() {
+            return false;
         }
         unsafe {
             ptr::write(
@@ -160,6 +216,8 @@ mod allocator {
             )
         };
         HEAD.store(START, Ordering::Release);
+        INITIALIZED.store(true, Ordering::Release);
+        true
     }
 
     unsafe fn insert_free(start: usize, bytes: usize) {
@@ -759,6 +817,14 @@ pub fn gui_input(event: &mut microsystem_abi::gui::InputEvent) -> Result<(), Sta
 }
 
 pub fn net_receive(device: CapHandle, frame: &mut [u8]) -> Result<usize, Status> {
+    net_receive_on(device, 0, frame)
+}
+
+pub fn net_receive_on(
+    device: CapHandle,
+    interface: u32,
+    frame: &mut [u8],
+) -> Result<usize, Status> {
     if frame.is_empty() || frame.len() > 1536 {
         return Err(Status::Invalid);
     }
@@ -769,7 +835,7 @@ pub fn net_receive(device: CapHandle, frame: &mut [u8]) -> Result<usize, Status>
                 device.0 as u64,
                 frame.as_mut_ptr() as u64,
                 frame.len() as u64,
-                0,
+                interface as u64,
                 0,
                 0,
             ],
@@ -783,6 +849,10 @@ pub fn net_receive(device: CapHandle, frame: &mut [u8]) -> Result<usize, Status>
 }
 
 pub fn net_send(device: CapHandle, frame: &[u8]) -> Result<(), Status> {
+    net_send_on(device, 0, frame)
+}
+
+pub fn net_send_on(device: CapHandle, interface: u32, frame: &[u8]) -> Result<(), Status> {
     if frame.is_empty() || frame.len() > 1536 {
         return Err(Status::Invalid);
     }
@@ -793,12 +863,38 @@ pub fn net_send(device: CapHandle, frame: &[u8]) -> Result<(), Status> {
                 device.0 as u64,
                 frame.as_ptr() as u64,
                 frame.len() as u64,
-                0,
+                interface as u64,
                 0,
                 0,
             ],
         )
     })
+}
+
+pub fn network_interface_info(
+    device: CapHandle,
+    interface: u32,
+) -> Result<microsystem_abi::network::HardwareInfoV1, Status> {
+    let mut info = microsystem_abi::network::HardwareInfoV1::default();
+    status(unsafe {
+        syscall(
+            Syscall::NetworkInterfaceInfo,
+            [
+                device.0 as u64,
+                (&mut info as *mut microsystem_abi::network::HardwareInfoV1) as u64,
+                interface as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    })?;
+    Ok(info)
+}
+
+pub fn ipc_peer() -> Result<u64, Status> {
+    let value = unsafe { syscall(Syscall::IpcPeer, [0; 6]) };
+    if value >= 0 { Ok(value as u64) } else { Err(status_error(value)) }
 }
 
 pub fn random_fill(source: CapHandle, bytes: &mut [u8]) -> Result<(), Status> {
@@ -825,6 +921,86 @@ pub fn frame_map(frame: CapHandle, address: u64, rights: Rights) -> Result<(), S
         syscall(
             Syscall::FrameMap,
             [frame.0 as u64, address, rights.0 as u64, 0, 0, 0],
+        )
+    })
+}
+
+/// Reserves page-aligned anonymous memory. Zero selects a free address. Pages
+/// are zero-filled on first access; executable mappings are unsupported.
+pub fn virtual_map(address: u64, bytes: u64, rights: u64) -> Result<u64, Status> {
+    let result = unsafe { syscall(Syscall::VirtualMap, [address, bytes, rights, 0, 0, 0]) };
+    if result < 0 {
+        Err(status_error(result))
+    } else {
+        Ok(result as u64)
+    }
+}
+
+/// Removes the complete reservation at address and releases its resident pages.
+pub fn virtual_unmap(address: u64) -> Result<(), Status> {
+    status(unsafe { syscall(Syscall::VirtualUnmap, [address, 0, 0, 0, 0, 0]) })
+}
+
+pub fn virtual_protect(address: u64, rights: u64) -> Result<(), Status> {
+    status(unsafe { syscall(Syscall::VirtualProtect, [address, rights, 0, 0, 0, 0]) })
+}
+
+/// Resizes a complete reservation in place. A conflicting neighbour leaves
+/// the old region unchanged. Shrinking releases the discarded pages.
+pub fn virtual_resize(address: u64, bytes: u64) -> Result<(), Status> {
+    status(unsafe { syscall(Syscall::VirtualResize, [address, bytes, 0, 0, 0, 0]) })
+}
+
+pub fn virtual_stats(output: &mut microsystem_abi::virtual_memory::StatsV1) -> Result<(), Status> {
+    status(unsafe {
+        syscall(
+            Syscall::VirtualStats,
+            [output as *mut _ as u64, 0, 0, 0, 0, 0],
+        )
+    })
+}
+
+/// Init-only static ELF launch. The kernel copies and validates the image,
+/// grants only the process endpoint and the explicitly requested information
+/// capabilities, and enforces the additional anonymous-page budget.
+pub fn thread_start_native(
+    image: &[u8],
+    program: u64,
+    pages: u32,
+    permissions: u64,
+) -> Result<u64, Status> {
+    let result = unsafe {
+        syscall(
+            Syscall::ThreadStartNative,
+            [
+                image.as_ptr() as u64,
+                image.len() as u64,
+                program,
+                pages as u64,
+                permissions,
+                0,
+            ],
+        )
+    };
+    if result < 0 {
+        Err(status_error(result))
+    } else {
+        Ok(result as u64)
+    }
+}
+
+/// Ensures a writable heap/anonymous byte range is resident. NoMemory is
+/// returned before changing mappings when the physical allocation cannot fit.
+pub fn virtual_commit(address: u64, bytes: u64) -> Result<(), Status> {
+    status(unsafe { syscall(Syscall::VirtualCommit, [address, bytes, 0, 0, 0, 0]) })
+}
+
+/// Console-service-only byte output sharing the kernel diagnostic UART lock.
+pub fn console_write_bytes(bytes: &[u8]) -> Result<(), Status> {
+    status(unsafe {
+        syscall(
+            Syscall::DebugWrite,
+            [bytes.as_ptr() as u64, bytes.len() as u64, 3, 0, 0, 0],
         )
     })
 }
@@ -887,6 +1063,21 @@ pub fn notification_signal(notification: CapHandle, bits: u64) -> Result<(), Sta
             [notification.0 as u64, bits, 0, 0, 0, 0],
         )
     })
+}
+
+/// Consumes available notification bits without sleeping. Busy means no event.
+pub fn notification_poll(notification: CapHandle) -> Result<u64, Status> {
+    let value = unsafe {
+        syscall(
+            Syscall::NotificationPoll,
+            [notification.0 as u64, 0, 0, 0, 0, 0],
+        )
+    };
+    if value < 0 {
+        Err(status_error(value))
+    } else {
+        Ok(value as u64)
+    }
 }
 
 pub fn irq_bind(irq: CapHandle, notification: CapHandle) -> Result<(), Status> {
@@ -980,6 +1171,49 @@ pub fn ipc_call(
             result => return result,
         }
     }
+}
+
+/// Attempts a call without blocking or yielding. The receiver must be waiting.
+/// Only messages without capability transfers are accepted. Poll the single
+/// reply slot before submitting another call.
+pub fn ipc_try_call(endpoint: CapHandle, request: &Message) -> Result<(), Status> {
+    status(unsafe {
+        syscall(
+            Syscall::IpcTryCall,
+            [
+                endpoint.0 as u64,
+                request as *const Message as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    })
+}
+
+pub fn service_status(pid: u64, info: &mut microsystem_abi::service::InfoV1) -> Result<(), Status> {
+    status(unsafe {
+        syscall(
+            Syscall::ServiceStatus,
+            [pid, info as *mut _ as u64, 0, 0, 0, 0],
+        )
+    })
+}
+
+pub fn service_stop(pid: u64, exit_status: i64) -> Result<(), Status> {
+    status(unsafe { syscall(Syscall::ServiceStop, [pid, exit_status as u64, 0, 0, 0, 0]) })
+}
+
+/// Returns Busy while a call is pending. Successful retrieval acknowledges the
+/// reply; an invalid destination leaves it available for a subsequent poll.
+pub fn ipc_poll_reply(reply: &mut Message) -> Result<(), Status> {
+    status(unsafe {
+        syscall(
+            Syscall::IpcPollReply,
+            [reply as *mut Message as u64, 0, 0, 0, 0, 0],
+        )
+    })
 }
 
 pub fn ipc_recv(endpoint: CapHandle, message: &mut Message, deadline: u64) -> Result<(), Status> {

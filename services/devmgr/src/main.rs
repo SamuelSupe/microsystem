@@ -25,9 +25,18 @@ const FEATURE_FLUSH: u32 = 1 << 9;
 const FEATURES_HIGH_REQUIRED: u32 = 0b11;
 const STATUS_FEATURES_OK: u8 = 1 << 3;
 static GUI_PRESENT: AtomicBool = AtomicBool::new(false);
+static REUSE_TRANSPORT: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(mmio_base: u64, mmio_bytes: u64, ecam_scan: u64) -> ! {
+pub extern "C" fn _start(
+    mmio_base: u64,
+    mmio_bytes: u64,
+    ecam_scan: u64,
+    reuse: u64,
+    gui: u64,
+) -> ! {
+    REUSE_TRANSPORT.store(reuse != 0, Ordering::Release);
+    GUI_PRESENT.store(gui != 0, Ordering::Release);
     let _ = microsystem_user_rt::debug_write(b"[user] devmgr service ELF entered EL0\n");
     let mut request = Message::new(protocol::BLOCK, 0);
     if microsystem_user_rt::ipc_recv(boot_cap::DEVMGR_ENDPOINT, &mut request, 0).is_err() {
@@ -63,7 +72,9 @@ fn forward_configuration(request: &mut Message, platform: Option<(u64, u64, u64)
     {
         return Status::Invalid;
     }
-    if let Some((mmio_base, mmio_bytes, ecam_scan)) = platform {
+    if let Some((mmio_base, mmio_bytes, ecam_scan)) =
+        platform.filter(|_| !REUSE_TRANSPORT.load(Ordering::Acquire))
+    {
         let Ok((slot, function)) = discover_and_configure(mmio_base, mmio_bytes, ecam_scan) else {
             return Status::NotFound;
         };
@@ -86,7 +97,18 @@ fn forward_configuration(request: &mut Message, platform: Option<(u64, u64, u64)
             b"[devmgr] resident EL0 discovered PCI ECAM function and assigned BARs\n",
         );
     }
+    if request.words == [0; 6] {
+        let Ok(words) = transport_words() else {
+            return Status::Invalid;
+        };
+        request.words = words;
+    }
     if request.words[..=5].contains(&0) {
+        return Status::Invalid;
+    }
+    // Stopping block disables PCI bus mastering. A reused BAR layout still
+    // needs its command register restored before restarting DMA queues.
+    if configure_pci_function().is_err() {
         return Status::Invalid;
     }
     if validate_transport_layout(request).is_err() || negotiate_transport(request).is_err() {

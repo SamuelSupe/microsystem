@@ -146,7 +146,7 @@ proc.spawn:counter           启动指定名称的应用
 proc.kill:counter            控制指定名称的进程
 sys.stats                    系统统计信息
 random                       随机源
-gui.window                   一个保留式 GUI 窗口
+gui.window                   最多四个保留式 GUI 窗口
 ```
 
 `fs.read` 和 `fs.write` 是绝对路径前缀权限；`net.connect` 是大小写不敏
@@ -233,8 +233,11 @@ print(response.status, body)
 `NotSupported`；受信任的 HTTPS 路径位于 Mica runtime 内部。
 
 内置 Reader 使用 `net.browse`，对运行时选择的主机执行受限的 HTTP/HTTPS
-GET。原始 `net.resolve`、TCP、UDP 和非 GET 操作仍需要精确权限。原始网卡
-能力只属于 `netd`；Mica 只获得 broker 访问，不会得到网卡或 MMIO capability。
+GET，并在 Reader 界面层最多跟随 8 次 HTTP(S) 重定向。重定向可以切换主机；
+网页链接仍限制为同源。Reader 还拥有独立的 `fs.write:/data` 权限，用户点击
+Save 后可将最多 32,512 字节的响应原子写入 `/data`；它没有文件读取权限。
+原始 `net.resolve`、TCP、UDP 和非 GET 操作仍需要精确权限。原始网卡能力只属
+于 `netd`；Mica 只获得 broker 访问，不会得到网卡或 MMIO capability。
 
 ## 7. GUI 应用
 
@@ -286,7 +289,18 @@ app:run()
 持 `set_text`、`set_checked`、`set_items`，以及 `on_click`、`on_change`、
 `on_submit`、`on_select` 回调。
 
-一个脚本拥有一个顶层窗口。GUI 任务只获得已校验的 command、event 和端点
+获得焦点的 `text_input` 支持方向键移动光标、Home/End 跳到行首或行尾，
+Backspace/Delete 按 UTF-8 字符删除，Ctrl+A 全选；输入新字符会替换全选内容。
+点击输入框会聚焦并把光标放到末尾，Tab 在可交互控件间切换焦点，Enter 提交。
+Ctrl+C/X/V 复制、剪切、粘贴 Ctrl+A 选中的文本。`gui.clipboard.read()` 和
+`gui.clipboard.write(text)` 使用共享的 4 KiB UTF-8 剪贴板。Ctrl+Space 切换
+基础拼音输入，显示组合态和候选窗；Space/Enter 提交，1–8 选词，Backspace
+编辑，Escape 取消。可编辑 TSV 词典和边界见 `docs/gui.md`。暂不支持局部
+选区和按点击位置放置光标。
+
+一个脚本最多拥有四个顶层窗口。控件只属于一个窗口，关闭窗口会释放控件；
+`window:run()` 分发所有窗口的回调，并在指定窗口关闭时返回。GUI 任务只获得
+已校验的 command、event 和端点
 capability；它不会获得 framebuffer、GPU、输入设备、DMA、BAR 或 IRQ 权限。
 
 ## 8. 参数、时间与限制

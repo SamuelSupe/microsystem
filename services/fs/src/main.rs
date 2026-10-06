@@ -20,6 +20,8 @@ const SSH_FILESYSTEM_DATA: usize = 0x005f_0000;
 const WINDOWD_FILESYSTEM_DATA: usize = 0x0060_0000;
 const TERMINAL_FILESYSTEM_DATA: usize = 0x0061_0000;
 const DATABASE_FILESYSTEM_DATA: usize = 0x0062_0000;
+const ROOT_FILESYSTEM_DATA: usize = 0x0063_0000;
+const NETWORK_FILESYSTEM_DATA: usize = 0x0064_0000;
 const OPEN_FILE_LIMIT: usize = 16;
 const SCRIPT_SESSION_LIMIT: usize = 8;
 const SCRIPT_SESSION_VA: u64 = script::SESSION_VA;
@@ -27,6 +29,7 @@ const SCRIPT_SESSION_VA: u64 = script::SESSION_VA;
 struct OpenFiles {
     paths: [Option<String>; OPEN_FILE_LIMIT],
     generations: [u32; OPEN_FILE_LIMIT],
+    owners: [(u32, u32); OPEN_FILE_LIMIT],
 }
 
 impl OpenFiles {
@@ -34,16 +37,18 @@ impl OpenFiles {
         Self {
             paths: [const { None }; OPEN_FILE_LIMIT],
             generations: [0; OPEN_FILE_LIMIT],
+            owners: [(0, 0); OPEN_FILE_LIMIT],
         }
     }
 
-    fn open(&mut self, path: String) -> Result<u64, Error> {
+    fn open(&mut self, path: String, peer: u32, uid: u32) -> Result<u64, Error> {
         let Some(index) = self.paths.iter().position(Option::is_none) else {
             return Err(Error::NoSpace);
         };
         let generation = self.generations[index].wrapping_add(1).max(1);
         self.generations[index] = generation;
         self.paths[index] = Some(path);
+        self.owners[index] = (peer, uid);
         Ok(((generation as u64) << 32) | (index as u64 + 1))
     }
 
@@ -57,6 +62,15 @@ impl OpenFiles {
             .get(index)
             .and_then(Option::as_deref)
             .ok_or(Error::NotFound)
+    }
+
+    fn owned(&self, descriptor: u64, peer: u32, uid: u32) -> bool {
+        self.path(descriptor).is_ok()
+            && (descriptor as u32)
+                .checked_sub(1)
+                .and_then(|i| self.owners.get(i as usize))
+                .copied()
+                == Some((peer, uid))
     }
 
     fn close(&mut self, descriptor: u64) -> Result<(), Error> {
@@ -83,11 +97,23 @@ impl OpenFiles {
     fn rename_path(&mut self, source: &str, destination: &str) {
         self.invalidate_path(destination);
         for path in self.paths.iter_mut().flatten() {
-            if path.as_str() == source {
-                path.clear();
-                path.push_str(destination);
+            if path.as_str() == source
+                || path
+                    .strip_prefix(source)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                *path = destination.to_string() + &path[source.len()..];
             }
         }
+    }
+
+    fn holds_under(&self, parent: &str) -> bool {
+        self.paths.iter().flatten().any(|path| {
+            path == parent
+                || path
+                    .strip_prefix(parent)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
     }
 }
 
@@ -95,6 +121,7 @@ struct ScriptSession {
     token: u64,
     region: CapHandle,
     open_files: OpenFiles,
+    uid: u32,
 }
 
 impl ScriptSession {
@@ -103,6 +130,7 @@ impl ScriptSession {
             token: 0,
             region: CapHandle::INVALID,
             open_files: OpenFiles::new(),
+            uid: microsystem_identity::GUEST_UID,
         }
     }
 }
@@ -136,7 +164,7 @@ impl ScriptSessions {
         }
     }
 
-    fn register(&mut self, token: u64, region: CapHandle) -> Status {
+    fn register(&mut self, token: u64, region: CapHandle, uid: u32) -> Status {
         if token == 0 || region == CapHandle::INVALID || self.index(token).is_some() {
             let _ = microsystem_user_rt::cap_delete(region);
             return Status::Invalid;
@@ -159,6 +187,7 @@ impl ScriptSessions {
             token,
             region,
             open_files: OpenFiles::new(),
+            uid,
         };
         Status::Ok
     }
@@ -295,8 +324,21 @@ pub extern "C" fn _start() -> ! {
     let _ =
         microsystem_user_rt::debug_write(b"[ipc] resident mfs->block capacity-sectors=131072\n");
     let now = microsystem_user_rt::clock_now().unwrap_or(0);
-    let mut filesystem =
-        FileService::mount(disk, now).unwrap_or_else(|_| microsystem_user_rt::exit(3));
+    let mut filesystem = FileService::mount(disk, now).unwrap_or_else(|error| {
+        let mut output = String::new();
+        let _ = writeln!(output, "[mfs] mount failed error={error:?}");
+        let _ = microsystem_user_rt::debug_write(output.as_bytes());
+        microsystem_user_rt::exit(map_fs_error(error) as i64 as u64)
+    });
+    filesystem.set_timestamp(microsystem_user_rt::clock_realtime().unwrap_or(0));
+    for (line, error) in filesystem.mount_failures() {
+        let mut output = String::new();
+        let _ = writeln!(
+            &mut output,
+            "[vfs] stored mount unavailable line={line} error={error:?}"
+        );
+        let _ = microsystem_user_rt::debug_write(output.as_bytes());
+    }
     let _ = microsystem_user_rt::debug_write(b"[user] mfs1 mounted via EL0 block IPC\n");
     if filesystem.stats().checkpoint_block < 2 {
         microsystem_user_rt::exit(8);
@@ -333,13 +375,13 @@ pub extern "C" fn _start() -> ! {
     let mut fs_request = Message::new(protocol::FILESYSTEM, 0);
     let mut open_files = OpenFiles::new();
     let mut script_sessions = ScriptSessions::new();
-    if receive_with_maintenance(&mut filesystem, None, &mut fs_request).is_err() {
-        microsystem_user_rt::exit(6);
-    }
     let _ = microsystem_user_rt::debug_write(b"[ipc] resident mfs endpoint=3 ready\n");
     let _ =
         microsystem_user_rt::debug_write(b"[user] mfs1 background-writeback=1s online-gc=true\n");
     let _ = microsystem_user_rt::service_online();
+    if receive_with_maintenance(&mut filesystem, None, &mut fs_request).is_err() {
+        microsystem_user_rt::exit(6);
+    }
     loop {
         let mut reply = Message::new(protocol::FILESYSTEM, fs_request.opcode);
         reply.words[5] = handle_fs(
@@ -375,10 +417,25 @@ fn handle_fs(
     request: &Message,
     reply: &mut Message,
 ) -> Status {
+    filesystem.set_timestamp(microsystem_user_rt::clock_realtime().unwrap_or(0));
+    let peer = match microsystem_user_rt::ipc_peer() {
+        Ok(peer) => peer as u32,
+        Err(status) => return status,
+    };
     if request.opcode == filesystem::SCRIPT_REGISTER {
-        return script_sessions.register(request.words[3], request.caps[0]);
+        if peer != 1 {
+            return Status::AccessDenied;
+        }
+        return script_sessions.register(
+            request.words[3],
+            request.caps[0],
+            request.words[0] as u32,
+        );
     }
     if request.opcode == filesystem::SCRIPT_UNREGISTER {
+        if peer != 1 {
+            return Status::AccessDenied;
+        }
         return script_sessions.unregister(request.words[3]);
     }
     if request.words[4] == filesystem::SCRIPT_REQUEST_MAGIC {
@@ -394,6 +451,8 @@ fn handle_fs(
         value if value == boot_cap::WINDOWD_FILESYSTEM_FRAME => WINDOWD_FILESYSTEM_DATA,
         value if value == boot_cap::GUI_TERMINAL_COMMANDS => TERMINAL_FILESYSTEM_DATA,
         value if value == boot_cap::DATABASE_FILESYSTEM_FRAME => DATABASE_FILESYSTEM_DATA,
+        value if value == boot_cap::ROOT_FILESYSTEM_FRAME => ROOT_FILESYSTEM_DATA,
+        value if value == boot_cap::NETWORK_FILESYSTEM_FRAME => NETWORK_FILESYSTEM_DATA,
         _ => return Status::AccessDenied,
     };
     let Ok(path_length) = usize::try_from(request.words[0]) else {
@@ -408,23 +467,155 @@ fn handle_fs(
     if path_length > 255 || total_length > BLOCK_SIZE {
         return Status::Invalid;
     }
-    if request.opcode == FsOperation::Stats as u16 {
-        return write_filesystem_stats(filesystem, shared_address, reply)
-            .map(|()| Status::Ok)
-            .unwrap_or_else(map_fs_error);
-    }
     let shared = unsafe { core::slice::from_raw_parts(shared_address as *const u8, BLOCK_SIZE) };
     let Ok(path) = String::from_utf8(shared[..path_length].to_vec()) else {
         return Status::Invalid;
     };
     let data = shared[path_length..path_length + data_length].to_vec();
+    let actor = if matches!(peer, 1 | 5 | 12 | 13) && request.words[3] == 0 {
+        microsystem_identity::Actor::SYSTEM
+    } else if peer == 11 && request.words[3] == 0 {
+        if !matches!(
+            path.as_str(),
+            "/.system/ssh/host.key" | "/.system/ssh/mica-policy"
+        ) || !matches!(request.opcode, value if value == FsOperation::Stat as u16 || value == FsOperation::ReadRange as u16)
+        {
+            return Status::AccessDenied;
+        }
+        microsystem_identity::Actor::SYSTEM
+    } else {
+        let snapshot = match unsafe {
+            microsystem_identity::read_shared(microsystem_abi::identity::SNAPSHOT_VA)
+        } {
+            Ok(snapshot) => snapshot,
+            Err(status) => return status,
+        };
+        match snapshot.actor(
+            peer,
+            request.words[3],
+            microsystem_user_rt::clock_now().unwrap_or(0),
+        ) {
+            Ok(actor) => actor,
+            Err(status) => return status,
+        }
+    };
+    if peer == 11 && request.words[3] == 0 && request.caps[0] != boot_cap::SSH_FILESYSTEM_FRAME {
+        return Status::AccessDenied;
+    }
+    let descriptor = request.words[2];
+    let uses_descriptor = matches!(request.opcode, value if value == FsOperation::Read as u16 || value == FsOperation::Write as u16 || value == FsOperation::Fsync as u16 || value == FsOperation::Close as u16)
+        && descriptor != 0;
+    if uses_descriptor && !open_files.owned(descriptor, peer, actor.uid) {
+        return Status::AccessDenied;
+    }
+    let resolved = if uses_descriptor {
+        open_files.path(descriptor).unwrap().to_string()
+    } else {
+        path.clone()
+    };
+    let checked = match microsystem_fs::access::authorize(
+        filesystem,
+        actor,
+        request.opcode,
+        &resolved,
+        &data,
+    ) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let created = filesystem.metadata(&checked) == Err(Error::NotFound)
+        && matches!(request.opcode, value if value == FsOperation::Write as u16 || value == FsOperation::Append as u16 || value == FsOperation::Mkdir as u16);
+    if request.opcode == FsOperation::Stats as u16 {
+        return write_filesystem_stats(
+            filesystem,
+            if path.is_empty() { "/" } else { &path },
+            shared_address,
+            reply,
+        )
+        .map(|()| Status::Ok)
+        .unwrap_or_else(map_fs_error);
+    }
     let result = match request.opcode {
         value if value == FsOperation::Stat as u16 => {
             require_path(&path).and_then(|path| stat_path(filesystem, path, reply))
         }
+        value if value == FsOperation::FormatImage as u16 => require_path(&path).and_then(|path| {
+            let mib = u32::try_from(request.words[2]).map_err(|_| Error::Invalid)?;
+            filesystem.format_image(path, mib)
+        }),
+        value if value == FsOperation::MountImage as u16 => require_path(&path).and_then(|image| {
+            let point = core::str::from_utf8(&data).map_err(|_| Error::Utf8)?;
+            if request.words[2] > 1 {
+                return Err(Error::Invalid);
+            }
+            filesystem.mount_image(image, point, request.words[2] != 0)
+        }),
+        value if value == FsOperation::Unmount as u16 => require_path(&path).and_then(|point| {
+            let point = mfs1::normalize(point)?;
+            if open_files.holds_under(&point)
+                || script_sessions
+                    .entries
+                    .iter()
+                    .any(|session| session.token != 0 && session.open_files.holds_under(&point))
+            {
+                return Err(Error::Busy);
+            }
+            filesystem.unmount(&point)
+        }),
+        value if value == FsOperation::MountList as u16 => {
+            let mut output = String::new();
+            output
+                .try_reserve(4096)
+                .map_err(|_| Error::NoSpace)
+                .and_then(|()| {
+                    output.push_str("/ device rw\n");
+                    for mount in filesystem.mounts() {
+                        let _ = writeln!(
+                            &mut output,
+                            "{} {} {}",
+                            mount.point,
+                            mount.image,
+                            if mount.readonly { "ro" } else { "rw" }
+                        );
+                    }
+                    for (line, error) in filesystem.mount_failures() {
+                        let _ = writeln!(&mut output, "unavailable line={line} error={error:?}");
+                    }
+                    write_shared(shared_address, output.as_bytes(), reply)
+                })
+        }
+        value if value == FsOperation::Attributes as u16 => require_path(&path).and_then(|path| {
+            let attributes = filesystem.attributes(path)?;
+            let payload = filesystem::AttributesV1 {
+                version: 1,
+                mode: attributes.mode,
+                uid: attributes.uid,
+                gid: attributes.gid,
+                created: attributes.created,
+                modified: attributes.modified,
+                accessed: attributes.accessed,
+                changed: attributes.changed,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&payload as *const filesystem::AttributesV1).cast::<u8>(),
+                    core::mem::size_of_val(&payload),
+                )
+            };
+            write_shared(shared_address, bytes, reply)
+        }),
+        value if value == FsOperation::Chmod as u16 => require_path(&path).and_then(|path| {
+            let mode = u32::try_from(request.words[2]).map_err(|_| Error::Invalid)?;
+            filesystem.chmod(path, mode)
+        }),
+        value if value == FsOperation::Chown as u16 => require_path(&path).and_then(|path| {
+            let uid = request.words[2] as u32;
+            let gid = (request.words[2] >> 32) as u32;
+            filesystem.chown(path, uid, gid)
+        }),
         value if value == FsOperation::Open as u16 => require_path(&path).and_then(|path| {
             stat_path(filesystem, path, reply)?;
-            reply.words[0] = open_files.open(path.to_string())?;
+            reply.words[0] = open_files.open(path.to_string(), peer, actor.uid)?;
             Ok(())
         }),
         value if value == FsOperation::List as u16 => filesystem
@@ -440,8 +631,26 @@ fn handle_fs(
         value if value == FsOperation::Write as u16 => {
             request_path(request, &path, open_files).and_then(|path| filesystem.write(&path, &data))
         }
+        value if value == FsOperation::Copy as u16 => require_path(&path).and_then(|source| {
+            let destination = core::str::from_utf8(&data).map_err(|_| Error::Invalid)?;
+            require_path(destination)?;
+            if filesystem.metadata(destination) != Err(Error::NotFound) {
+                return Err(Error::AlreadyExists);
+            }
+            let bytes = filesystem.read(source)?;
+            filesystem.write(destination, &bytes)
+        }),
         value if value == FsOperation::WriteRange as u16 => require_path(&path)
             .and_then(|path| write_range(filesystem, path, request.words[2], &data)),
+        value if value == FsOperation::Append as u16 => require_path(&path).and_then(|path| {
+            if created {
+                filesystem.write(path, &data)?;
+                microsystem_fs::access::own_created(filesystem, actor, path)?;
+                filesystem.fsync(path)
+            } else {
+                filesystem.append(path, &data)
+            }
+        }),
         value if value == FsOperation::Mkdir as u16 => match filesystem.mkdir(&path) {
             Err(Error::AlreadyExists) if filesystem.metadata(&path) == Ok(Metadata::Directory) => {
                 Ok(())
@@ -449,12 +658,18 @@ fn handle_fs(
             result => result,
         },
         value if value == FsOperation::Sync as u16 => filesystem.sync(),
-        value if value == FsOperation::Fsync as u16 => open_files
-            .path(request.words[2])
-            .map(str::to_string)
-            .and_then(|path| filesystem.fsync(&path)),
+        value if value == FsOperation::Fsync as u16 => {
+            if request.words[2] == 0 {
+                require_path(&path).and_then(|path| filesystem.fsync(path))
+            } else {
+                open_files
+                    .path(request.words[2])
+                    .map(str::to_string)
+                    .and_then(|path| filesystem.fsync(&path))
+            }
+        }
         value if value == FsOperation::Rename as u16 => {
-            let destination = String::from_utf8(data).map_err(|_| Error::Utf8);
+            let destination = String::from_utf8(data.clone()).map_err(|_| Error::Utf8);
             destination.and_then(|destination| {
                 filesystem.rename(&path, &destination)?;
                 open_files.rename_path(&path, &destination);
@@ -463,7 +678,7 @@ fn handle_fs(
             })
         }
         value if value == FsOperation::Replace as u16 => {
-            let destination = String::from_utf8(data).map_err(|_| Error::Utf8);
+            let destination = String::from_utf8(data.clone()).map_err(|_| Error::Utf8);
             destination.and_then(|destination| {
                 filesystem.replace_file(&path, &destination)?;
                 open_files.rename_path(&path, &destination);
@@ -478,6 +693,19 @@ fn handle_fs(
         value if value == FsOperation::Close as u16 => open_files.close(request.words[2]),
         _ => return Status::Invalid,
     };
+    if result.is_ok() && created {
+        if let Err(error) = microsystem_fs::access::own_created(filesystem, actor, &checked) {
+            return map_fs_error(error);
+        }
+    }
+    if result.is_ok() && request.opcode == FsOperation::Copy as u16 {
+        if let Ok(destination) = core::str::from_utf8(&data) {
+            if let Err(error) = microsystem_fs::access::own_created(filesystem, actor, destination)
+            {
+                return map_fs_error(error);
+            }
+        }
+    }
     match result {
         Ok(()) => Status::Ok,
         Err(Error::NotFound) => Status::NotFound,
@@ -498,6 +726,18 @@ fn handle_script_fs(
     let Some(index) = sessions.index(token) else {
         return Status::AccessDenied;
     };
+    let uid = sessions.entries[index].uid;
+    let actor =
+        match unsafe { microsystem_identity::read_shared(microsystem_abi::identity::SNAPSHOT_VA) }
+            .and_then(|s| {
+                s.uid(uid)
+                    .filter(|u| u.enabled())
+                    .map(|u| u.actor())
+                    .ok_or(Status::AccessDenied)
+            }) {
+            Ok(actor) => actor,
+            Err(status) => return status,
+        };
     let path_length = request.words[0] as usize;
     let data_length = request.words[1] as usize;
     if path_length > 1024
@@ -590,6 +830,17 @@ fn handle_script_fs(
             }
         }
 
+        if let Err(status) = microsystem_fs::access::authorize(
+            filesystem_service,
+            actor,
+            operation,
+            &resolved_path,
+            &data,
+        ) {
+            return status;
+        }
+        let created = filesystem_service.metadata(&resolved_path) == Err(Error::NotFound)
+            && matches!(operation, value if value == FsOperation::Write as u16 || value == FsOperation::WriteAtomic as u16 || value == FsOperation::Mkdir as u16);
         let outcome = match operation {
             value if value == FsOperation::Stat as u16 => {
                 stat_path(filesystem_service, &resolved_path, reply)
@@ -617,8 +868,20 @@ fn handle_script_fs(
                     Err(status) => return status,
                 };
                 let durable = request.words[2] & 1 != 0;
+                let original = filesystem_service.attributes(&resolved_path).ok();
                 filesystem_service
-                    .write(&temporary, &data)
+                    .write(&temporary, &[])
+                    .and_then(|()| {
+                        let mut attributes = filesystem_service.attributes(&temporary)?;
+                        attributes.uid = original.map_or(actor.uid, |a| a.uid);
+                        attributes.gid = original.map_or(actor.gid, |a| a.gid);
+                        attributes.mode = original.map_or(0o644, |a| a.mode);
+                        if let Some(original) = original {
+                            attributes.created = original.created;
+                        }
+                        filesystem_service.set_attributes(&temporary, attributes)?;
+                        filesystem_service.write(&temporary, &data)
+                    })
                     .and_then(|()| {
                         if durable {
                             filesystem_service.fsync(&temporary)
@@ -644,9 +907,11 @@ fn handle_script_fs(
             value if value == FsOperation::Sync as u16 => filesystem_service.sync(),
             value if value == FsOperation::Open as u16 => {
                 stat_path(filesystem_service, &resolved_path, reply).and_then(|()| {
-                    reply.words[0] = sessions.entries[index]
-                        .open_files
-                        .open(resolved_path.clone())?;
+                    reply.words[0] = sessions.entries[index].open_files.open(
+                        resolved_path.clone(),
+                        0,
+                        actor.uid,
+                    )?;
                     Ok(())
                 })
             }
@@ -673,6 +938,13 @@ fn handle_script_fs(
             }
             _ => return Status::Invalid,
         };
+        if outcome.is_ok() && created {
+            if let Err(error) =
+                microsystem_fs::access::own_created(filesystem_service, actor, &resolved_path)
+            {
+                return map_fs_error(error);
+            }
+        }
         outcome.map(|()| Status::Ok).unwrap_or_else(map_fs_error)
     })();
     let _ = microsystem_user_rt::frame_unmap(region, SCRIPT_SESSION_VA);
@@ -870,6 +1142,9 @@ fn map_fs_error(error: Error) -> Status {
         Error::NoSpace => Status::NoSpace,
         Error::Io => Status::Io,
         Error::Corrupt => Status::Corrupt,
+        Error::Busy => Status::Busy,
+        Error::CrossDevice => Status::NotSupported,
+        Error::ReadOnly => Status::AccessDenied,
         _ => Status::Invalid,
     }
 }
@@ -894,6 +1169,10 @@ fn stat_path(
     path: &str,
     reply: &mut Message,
 ) -> Result<(), Error> {
+    let attributes = filesystem.attributes(path)?;
+    reply.words[2] = attributes.mode as u64;
+    reply.words[3] = attributes.uid as u64 | ((attributes.gid as u64) << 32);
+    reply.words[4] = attributes.modified;
     match filesystem.metadata(path) {
         Ok(Metadata::File { bytes }) => {
             reply.words[0] = 1;
@@ -912,10 +1191,11 @@ fn stat_path(
 
 fn write_filesystem_stats(
     filesystem: &FileService<IpcDisk>,
+    path: &str,
     shared_address: usize,
     reply: &mut Message,
 ) -> Result<(), Error> {
-    let stats = filesystem.stats();
+    let stats = filesystem.stats_path(path)?;
     let output = FilesystemStatsV1 {
         version: 1,
         reserved: 0,
@@ -948,23 +1228,8 @@ fn write_range(
     offset: u64,
     data: &[u8],
 ) -> Result<(), Error> {
-    let mut bytes = filesystem.read(path)?;
     let offset = usize::try_from(offset).map_err(|_| Error::Invalid)?;
-    if offset > bytes.len() {
-        return Err(Error::Invalid);
-    }
-    if data.is_empty() {
-        return Ok(());
-    }
-    let end = offset.checked_add(data.len()).ok_or(Error::NoSpace)?;
-    if end > bytes.len() {
-        bytes
-            .try_reserve_exact(end - bytes.len())
-            .map_err(|_| Error::NoSpace)?;
-        bytes.resize(end, 0);
-    }
-    bytes[offset..end].copy_from_slice(data);
-    filesystem.write(path, &bytes)
+    filesystem.write_range(path, offset, data)
 }
 
 fn receive_with_maintenance(

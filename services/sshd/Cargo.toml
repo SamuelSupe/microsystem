@@ -9,6 +9,7 @@ build = "../user-build.rs"
 [dependencies]
 embedded-io-async = { version = "0.6", default-features = false }
 microsystem-abi = { path = "../../crates/abi" }
+microsystem-identity = { path = "../../crates/identity" }
 microsystem-shell = { path = "../shell" }
 microsystem-mica = { path = "../../crates/mica", default-features = false }
 microsystem-user-rt = { path = "../../crates/user-rt", optional = true }

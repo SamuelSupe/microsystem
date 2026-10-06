@@ -69,7 +69,10 @@ mechanism path uses long mode, the local APIC timer, IOAPIC INTx routing, Intel
 VT-d for DMA isolation, and VirtIO for block, network, and RNG devices. PCI
 interrupt routing reads the firmware-provided PCI Interrupt Line; the accepted
 VirtIO-blk run bound line 11 to `ioapic-id=11` and observed two INTx
-completions.
+completions. VirtIO PCI discovery bounds each capability region to the firmware
+MMIO window and the probed size of its assigned BAR, validates common and
+notification region sizes, and checks queue notification offsets before
+writing them.
 
 `ARCH=x86_64 make build` passed; the full `make ARCH=x86_64 test` matrix has not
 been run and is not a PASS result.
@@ -89,10 +92,31 @@ bounded SMMUv3 domain. On RISC-V, S-mode performs the corresponding DTB,
 Sv39, PLIC/SBI, PCI VirtIO and RISC-V IOMMU setup. Both paths prepare init/root
 and one idle task per CPU/hart; init then starts resident EL0 services by bootfs
 name, and each service is re-parsed as a static ELF64 `ET_EXEC` image with
-page-granular W^X checks. On x86_64, the Multiboot2 entry installs long-mode
+page-granular W^X checks; its entry point must lie in an executable `PT_LOAD`
+segment. On x86_64, the Multiboot2 entry installs long-mode
 high-half/user mappings, initializes the local APIC timer and IOAPIC, creates the
 Intel VT-d domain, and prepares the same init/root and resident EL0 service
 layout.
+
+The boot entry passes Multiboot2 information into discovery. The memory map
+preserves usable intervals and firmware/module reservations; ACPI RSDT/XSDT,
+MADT, MCFG and DMAR are length/checksum checked. Enabled CPU IDs select the
+bootstrap and secondary APIC destinations. Static `\_SB.PCI0._CRS` buffers
+provide the root MMIO allocation window; dynamic AML methods remain unsupported.
+The current VT-d profile accepts one segment-zero hardware unit and records its
+endpoint scope. Early mapping bounds allocatable x86 memory to the first 4 GiB;
+the frame allocator reserves all low boot/kernel/heap memory across intervals.
+Firmware-table errors retain diagnostics and do not invent replacement resources.
+
+Each PCI requester stream gets its own IOMMU context and page tables. Runtime
+DMA mappings stay in the block stream; network, RNG, GPU and input streams
+receive only their own queue and framebuffer pages. The physical allocator
+reads all FDT RAM regions, excludes `/memreserve/` and `/reserved-memory`
+ranges, and tracks at most 256 MiB of frames. It fails closed if its fixed
+memory-map tables overflow. PCIe bridge setup assigns bounded secondary buses
+and memory windows; the software limit is eight buses. Modern VirtIO-net
+discovery includes those buses. AArch64 uses SMMUv3 two-level stream tables,
+covering 16-bit requester IDs with eight resident second-level tables.
 
 The bootfs has 25 entries (24 static ELF files and `etc/services`).
 `SERVICE_COUNT=13` and the service-slot order is:
@@ -106,16 +130,73 @@ Without GPU/input, init starts the non-GUI manifest
 starts `windowd,terminal,files,monitor`. The serial readiness mask reports
 `8/8` for its required slots, while the GUI profile enables all 13 slots and
 reports `13/13`. Service address spaces use ASIDs `0x20..0x2c`. Ordinary
-application slots are independent, capacity eight, and the first dynamic PID
+application slots are independent, capacity sixteen, and the first dynamic PID
 is 14. The tested Mica process is created through `ThreadStartEx` and is not a
 resident service.
 
-Each ordinary task receives a 64 KiB stack, a 1 MiB user-rt heap and a
-`0xe0000`-byte image window. MFS receives a 32 MiB large-heap backing; windowd
+Each ordinary task receives a 64 KiB stack, a 1 MiB demand-backed user-rt heap
+and a `0xe0000`-byte image window (`0x100000` on x86-64). MFS and database
+receive a 32 MiB demand-backed heap; windowd
 is allowed to map the large-window VA for GUI `FrameRegion` mappings but does
 not receive that heap backing. The kernel's lock-free zeroing bump heap is
-128 MiB; the FrameAllocator starts after it and is separately protected. User
+64 MiB; the FrameAllocator starts after it and is separately protected. User
 mappings and ASIDs are invalidated on exit/reuse.
+
+Tasks also have 32 anonymous virtual regions with a 16 MiB reservation budget.
+Reservations consume physical pages on first access. They support in-place
+growth/shrink, read-only protection and complete unmapping; exit, faults and
+kill reclaim data and page-table pages. User-rt uses this path for allocations
+that exceed its initial heap. `VirtualStats` and process owned-page counters
+expose memory use. The allocator no longer preallocates and clears 1 MiB for
+every ordinary task or 32 MiB for each storage/database service.
+
+## Service lifecycle
+
+Init supervises every started service except itself. The kernel retains service
+identity, startup epochs, readiness times and exit status, completes abandoned
+IPC with `Io`, and restores the service's fixed boot grants on restart. Runtime
+caps and mappings are reclaimed before reloading an image. VirtIO block must
+acknowledge controller reset and complete IOMMU unmapping before DMA memory is
+released; failed quiescence pins the memory and disables automatic restart.
+
+Init stops dependent services and script sessions, then restarts in dependency
+order. Startup has a 120-second limit. Recovery waits 1, 2, 4, 8, 16 and then
+30 seconds between repeated failures, with eight attempts before an explicit
+administrative restart is required. Sixty seconds online resets this budget.
+Service initialization reports online before waiting for its first client, so
+recovery cannot deadlock on readiness. Shell can operate with storage/database
+unavailable. `service list`, `service status NAME`, `service stop NAME` and
+`service restart NAME` are available from shell and GUI Terminal.
+
+Runtime initialization fills the scheduler state in place. A large temporary
+must not remain on the kernel stack under every exception. Frame-region lookup
+borrows the registry entry under the scheduler lock instead of copying an
+8 KiB frame list into each lookup's stack frame.
+
+## Native installation and execution
+
+Init owns the application manager endpoint and a separate filesystem frame.
+`app install/update NAME VERSION /absolute/ELF [PAGES] [none|random|stats|all]`
+copies a static ELF to an immutable version, validates it and stores its SHA-256,
+anonymous-memory budget and read-capability grants. Files and metadata are
+fsynced before an atomic active-version pointer is published. `app rollback`
+verifies the preceding version before swapping that pointer. Launch revalidates
+ELF bounds and the checksum, then the kernel snapshots the file bytes. Existing
+process images are independent of filesystem updates. The checksum detects
+corruption; publication is authorized by the installer capability.
+
+`app list/info/run/exec` are also available in Terminal. Unregistered `exec`
+accepts an absolute static ELF path with the default memory budget and no
+information capabilities. The manager is separate from the ordinary process
+broker; the process broker cannot launch core service identities. Native
+applications receive no process-control, filesystem or network endpoint, and
+information capabilities are explicitly selected at installation.
+
+The initial user heap is 1 MiB; `PAGES` bounds additional anonymous memory
+(1–4,096 pages). The kernel heap reservation is now 64 MiB and holds fixed image,
+stack and page-table slots. User data uses the frame allocator. The pressure
+fixture is loaded from MFS, holds 16 MiB per process, and observes `NoMemory`
+before any partial commit. It is outside the boot archive.
 
 ## EL1/EL0 boundary
 
@@ -170,10 +251,13 @@ The network permission boundary is split intentionally. Exact
 methods. The unscoped `net.browse` rule is consumed only by the Reader's
 `http.get` path for dynamic HTTP/HTTPS GET destinations; its private broker
 marker cannot be set by script-level network calls. Page links remain
-same-origin, while an explicit address-bar URL may choose another origin.
-TLS 1.3 validation retains the trust anchor when a server repeats it as the
-chain tail (the redundant tail is omitted before revalidation) and explicitly
-supports P-384 ECDSA `CertificateVerify`.
+same-origin, while an explicit address-bar URL or redirect may choose another
+origin. The fixed Reader policy also grants `fs.write:/data` so its explicit
+Save control can atomically persist a loaded response of at most 32,512 bytes;
+it does not grant filesystem reads. TLS 1.3 validation retains the trust
+anchor when a server repeats it as the chain tail (the redundant tail is
+omitted before revalidation) and explicitly supports P-384 ECDSA
+`CertificateVerify`.
 
 ### User-space SQL service
 
@@ -212,6 +296,14 @@ lookup, read, metadata/stat, put, mkdir and rename validation. `list` derives
 only path names for its result instead of cloning file bodies, while chained
 rename/recreate/remove paths are resolved against the ordered mutation view and
 remain stable after sync/remount.
+
+Range writes publish Patch records for the modified bytes and preserve file
+ownership/mode/birth time. Attributes are separate checksummed records with four
+Unix-second timestamps; the service samples RTC time for modifications and uses
+noatime for reads. A file fsync includes preceding directory renames affecting
+that file. Transactions that fit one segment are kept together, so metadata
+records do not join otherwise independent GC victims. These formats, durability
+rules and current memory limits are described in `docs/mfs1.md`.
 
 MFS1 remains format version 1. Each metadata root has two independent
 CRC32C-checked superblock copies; mount validates the head and then replays the
@@ -335,8 +427,14 @@ mutation. The GUI partial-Present path remains bounded across user-rt, kernel,
 GPU and windowd, with pointer damage carried through to redraw.
 
 The built-in Terminal has a bounded command surface (`ls/list`, `cat/read`,
-`stat`, `touch/create`, `cp`, `write`, `mkdir`, `rmdir`, `mv/rename`,
-`rm/remove/unlink`, `fsync`, `sync`) over absolute paths only. Its commands use
+`stat`, `touch/create`, `cp`, `write`, `append`, `mkdir`, `rmdir`, `mv/rename`,
+`rm/remove/unlink`, `fsync`, `sync`) with terminal-local `pwd`/`cd` and relative
+path resolution. Whole file arguments support single/double quotes without
+escapes, expansion or concatenation. `mv` resolves directory destinations to
+the source basename and retains the no-overwrite contract. `Append=17` reads
+the current EOF and publishes one complete candidate within the serialized
+MFS service, avoiding a client-side stat/write race; durability requires
+`fsync` or `sync`. Its commands use
 the dedicated `TERMINAL_FILESYSTEM_ENDPOINT` and terminal-only
 `GUI_TERMINAL_COMMANDS` 4 KiB shared frame; the MFS broker keeps this frame
 separate from block-DMA and other filesystem payload frames. Command input is
@@ -352,6 +450,36 @@ The serial shell additionally exposes `help`, `pwd`, `cd`, `echo`, `clear`,
 `curl`, `nslookup`, `netstat`, `run`, `mica`, `exit`, `shutdown`, `poweroff`,
 and `reboot`. `fs <command>` exposes the filesystem commands and aliases;
 `head/tail -n N`, `mkdir -p`, `cp -r`, and `rm -r` are supported bounded forms.
-The serial shell and GUI Terminal share the filesystem parser, aliases, absolute
-path semantics and MFS broker; process/network/Mica/power commands are serial
-only.
+The serial shell and GUI Terminal share the filesystem parser, aliases and
+working-directory path semantics. Terminal `ps` uses the process broker to
+list application state and shares boot-program name resolution with the
+serial shell. Terminal also supports `kill`, `wait`, system/time/history
+commands, `netstat` and power control. DNS, curl, SQL and Mica execution use
+the serial shell.
+
+## Firmware, devices and identities
+
+The x86 profile passes Multiboot2 information to the kernel and uses its memory
+map/modules plus checksummed ACPI MADT/MCFG/DMAR and static root-bridge `_CRS`
+resources. Dynamic AML execution and multiple VT-d units are unsupported and
+remain outside the QEMU profile. AArch64 preserves a supplied DTB; its ELF
+loader fallback uses QEMU's DTB at 0x40000000. FDT discovery includes all memory
+nodes and reserved regions. Kernel mappings currently use the first 4 GiB and
+the scheduler activates at most two CPUs even when firmware reports more.
+
+PCIe allocation tracks up to eight buses and forwards subordinate bus numbers
+through ancestor bridges. The network device scanner exposes up to four modern
+VirtIO interfaces, with independent queues, MAC/link/epoch state, BAR assignment
+and PCIe slot removal. SMMUv3, RISC-V IOMMU and VT-d tables admit those bridge
+requester IDs. BAR sizing is cached while device/address identity is unchanged,
+so active DMA mappings are not invalidated by a resource re-probe. Failed
+activation disables bus mastering and reports once until the device changes.
+Physical drivers and motherboard qualification await the user's target machine.
+
+Init owns accounts and publishes an atomic readonly snapshot to trusted brokers.
+The filesystem applies UID/GID/mode plus ancestor-search permissions after VFS
+routing; init applies role and process ownership to launches/kills; administrative
+service/network/app/SQL operations require an administrator. SSH has a signed-key
+transport plus init-issued credentials, checks epoch/expiry on channel I/O, and
+persists host-key rotation. See [identity.md](identity.md) for bootstrap trust,
+limits, local audit and failure recovery.

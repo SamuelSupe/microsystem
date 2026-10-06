@@ -1,12 +1,52 @@
 use microsystem_abi::{CapHandle, Message, ObjectType, Rights, Status};
 use microsystem_kernel::capability::{CapabilityTable, MAX_CAPABILITIES};
 use microsystem_kernel::elf::{EM_AARCH64, ET_EXEC, ElfImage, PF_W, PF_X, USER_MIN};
-use microsystem_kernel::ipc::{EndpointQueue, Envelope};
+use microsystem_kernel::ipc::{EndpointQueue, Envelope, ReplySlot};
 use microsystem_kernel::memory::{FrameAllocator, Mapping, PAGE_SIZE};
 use microsystem_kernel::scheduler::{Scheduler, ThreadState};
 
 fn rights(bits: &[Rights]) -> Rights {
     Rights(bits.iter().fold(0, |value, right| value | right.0))
+}
+
+#[test]
+fn asynchronous_reply_is_owned_until_consumed_and_other_calls_can_progress() {
+    let mut waiting = ReplySlot::Idle;
+    let mut independent = ReplySlot::Idle;
+    let reply = Message::new(6, 1);
+    waiting.begin(7).unwrap();
+    assert_eq!(waiting.result(), Err(Status::Busy));
+    independent.begin(9).unwrap();
+    independent.complete(9, reply).unwrap();
+    assert_eq!(independent.result(), Ok(reply));
+    assert_eq!(waiting.complete(9, reply), Err(Status::AccessDenied));
+    waiting.complete(7, reply).unwrap();
+    assert_eq!(waiting.begin(7), Err(Status::Busy));
+    assert_eq!(waiting.result(), Ok(reply));
+    assert_eq!(waiting.result(), Ok(reply));
+    waiting = ReplySlot::Idle;
+    waiting.begin(7).unwrap();
+}
+
+#[test]
+fn service_boot_snapshot_retains_handles_without_resurrecting_runtime_resources() {
+    let mut table = CapabilityTable::new();
+    let boot = table
+        .insert_root(27, ObjectType::Endpoint, Rights::READ)
+        .unwrap();
+    let runtime = table
+        .insert_root(1000, ObjectType::Frame, Rights::READ)
+        .unwrap();
+    let mut restored = table.snapshot_matching(|capability| capability.object < 100);
+    assert_eq!(restored.lookup(boot, Rights::READ).unwrap().object, 27);
+    assert_eq!(
+        restored.lookup(runtime, Rights::READ),
+        Err(Status::BadCapability)
+    );
+    let replacement = restored
+        .insert_root(1001, ObjectType::Frame, Rights::READ)
+        .unwrap();
+    assert_ne!(runtime, replacement);
 }
 
 #[test]
@@ -188,6 +228,21 @@ fn allocator_respects_reservations_and_double_release() {
 }
 
 #[test]
+fn firmware_low_memory_stays_reserved_after_main_ram_exhaustion() {
+    use microsystem_kernel::memory::PhysicalRange;
+    let mut allocator = FrameAllocator::empty();
+    allocator.initialize_regions(&[
+        PhysicalRange { base: 0, bytes: 4 * PAGE_SIZE },
+        PhysicalRange { base: 0x0200_0000, bytes: 2 * PAGE_SIZE },
+    ]).unwrap();
+    allocator.reserve(0, 0x0200_0000).unwrap();
+    assert_eq!(allocator.allocate().unwrap(), 0x0200_0000);
+    assert_eq!(allocator.allocate().unwrap(), 0x0200_1000);
+    assert_eq!(allocator.allocate(), Err(Status::NoMemory));
+    assert_eq!(allocator.release(0x1000), Err(Status::Invalid));
+}
+
+#[test]
 fn mapping_validation_enforces_alignment_and_w_x() {
     let valid = Mapping {
         virtual_address: 0x4000,
@@ -222,7 +277,7 @@ fn elf_loader_rejects_wx_segments_sharing_one_page() {
     image[4] = 2;
     image[5] = 1;
     put_u16(&mut image, 16, ET_EXEC);
-    put_u16(&mut image, 18, EM_AARCH64);
+    put_u16(&mut image, 18, test_machine());
     put_u64(&mut image, 24, USER_MIN);
     put_u64(&mut image, 32, 64);
     put_u16(&mut image, 54, 56);
@@ -235,6 +290,35 @@ fn elf_loader_rejects_wx_segments_sharing_one_page() {
     put_load_segment(&mut image, 120, 0x120, USER_MIN + 0x10, 0x10, PF_W);
 
     assert!(matches!(ElfImage::parse(&image), Err(Status::Invalid)));
+}
+
+#[test]
+fn static_loader_rejects_interpreters_and_dynamic_tables_before_execution() {
+    for kind in [2, 3] {
+        let mut image = vec![0u8; 0x140];
+        image[..4].copy_from_slice(b"\x7fELF");
+        image[4] = 2;
+        image[5] = 1;
+        put_u16(&mut image, 16, ET_EXEC);
+        put_u16(&mut image, 18, test_machine());
+        put_u64(&mut image, 24, USER_MIN);
+        put_u64(&mut image, 32, 64);
+        put_u16(&mut image, 54, 56);
+        put_u16(&mut image, 56, 2);
+        put_load_segment(&mut image, 64, 0x100, USER_MIN, 0x10, PF_X);
+        put_u32(&mut image, 120, kind);
+        assert!(matches!(ElfImage::parse(&image), Err(Status::NotSupported)));
+    }
+}
+
+fn test_machine() -> u16 {
+    if cfg!(target_arch = "x86_64") {
+        microsystem_kernel::elf::EM_X86_64
+    } else if cfg!(target_arch = "riscv64") {
+        microsystem_kernel::elf::EM_RISCV
+    } else {
+        EM_AARCH64
+    }
 }
 
 fn put_load_segment(

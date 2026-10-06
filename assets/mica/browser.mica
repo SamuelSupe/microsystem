@@ -1,9 +1,11 @@
 --!mica 1
 --!allow gui.window
 --!allow net.browse
+--!allow fs.write:/data
 
 local gui = require("gui")
 local http = require("http")
+local fs = require("fs")
 local bytes = require("bytes")
 local string = require("string")
 local table = require("table")
@@ -13,6 +15,20 @@ local PAGE_LINES = 18
 local LINE_WIDTH = 64
 local MAX_DOCUMENT_LINES = 96
 local MAX_BODY_BYTES = 98304
+local MAX_REDIRECTS = 8
+local MAX_SAVE_BYTES = 32512
+
+local is_redirect = function(status)
+    return status == 301 or status == 302 or status == 303 or status == 307 or status == 308
+end
+
+local valid_save_path = function(path)
+    path = string.trim(path)
+    if string.len(path) > 240 or not string.starts_with(path, "/data/") or string.find(path, "..") or string.find(path, "*") then
+        return nil, "path must be a file below /data"
+    end
+    return path, nil
+end
 
 local decode_entities = function(value)
     value = string.replace(value, "&amp;", "&")
@@ -219,13 +235,14 @@ local last_slash = function(value)
     return last
 end
 
-local resolve_url = function(base, reference)
+local resolve_reference = function(base, reference, allow_cross_origin)
     reference = string.trim(decode_entities(reference))
     if reference == "" or string.starts_with(reference, "#") then return base, nil end
     local base_parts, base_error = parse_url(base)
     if not base_parts then return nil, base_error end
     local target = nil
-    if string.starts_with(reference, "http://") or string.starts_with(reference, "https://") then
+    local lower_reference = string.lower(reference)
+    if string.starts_with(lower_reference, "http://") or string.starts_with(lower_reference, "https://") then
         target = reference
     elseif string.starts_with(reference, "//") then
         target = base_parts.scheme + ":" + reference
@@ -252,9 +269,19 @@ local resolve_url = function(base, reference)
     local target_parts, target_error = parse_url(target)
     if not target_parts then return nil, target_error end
     if target_parts.origin ~= base_parts.origin then
-        return nil, "cross-origin navigation is not allowed"
+        if not allow_cross_origin then
+            return nil, "cross-origin navigation is not allowed"
+        end
     end
     return target_parts.url, nil
+end
+
+local resolve_url = function(base, reference)
+    return resolve_reference(base, reference, false)
+end
+
+local resolve_redirect_url = function(base, reference)
+    return resolve_reference(base, reference, true)
 end
 
 local render_page = function(lines, links, page, list_widget, page_widget)
@@ -283,6 +310,8 @@ local forward_button = gui.button {text = "Forward", width = 72}
 local reload_button = gui.button {text = "Reload", width = 68}
 local address = gui.text_input {text = initial_url, grow = 1}
 local go_button = gui.button {text = "Go", width = 48}
+local save_path = gui.text_input {text = "/data/reader.html", grow = 1}
+local save_button = gui.button {text = "Save", width = 58}
 local status = gui.label {text = "Ready", height = 24}
 local document = gui.list {items = {"Ready"}, grow = 1}
 local previous_page = gui.button {text = "Previous page", width = 116}
@@ -296,6 +325,7 @@ app:set_root(gui.column {
     gap = 8,
     children = {
         gui.row {height = 38, gap = 6, children = {back_button, forward_button, reload_button, address, go_button}},
+        gui.row {height = 38, gap = 6, children = {save_path, save_button}},
         status,
         document,
         gui.row {height = 34, gap = 8, children = {previous_page, page_label, next_page}},
@@ -305,6 +335,9 @@ app:set_root(gui.column {
 local make_controller = function()
     local address_value = initial_url
     local current_url = initial_url
+    local save_path_value = "/data/reader.html"
+    local saved_body = nil
+    local saved_url = nil
     local history = {}
     local history_index = 0
     local page = 1
@@ -313,8 +346,42 @@ local make_controller = function()
     local links = {""}
     local visible_links = {""}
     return function(action, value)
+    local history_target = nil
     if action == "address" then
         address_value = value
+        return
+    elseif action == "save_path" then
+        save_path_value = value
+        return
+    elseif action == "save" then
+        if not saved_body then
+            status:set_text("Save failed: load a response first")
+            app:invalidate()
+            return
+        end
+        local normalized, path_error = valid_save_path(save_path_value)
+        if not normalized then
+            status:set_text(path_error)
+            app:invalidate()
+            return
+        end
+        local size = bytes.len(saved_body)
+        if size > MAX_SAVE_BYTES then
+            status:set_text("Save failed: response exceeds 31.75 KiB")
+            app:invalidate()
+            return
+        end
+        local saved, save_error = fs.write_file(normalized, saved_body, {atomic = true, fsync = true})
+        if not saved then
+            status:set_text("Save failed: " + save_error.message)
+            app:invalidate()
+            return
+        end
+        save_path_value = normalized
+        save_path:set_text(normalized)
+        status:set_text("Saved " + tostring(size) + " bytes from " + saved_url)
+        app:invalidate()
+        print("mica-reader saved path=" + normalized + " bytes=" + tostring(size) + " atomic=true fsync=true")
         return
     elseif action == "previous_page" then
         page = page - 1
@@ -339,13 +406,13 @@ local make_controller = function()
         action = "navigate"
     elseif action == "back" then
         if history_index <= 1 then return end
-        history_index = history_index - 1
-        value = history[history_index]
+        history_target = history_index - 1
+        value = history[history_target]
         action = "history"
     elseif action == "forward" then
         if history_index >= table.len(history) then return end
-        history_index = history_index + 1
-        value = history[history_index]
+        history_target = history_index + 1
+        value = history[history_target]
         action = "history"
     elseif action == "reload" then
         value = current_url
@@ -354,6 +421,8 @@ local make_controller = function()
 
     if action ~= "navigate" and action ~= "history" then return end
     if not value then value = address_value end
+    saved_body = nil
+    saved_url = nil
     local parsed, parse_error = parse_url(value)
     if not parsed then
         status:set_text(parse_error)
@@ -364,9 +433,40 @@ local make_controller = function()
     app:invalidate()
     app:present()
     local response, request_error = http.get(parsed.url)
+    local redirect_count = 0
+    local redirect_error = nil
+    while response and is_redirect(response.status) and response.location do
+        response:read_all(MAX_BODY_BYTES)
+        if redirect_count >= MAX_REDIRECTS then
+            redirect_error = "too many redirects"
+            response = nil
+        else
+            local target, resolve_error = resolve_redirect_url(parsed.url, response.location)
+            if not target then
+                redirect_error = resolve_error
+                response = nil
+            else
+                local next_page, parse_error = parse_url(target)
+                if not next_page then
+                    redirect_error = parse_error
+                    response = nil
+                else
+                    parsed = next_page
+                    redirect_count = redirect_count + 1
+                    status:set_text("Redirecting to " + parsed.origin)
+                    app:invalidate()
+                    app:present()
+                    response, request_error = http.get(parsed.url)
+                end
+            end
+        end
+    end
     if not response then
-        status:set_text(request_error.message)
-        lines = {"Request failed", request_error.message}
+        local message = redirect_error
+        if not message and request_error then message = request_error.message end
+        if not message then message = "request failed" end
+        status:set_text(message)
+        lines = {"Request failed", message}
         links = {"", ""}
         page = 1
         visible_links, page, page_count = render_page(lines, links, page, document, page_label)
@@ -374,38 +474,33 @@ local make_controller = function()
         return
     end
 
-    if response.status >= 300 and response.status <= 399 and response.location then
-        response:read_all(MAX_BODY_BYTES)
-        lines = {"HTTP " + tostring(response.status) + " redirect", "→ " + response.location}
-        links = {"", response.location}
-        status:set_text("Redirect returned; select the link to follow")
+    local body, body_error = response:read_all(MAX_BODY_BYTES)
+    if not body then
+        status:set_text(body_error.message)
+        lines = {"Response read failed", body_error.message}
+        links = {"", ""}
     else
-        local body, body_error = response:read_all(MAX_BODY_BYTES)
-        if not body then
-            status:set_text(body_error.message)
-            lines = {"Response read failed", body_error.message}
+        saved_body = body
+        saved_url = parsed.url
+        local source, utf8_error = bytes.to_string(body)
+        if not source then
+            status:set_text(utf8_error.message)
+            lines = {"Response is not UTF-8"}
+            links = {""}
+        elseif response.content_type and string.starts_with(string.lower(response.content_type), "text/plain") then
+            lines, links = append_line({}, {}, source, "", "", true)
+            status:set_text("HTTP " + tostring(response.status) + " text/plain")
+            app:set_title("Mica Reader — text")
+        elseif response.content_type and not string.starts_with(string.lower(response.content_type), "text/html") then
+            lines = {"Unsupported content type", response.content_type}
             links = {"", ""}
+            status:set_text("HTTP " + tostring(response.status) + " unsupported content")
         else
-            local source, utf8_error = bytes.to_string(body)
-            if not source then
-                status:set_text(utf8_error.message)
-                lines = {"Response is not UTF-8"}
-                links = {""}
-            elseif response.content_type and string.starts_with(string.lower(response.content_type), "text/plain") then
-                lines, links = append_line({}, {}, source, "", "", true)
-                status:set_text("HTTP " + tostring(response.status) + " text/plain")
-                app:set_title("Mica Reader — text")
-            elseif response.content_type and not string.starts_with(string.lower(response.content_type), "text/html") then
-                lines = {"Unsupported content type", response.content_type}
-                links = {"", ""}
-                status:set_text("HTTP " + tostring(response.status) + " unsupported content")
-            else
-                local parsed_document = parse_html(source)
-                lines = parsed_document.lines
-                links = parsed_document.links
-                app:set_title(parsed_document.title)
-                status:set_text("HTTP " + tostring(response.status) + " — " + parsed.origin)
-            end
+            local parsed_document = parse_html(source)
+            lines = parsed_document.lines
+            links = parsed_document.links
+            app:set_title(parsed_document.title)
+            status:set_text("HTTP " + tostring(response.status) + " — " + parsed.origin)
         end
     end
 
@@ -418,6 +513,8 @@ local make_controller = function()
         end
         history = table.insert(history, current_url)
         history_index = table.len(history)
+    elseif history_target then
+        history_index = history_target
     end
     page = 1
     visible_links, page, page_count = render_page(lines, links, page, document, page_label)
@@ -434,6 +531,9 @@ reload_button:set_callback("click", function() controller("reload", "") end)
 address:set_callback("change", function(text) controller("address", text) end)
 address:set_callback("submit", function(text) controller("navigate", text) end)
 go_button:set_callback("click", function() controller("navigate", nil) end)
+save_path:set_callback("change", function(text) controller("save_path", text) end)
+save_path:set_callback("submit", function(text) controller("save_path", text) end)
+save_button:set_callback("click", function() controller("save", "") end)
 document:set_callback("select", function(index) controller("select", index) end)
 previous_page:set_callback("click", function() controller("previous_page", "") end)
 next_page:set_callback("click", function() controller("next_page", "") end)

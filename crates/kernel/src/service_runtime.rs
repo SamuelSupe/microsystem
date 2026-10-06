@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 use core::mem;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::selected as arch;
 use crate::arch::selected::preempt::{self, Context, ExceptionFrame};
@@ -17,14 +17,31 @@ use microsystem_abi::{
 };
 use microsystem_kernel::capability::{Capability, CapabilityTable, MAX_CAPABILITIES};
 use microsystem_kernel::elf::{ElfImage, USER_MIN};
+use microsystem_kernel::ipc::ReplySlot;
 
-pub const SERVICE_COUNT: usize = 13;
-pub const SERVICE_NAMES: [&str; SERVICE_COUNT] = [
-    "init", "console", "block", "mfs", "shell", "devmgr", "windowd", "terminal", "files",
-    "monitor", "sshd", "netd", "db",
-];
+#[path = "virtual_memory.rs"]
+mod virtual_memory;
+
+pub fn handle_virtual_memory(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
+    virtual_memory::handle(frame, syscall)
+}
+
+pub fn handle_page_fault(
+    frame: &ExceptionFrame,
+    cause: u64,
+    address: u64,
+) -> Option<Result<(), Status>> {
+    virtual_memory::fault(frame, cause, address)
+}
+
+pub const SERVICE_COUNT: usize = microsystem_abi::service::NAMES.len();
+pub const SERVICE_NAMES: [&str; SERVICE_COUNT] = microsystem_abi::service::NAMES;
 const APPLICATION_START: usize = SERVICE_COUNT;
 const APPLICATION_COUNT: usize = microsystem_abi::process::MAX_APPLICATIONS;
+const PCI_ACTIVATION_IDLE: u8 = 0;
+const PCI_ACTIVATION_STARTING: u8 = 1;
+const PCI_ACTIVATION_READY: u8 = 2;
+const PCI_ACTIVATION_FAILED: u8 = 3;
 const CPU_COUNT: usize = 2;
 const IDLE_START: usize = APPLICATION_START + APPLICATION_COUNT;
 const TASK_COUNT: usize = IDLE_START + CPU_COUNT;
@@ -42,9 +59,9 @@ const LARGE_HEAP_TABLES: usize = LARGE_HEAP_BYTES / 0x20_0000;
 const STACK_BYTES: usize = 16 * 4096;
 const STACK_TOP: u64 = 0x0080_0000;
 const ASID_BASE: u16 = 0x20;
-const ENDPOINT_COUNT: usize = 26;
+const ENDPOINT_COUNT: usize = 29;
 const ENDPOINT_OWNERS: [usize; ENDPOINT_COUNT] = [
-    1, 2, 3, 0, 5, 2, 6, 6, 6, 7, 8, 9, 11, 11, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 12,
+    1, 2, 3, 0, 5, 2, 6, 6, 6, 7, 8, 9, 11, 11, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 12, 0, 0, 0,
 ];
 const BLOCK_TASK: usize = 2;
 const CONSOLE_TASK: usize = 1;
@@ -68,6 +85,8 @@ const SSH_FILESYSTEM_DATA_VA: u64 = 0x005f_0000;
 const WINDOWD_FILESYSTEM_DATA_VA: u64 = 0x0060_0000;
 const TERMINAL_FILESYSTEM_DATA_VA: u64 = 0x0061_0000;
 const DATABASE_FILESYSTEM_DATA_VA: u64 = 0x0062_0000;
+const ROOT_FILESYSTEM_DATA_VA: u64 = 0x0063_0000;
+const NETWORK_FILESYSTEM_DATA_VA: u64 = 0x0064_0000;
 const CONSOLE_UART_VA: u64 = 0x005d_0000;
 const DEVMGR_PCI_CONFIG_VA: u64 = 0x005e_0000;
 const DEVMGR_ECAM_SCAN_VA: u64 = 0x0042_0000;
@@ -79,6 +98,9 @@ const SSH_FILESYSTEM_FRAME_OBJECT: u32 = 14;
 const WINDOWD_FILESYSTEM_FRAME_OBJECT: u32 = 15;
 const TERMINAL_FILESYSTEM_FRAME_OBJECT: u32 = 16;
 const DATABASE_FILESYSTEM_FRAME_OBJECT: u32 = 17;
+const ROOT_FILESYSTEM_FRAME_OBJECT: u32 = 18;
+const NETWORK_FILESYSTEM_FRAME_OBJECT: u32 = 19;
+const IDENTITY_SNAPSHOT_OBJECT: u32 = 20;
 const DEVICE_NOTIFICATION_OBJECT: u32 = 2;
 const SHARED_FRAME_NODE: u32 = 1;
 const FILESYSTEM_FRAME_NODE: u32 = 8;
@@ -109,7 +131,7 @@ const FRAME_REGION_COUNT: usize = 32;
 const FRAME_REGION_MAX_PAGES: usize = 2048;
 const GUI_MEMORY_POOL_OBJECT: u32 = 52;
 const GUI_MEMORY_POOL_NODE: u32 = 18;
-const GUI_MEMORY_POOL_QUOTA: usize = 1024;
+const GUI_MEMORY_POOL_QUOTA: usize = 1536;
 const SCRIPT_MEMORY_POOL_OBJECT: u32 = 53;
 const SCRIPT_MEMORY_POOL_NODE: u32 = 28;
 const SCRIPT_MEMORY_POOL_QUOTA: usize = 264;
@@ -137,6 +159,26 @@ const GUI_CONFIG_ENDPOINT_NODE: u32 = 34;
 const GUI_DYNAMIC_ENDPOINT_NODE_BASE: u32 = 35;
 const GUI_LAUNCH_ENDPOINT_NODE: u32 = 44;
 const DATABASE_ENDPOINT_NODE: u32 = 46;
+const TERMINAL_CANCEL_OBJECT: u32 = 95;
+const TERMINAL_CANCEL_NODE: u32 = 48;
+const SERVICE_ENDPOINT_NODE: u32 = 49;
+const ROOT_FILESYSTEM_FRAME_NODE: u32 = 50;
+const APPLICATION_ENDPOINT_NODE: u32 = 51;
+const NETWORK_FILESYSTEM_FRAME_NODE: u32 = 52;
+const IDENTITY_SNAPSHOT_NODE: u32 = 53;
+const IDENTITY_ENDPOINT_NODE: u32 = 54;
+
+struct NativeScratch(UnsafeCell<[u8; microsystem_abi::application::MAX_IMAGE_BYTES]>);
+unsafe impl Sync for NativeScratch {}
+static NATIVE_SCRATCH: NativeScratch = NativeScratch(UnsafeCell::new(
+    [0; microsystem_abi::application::MAX_IMAGE_BYTES],
+));
+
+struct NativeLaunch {
+    image: &'static [u8],
+    pages: u32,
+    permissions: u64,
+}
 
 #[repr(C, align(4096))]
 struct TaskMemory {
@@ -149,8 +191,6 @@ struct TaskMemory {
     large_heap_level3: [[u64; 512]; LARGE_HEAP_TABLES],
     image: [u8; IMAGE_BYTES],
     stack: [u8; STACK_BYTES],
-    heap: [u8; HEAP_BYTES],
-    large_heap: *mut u8,
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +213,7 @@ struct StartCell(UnsafeCell<[Start; TASK_COUNT]>);
 struct StateCell(UnsafeCell<State>);
 struct GrantCell(UnsafeCell<Option<UserTransportGrant>>);
 struct CapCell(UnsafeCell<[CapabilityTable; TASK_COUNT]>);
+struct BootCapsCell(UnsafeCell<[CapabilityTable; SERVICE_COUNT]>);
 struct StateGuard;
 
 #[derive(Clone, Copy)]
@@ -201,6 +242,7 @@ unsafe impl Sync for StartCell {}
 unsafe impl Sync for StateCell {}
 unsafe impl Sync for GrantCell {}
 unsafe impl Sync for CapCell {}
+unsafe impl Sync for BootCapsCell {}
 
 impl Drop for StateGuard {
     fn drop(&mut self) {
@@ -214,6 +256,8 @@ struct State {
     endpoints: [Endpoint; ENDPOINT_COUNT],
     reply_to: [Option<usize>; TASK_COUNT],
     requests: [Message; TASK_COUNT],
+    async_replies: [ReplySlot; TASK_COUNT],
+    services: [microsystem_abi::service::InfoV1; SERVICE_COUNT],
     current: [usize; CPU_COUNT],
     last_accounted_ticks: [u64; CPU_COUNT],
     applications: [ApplicationSlot; APPLICATION_COUNT],
@@ -279,6 +323,7 @@ enum ThreadState {
     },
     Terminating {
         cpu: usize,
+        status: i64,
     },
 }
 
@@ -310,11 +355,16 @@ static STATE: StateCell = StateCell(UnsafeCell::new(State {
     endpoints: [Endpoint::EMPTY; ENDPOINT_COUNT],
     reply_to: [None; TASK_COUNT],
     requests: [Message::new(0, 0); TASK_COUNT],
+    async_replies: [ReplySlot::Idle; TASK_COUNT],
+    services: [microsystem_abi::service::InfoV1::EMPTY; SERVICE_COUNT],
     current: [0; CPU_COUNT],
     last_accounted_ticks: [0; CPU_COUNT],
     applications: [ApplicationSlot::EMPTY; APPLICATION_COUNT],
 }));
 static PREPARED: AtomicBool = AtomicBool::new(false);
+static BOOT_CAPS: BootCapsCell = BootCapsCell(UnsafeCell::new(
+    [const { CapabilityTable::new() }; SERVICE_COUNT],
+));
 static ACTIVE_CPUS: AtomicU32 = AtomicU32::new(0);
 static READY: AtomicU32 = AtomicU32::new(0);
 static ONLINE: AtomicU32 = AtomicU32::new(0);
@@ -326,6 +376,7 @@ static SMP_REPORTED: AtomicBool = AtomicBool::new(false);
 static STATE_LOCK_NEXT: AtomicU32 = AtomicU32::new(0);
 static STATE_LOCK_OWNER: AtomicU32 = AtomicU32::new(0);
 static BLOCK_GRANT: GrantCell = GrantCell(UnsafeCell::new(None));
+static PCI_ACTIVATION_STATE: AtomicU8 = AtomicU8::new(PCI_ACTIVATION_IDLE);
 static CONSOLE_UART: AtomicU64 = AtomicU64::new(0);
 static CAPS: CapCell = CapCell(UnsafeCell::new(
     [const { CapabilityTable::new() }; TASK_COUNT],
@@ -366,6 +417,9 @@ static SSH_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static WINDOWD_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static TERMINAL_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static DATABASE_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static ROOT_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static NETWORK_FILESYSTEM_FRAME_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_SNAPSHOT_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 static KERNEL_HEAP_REPORTED: AtomicBool = AtomicBool::new(false);
 static BOOTFS_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static BOOTFS_LENGTH: AtomicUsize = AtomicUsize::new(0);
@@ -441,6 +495,7 @@ pub fn prepare(bootfs: &'static [u8]) -> Result<(), ()> {
     BOOTFS_ADDRESS.store(bootfs.as_ptr() as usize, Ordering::Release);
     BOOTFS_LENGTH.store(bootfs.len(), Ordering::Release);
     unsafe { *BLOCK_GRANT.0.get() = None };
+    PCI_ACTIVATION_STATE.store(PCI_ACTIVATION_IDLE, Ordering::Release);
 
     let init = image_by_name(bootfs, SERVICE_NAMES[0]).ok_or(())?;
     load_task(0, init)?;
@@ -466,16 +521,17 @@ pub fn run() -> ! {
     let starts = unsafe { &*STARTS.0.get() };
     let _guard = lock_state();
     let state = unsafe { &mut *STATE.0.get() };
-    *state = State {
-        contexts: [Context::EMPTY; TASK_COUNT],
-        threads: [ThreadState::Exited; TASK_COUNT],
-        endpoints: [Endpoint::EMPTY; ENDPOINT_COUNT],
-        reply_to: [None; TASK_COUNT],
-        requests: [Message::new(0, 0); TASK_COUNT],
-        current: [0; CPU_COUNT],
-        last_accounted_ticks: [arch::timer_ticks(0), arch::timer_ticks(1)],
-        applications: [ApplicationSlot::EMPTY; APPLICATION_COUNT],
-    };
+    // This frame remains below every exception until the CPU shuts down. A
+    // whole-State temporary would consume most of the 64 KiB kernel stack.
+    state.threads.fill(ThreadState::Exited);
+    state.endpoints.fill(Endpoint::EMPTY);
+    state.reply_to.fill(None);
+    state.requests.fill(Message::new(0, 0));
+    state.async_replies.fill(ReplySlot::Idle);
+    state.services.fill(microsystem_abi::service::InfoV1::EMPTY);
+    state.current.fill(0);
+    state.last_accounted_ticks = [arch::timer_ticks(0), arch::timer_ticks(1)];
+    state.applications.fill(ApplicationSlot::EMPTY);
     for (context, start) in state.contexts.iter_mut().zip(starts) {
         *context = Context::EMPTY;
         context.elr = start.entry;
@@ -524,6 +580,14 @@ pub fn run() -> ! {
     if install_boot_capabilities().is_err() {
         arch::shutdown(true);
     }
+    for task in 0..SERVICE_COUNT {
+        unsafe { (&mut *BOOT_CAPS.0.get())[task] = (&*CAPS.0.get())[task].clone() };
+        state.services[task].pid = (task + 1) as u32;
+        state.services[task].program = program_id(SERVICE_NAMES[task]);
+    }
+    state.services[0].starts = 1;
+    state.services[0].state = microsystem_abi::service::STARTING;
+    state.services[0].started_ns = arch::clock_nanos();
     arch::activate_ttbr0(starts[0].ttbr0);
     ACTIVE_CPUS.fetch_or(1 << 1, Ordering::Release);
     let registers = state.contexts[0].registers;
@@ -567,15 +631,16 @@ pub fn handle_yield(frame: &mut ExceptionFrame) -> Option<u64> {
         return None;
     }
     let _guard = lock_state();
+    wake_notifications();
     switch(frame);
     Some(2)
 }
 
 pub fn handle_ipc(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
-    if !active_on_current_cpu() || !(2..=4).contains(&syscall) {
+    if !active_on_current_cpu() || !matches!(syscall, 2..=4 | 32 | 33) {
         return None;
     }
-    if syscall == 2 {
+    if matches!(syscall, 2 | 32) {
         IPC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     let _guard = lock_state();
@@ -583,6 +648,8 @@ pub fn handle_ipc(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
         2 => call(frame),
         3 => receive(frame),
         4 => reply_receive(frame),
+        32 => try_call(frame),
+        33 => poll_reply(frame),
         _ => unreachable!(),
     })
 }
@@ -762,12 +829,12 @@ pub fn handle_frame_mapping(frame: &mut ExceptionFrame, syscall: u64) -> Option<
 }
 
 pub fn handle_notification(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
-    if !active_on_current_cpu() || !matches!(syscall, 5 | 23) {
+    if !active_on_current_cpu() || !matches!(syscall, 5 | 23 | 34) {
         return None;
     }
     let _guard = lock_state();
     let task = current_task(unsafe { &*STATE.0.get() });
-    let required = if syscall == 5 {
+    let required = if matches!(syscall, 5 | 34) {
         Rights::READ
     } else {
         Rights::WRITE
@@ -799,7 +866,7 @@ pub fn handle_notification(frame: &mut ExceptionFrame, syscall: u64) -> Option<u
         frame.registers[0] = Status::AccessDenied as i64 as u64;
         return Some(0);
     }
-    if deadline_elapsed(frame.registers[1]) {
+    if syscall == 5 && deadline_elapsed(frame.registers[1]) {
         frame.registers[0] = Status::TimedOut as i64 as u64;
         return Some(0);
     }
@@ -809,6 +876,11 @@ pub fn handle_notification(frame: &mut ExceptionFrame, syscall: u64) -> Option<u
     };
     if bits != 0 {
         frame.registers[0] = bits;
+        return Some(0);
+    }
+
+    if syscall == 34 {
+        frame.registers[0] = Status::Busy as i64 as u64;
         return Some(0);
     }
 
@@ -1015,8 +1087,30 @@ pub fn handle_system_control(frame: &mut ExceptionFrame, syscall: u64) -> Option
             let slot = u8::try_from(frame.registers[2]).ok();
             let function = u8::try_from(frame.registers[3]).ok();
             match (slot, function) {
-                (Some(slot), Some(function)) => {
-                    device_control::activate(slot, function).and_then(install_transport)
+                (Some(slot), Some(function)) if slot < 32 && function < 8 => {
+                    if PCI_ACTIVATION_STATE
+                        .compare_exchange(
+                            PCI_ACTIVATION_IDLE,
+                            PCI_ACTIVATION_STARTING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        Err(Status::Busy)
+                    } else {
+                        let result =
+                            device_control::activate(slot, function).and_then(install_transport);
+                        PCI_ACTIVATION_STATE.store(
+                            if result.is_ok() {
+                                PCI_ACTIVATION_READY
+                            } else {
+                                PCI_ACTIVATION_FAILED
+                            },
+                            Ordering::Release,
+                        );
+                        result
+                    }
                 }
                 _ => Err(Status::Invalid),
             }
@@ -1241,7 +1335,7 @@ pub fn handle_gui_input(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64>
 }
 
 pub fn handle_network(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
-    if !active_on_current_cpu() || !(27..=29).contains(&syscall) {
+    if !active_on_current_cpu() || (!(27..=29).contains(&syscall) && syscall != 44) {
         return None;
     }
     let _guard = lock_state();
@@ -1251,7 +1345,7 @@ pub fn handle_network(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
         return Some(0);
     }
     let handle = CapHandle(frame.registers[0] as u32);
-    let (object_type, rights) = if syscall == 27 {
+    let (object_type, rights) = if syscall == 27 || syscall == 44 {
         (ObjectType::NetworkDevice, Rights::READ)
     } else if syscall == 28 {
         (ObjectType::NetworkDevice, Rights::WRITE)
@@ -1263,6 +1357,26 @@ pub fn handle_network(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
         frame.registers[0] = Status::AccessDenied as i64 as u64;
         return Some(0);
     }
+    if syscall == 44 {
+        let pointer = frame.registers[1];
+        let index = frame.registers[2] as usize;
+        frame.registers[0] = match crate::net::hardware_info(index) {
+            Some(info)
+                if copy_to_user(
+                    task,
+                    pointer,
+                    (&info as *const microsystem_abi::network::HardwareInfoV1).cast::<u8>(),
+                    core::mem::size_of_val(&info),
+                )
+                .is_some() =>
+            {
+                Status::Ok as i64 as u64
+            }
+            Some(_) => Status::Fault as i64 as u64,
+            None => Status::Invalid as i64 as u64,
+        };
+        return Some(0);
+    }
     let pointer = frame.registers[1];
     let bytes = frame.registers[2] as usize;
     let maximum = if syscall == 29 { 256 } else { 1536 };
@@ -1272,7 +1386,7 @@ pub fn handle_network(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
     }
     let mut buffer = [0u8; 1536];
     frame.registers[0] = match syscall {
-        27 => match crate::net::receive(&mut buffer[..bytes]) {
+        27 => match crate::net::receive(frame.registers[3] as usize, &mut buffer[..bytes]) {
             Ok(0) => 0,
             Ok(received)
                 if validate_user_range(task, pointer, received as u64, true)
@@ -1286,7 +1400,7 @@ pub fn handle_network(frame: &mut ExceptionFrame, syscall: u64) -> Option<u64> {
         28 if validate_user_range(task, pointer, bytes as u64, false)
             && copy_from_user(task, pointer, buffer.as_mut_ptr(), bytes).is_some() =>
         {
-            match crate::net::send(&buffer[..bytes]) {
+            match crate::net::send(frame.registers[3] as usize, &buffer[..bytes]) {
                 Ok(true) => Status::Ok as i64 as u64,
                 Ok(false) => Status::Busy as i64 as u64,
                 Err(()) => Status::Io as i64 as u64,
@@ -1311,61 +1425,20 @@ fn install_transport(grant: UserTransportGrant) -> Result<(), Status> {
     if unsafe { (*BLOCK_GRANT.0.get()).is_some() } {
         return Err(Status::Busy);
     }
-    unsafe { *BLOCK_GRANT.0.get() = Some(grant) };
-    for task in [BLOCK_TASK, DEVMGR_TASK] {
-        let memory = task_memory_mut(task).ok_or(Status::Invalid)?;
-        map_page(
-            memory,
-            BLOCK_COMMON_VA,
-            grant.common_physical,
-            device_page_flags(),
-        );
-        map_page(
-            memory,
-            BLOCK_NOTIFY_VA,
-            grant.notify_physical,
-            device_page_flags(),
-        );
-        map_page(
-            memory,
-            BLOCK_ISR_VA,
-            grant.isr_physical,
-            device_page_flags(),
-        );
-        map_page(
-            memory,
-            BLOCK_DEVICE_VA,
-            grant.device_physical,
-            device_page_flags(),
-        );
+    for task in [BLOCK_TASK, DEVMGR_TASK, MFS_TASK] {
+        if task_memory(task).is_none() {
+            return Err(Status::Invalid);
+        }
     }
-    let devmgr_memory = task_memory_mut(DEVMGR_TASK).ok_or(Status::Invalid)?;
-    map_page(
-        devmgr_memory,
-        DEVMGR_PCI_CONFIG_VA,
-        grant.pci_function_physical,
-        device_page_flags(),
-    );
-    let block_memory = task_memory_mut(BLOCK_TASK).ok_or(Status::Invalid)?;
-    map_page(
-        block_memory,
-        BLOCK_QUEUE_VA,
-        grant.queue_physical,
-        normal_page_flags(),
-    );
-    for task in [BLOCK_TASK, MFS_TASK] {
-        let memory = task_memory_mut(task).ok_or(Status::Invalid)?;
-        map_page(
-            memory,
-            SHARED_DATA_VA,
-            grant.data_physical,
-            normal_page_flags(),
-        );
+    for task in [BLOCK_TASK, DEVMGR_TASK, MFS_TASK] {
+        let memory = task_memory_mut(task).expect("prevalidated transport task memory");
+        map_transport_memory(memory, task, grant);
     }
     crate::arch::dma_write_barrier();
     for task in [BLOCK_TASK, MFS_TASK, DEVMGR_TASK] {
         arch::invalidate_user_asid(ASID_BASE + task as u16);
     }
+    unsafe { *BLOCK_GRANT.0.get() = Some(grant) };
     Ok(())
 }
 
@@ -1428,6 +1501,13 @@ pub fn mark_current_online() {
     if current >= SERVICE_COUNT {
         return;
     }
+    let state = unsafe { &mut *STATE.0.get() };
+    state.services[current].state = microsystem_abi::service::ONLINE;
+    state.services[current].online_ns = arch::clock_nanos();
+    unsafe {
+        (&mut *BOOT_CAPS.0.get())[current] =
+            (&*CAPS.0.get())[current].snapshot_matching(|capability| capability.object < 100);
+    }
     let online = ONLINE.fetch_or(1 << current, Ordering::AcqRel) | (1 << current);
     let expected_mask = EXPECTED_SERVICE_MASK.load(Ordering::Acquire);
     let expected = expected_mask.count_ones();
@@ -1477,6 +1557,13 @@ pub fn start_thread(program: u64) -> Result<u64, Status> {
 
 pub fn clock_realtime() -> Result<u64, Status> {
     crate::rtc::realtime().ok_or(Status::NotSupported)
+}
+
+pub fn ipc_peer() -> Result<u64, Status> {
+    if !active_on_current_cpu() { return Err(Status::Busy); }
+    let _guard = lock_state();
+    let state = unsafe { &*STATE.0.get() };
+    state.reply_to[current_task(state)].map(|caller| caller as u64 + 1).ok_or(Status::Busy)
 }
 
 pub fn start_thread_ex(pointer: u64, bytes: u64) -> Result<u64, Status> {
@@ -1533,15 +1620,70 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
         return Err(Status::AccessDenied);
     }
     let guard = lock_state();
+    start_thread_locked(guard, program, launch, None)
+}
+
+pub fn start_native(
+    pointer: u64,
+    bytes: u64,
+    program: u64,
+    pages: u64,
+    permissions: u64,
+) -> Result<u64, Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let guard = lock_state();
+    if current_task(unsafe { &*STATE.0.get() }) != 0 {
+        return Err(Status::AccessDenied);
+    }
+    if bytes == 0
+        || bytes > microsystem_abi::application::MAX_IMAGE_BYTES as u64
+        || pages == 0
+        || pages > microsystem_abi::virtual_memory::PAGE_BUDGET as u64
+        || permissions
+            & !(microsystem_abi::application::RANDOM | microsystem_abi::application::SYSTEM_INFO)
+            != 0
+    {
+        return Err(Status::Invalid);
+    }
+    let image = unsafe { &mut *NATIVE_SCRATCH.0.get() };
+    for offset in (0..bytes as usize).step_by(4096) {
+        let count = (bytes as usize - offset).min(4096);
+        let address = pointer.checked_add(offset as u64).ok_or(Status::Fault)?;
+        copy_from_user(0, address, image[offset..].as_mut_ptr(), count).ok_or(Status::Fault)?;
+    }
+    start_thread_locked(
+        guard,
+        program,
+        None,
+        Some(NativeLaunch {
+            image: &image[..bytes as usize],
+            pages: pages as u32,
+            permissions,
+        }),
+    )
+}
+
+fn start_thread_locked(
+    guard: StateGuard,
+    program: u64,
+    launch: Option<&ThreadLaunchV2>,
+    native: Option<NativeLaunch>,
+) -> Result<u64, Status> {
     if current_task(unsafe { &*STATE.0.get() }) != 0 {
         return Err(Status::AccessDenied);
     }
     if program == 0 {
         return Err(Status::Invalid);
     }
-    let profile = launch.map_or(microsystem_abi::THREAD_PROFILE_APPLICATION, |launch| {
-        launch.profile
-    });
+    let profile = if native.is_some() {
+        microsystem_abi::THREAD_PROFILE_NATIVE
+    } else {
+        launch.map_or(microsystem_abi::THREAD_PROFILE_APPLICATION, |launch| {
+            launch.profile
+        })
+    };
     if let Some(launch) = launch {
         if !matches!(launch.version, 1 | 2)
             || launch.flags & !microsystem_abi::THREAD_LAUNCH_FLAG_GUI != 0
@@ -1553,14 +1695,22 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
         }
     }
     let state = unsafe { &mut *STATE.0.get() };
-    let service_task = SERVICE_NAMES
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(task, name)| (program_id(name) == program).then_some(task));
+    let service_task = native
+        .is_none()
+        .then(|| {
+            SERVICE_NAMES
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(task, name)| (program_id(name) == program).then_some(task))
+        })
+        .flatten();
     let (task, image, application) = if let Some(task) = service_task {
         if !matches!(state.threads[task], ThreadState::Exited) {
             return Err(Status::Busy);
+        }
+        if state.services[task].state == microsystem_abi::service::QUIESCE_FAILED {
+            return Err(Status::Io);
         }
         (
             task,
@@ -1573,7 +1723,11 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
             .ok_or(Status::Busy)?;
         (
             task,
-            application_image_by_id(program, launch.is_some())?,
+            if let Some(native) = &native {
+                native.image
+            } else {
+                application_image_by_id(program, launch.is_some())?
+            },
             true,
         )
     };
@@ -1586,6 +1740,13 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
         None
     };
     load_task(task, image).map_err(|_| Status::Invalid)?;
+    if !application {
+        unsafe { (&mut *CAPS.0.get())[task] = (&*BOOT_CAPS.0.get())[task].clone() };
+        state.services[task].state = microsystem_abi::service::STARTING;
+        state.services[task].starts += 1;
+        state.services[task].started_ns = arch::clock_nanos();
+        state.services[task].online_ns = 0;
+    }
     arch::flush_icache();
     arch::invalidate_user_asid(ASID_BASE + task as u16);
     let start = unsafe { (&*STARTS.0.get())[task] };
@@ -1603,6 +1764,9 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
         state.contexts[task].registers[0] = base;
         state.contexts[task].registers[1] = bytes;
         state.contexts[task].registers[2] = DEVMGR_ECAM_SCAN_VA;
+        state.contexts[task].registers[3] = u64::from(unsafe { (*BLOCK_GRANT.0.get()).is_some() });
+        state.contexts[task].registers[4] =
+            u64::from(EXPECTED_SERVICE_MASK.load(Ordering::Acquire) & (1 << WINDOWD_TASK) != 0);
     }
     if application {
         let index = task - APPLICATION_START;
@@ -1615,6 +1779,8 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
                 capabilities,
                 &mut state.contexts[task],
             )
+        } else if native.is_some() {
+            Ok(())
         } else {
             insert_endpoint_cap(
                 tables,
@@ -1625,6 +1791,33 @@ fn start_thread_inner(program: u64, launch: Option<&ThreadLaunchV2>) -> Result<u
                 PROCESS_ENDPOINT_NODE,
             )
         };
+        if let Some(native) = &native {
+            install = install.and_then(|()| virtual_memory::set_budget(task, native.pages));
+            for (flag, handle, object, object_type, node) in [
+                (
+                    microsystem_abi::application::RANDOM,
+                    microsystem_abi::boot_cap::RANDOM_SOURCE,
+                    62,
+                    ObjectType::RandomSource,
+                    RANDOM_SOURCE_NODE,
+                ),
+                (
+                    microsystem_abi::application::SYSTEM_INFO,
+                    microsystem_abi::boot_cap::SYSTEM_INFO,
+                    60,
+                    ObjectType::SystemInfo,
+                    22,
+                ),
+            ] {
+                if native.permissions & flag != 0 {
+                    install = install.and_then(|()| {
+                        tables[task]
+                            .insert_root_at(handle, object, object_type, Rights::READ, node)
+                            .map(|_| ())
+                    });
+                }
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         if install.is_ok() {
             install = prepare_x86_application_entry(task, &mut state.contexts[task]);
@@ -1837,6 +2030,12 @@ fn program_id(name: &str) -> u64 {
 }
 
 fn finish_application(state: &mut State, task: usize, status: i64) {
+    if let ReplySlot::Pending(server) = state.async_replies[task] {
+        if state.reply_to[server as usize] == Some(task) {
+            state.reply_to[server as usize] = None;
+        }
+    }
+    state.async_replies[task] = ReplySlot::Idle;
     match state.threads[task] {
         ThreadState::Sending { endpoint, .. } => {
             if let Some(index) = endpoint.checked_sub(1)
@@ -1863,7 +2062,140 @@ fn finish_application(state: &mut State, task: usize, status: i64) {
     application.reclaimed_mappings = cleanup.mappings;
 }
 
-pub fn handle_application_exit(frame: &mut ExceptionFrame, status: i64) -> Option<(u64, u64)> {
+fn finish_service(state: &mut State, task: usize, status: i64) {
+    // Wake every client before replacing a service's address space. No caller
+    // may keep a reply pointer or a queued capability transfer into that image.
+    for client in 0..TASK_COUNT {
+        if let ReplySlot::Pending(server) = state.async_replies[client] {
+            if server as usize == task {
+                state.async_replies[client] = ReplySlot::Failed(Status::Io);
+            }
+        }
+        let waiting = match state.threads[client] {
+            ThreadState::WaitingReply { server, .. } => server == task,
+            ThreadState::Sending { endpoint, .. } => ENDPOINT_OWNERS[endpoint - 1] == task,
+            _ => false,
+        };
+        if waiting {
+            state.threads[client] = ThreadState::Runnable;
+            state.contexts[client].registers[0] = Status::Io as i64 as u64;
+        }
+        if state.reply_to[client] == Some(task) {
+            state.reply_to[client] = None;
+        }
+    }
+    for (index, endpoint) in state.endpoints.iter_mut().enumerate() {
+        if ENDPOINT_OWNERS[index] == task || endpoint.pending == Some(task) {
+            endpoint.pending = None;
+        }
+    }
+    state.reply_to[task] = None;
+    state.async_replies[task] = ReplySlot::Idle;
+    state.requests[task] = Message::new(0, 0);
+    state.threads[task] = ThreadState::Exited;
+    state.services[task].state = microsystem_abi::service::STOPPED;
+    state.services[task].exit_status = status;
+    state.services[task].online_ns = 0;
+    ONLINE.fetch_and(!(1 << task), Ordering::Release);
+    READY.fetch_and(!(1 << task), Ordering::Release);
+    let quiesced = task != BLOCK_TASK || quiesce_block().is_ok();
+    if quiesced {
+        reclaim_task_capabilities(task);
+    } else {
+        // A controller that has not acknowledged reset may still DMA. Keep
+        // its memory pinned and refuse a restart until explicit recovery.
+        state.services[task].state = microsystem_abi::service::QUIESCE_FAILED;
+    }
+    crate::kprintln!(
+        "[service] stopped name={} status={} starts={} quiesced={}",
+        SERVICE_NAMES[task],
+        status,
+        state.services[task].starts,
+        quiesced
+    );
+    arch::send_reschedule(0);
+    arch::send_reschedule(1);
+}
+
+fn quiesce_block() -> Result<(), Status> {
+    let Some(grant) = (unsafe { *BLOCK_GRANT.0.get() }) else {
+        return Ok(());
+    };
+    let status = (arch::phys_to_virt(grant.common_physical) + 20) as *mut u8;
+    unsafe { ptr::write_volatile(status, 0) };
+    let mut acknowledged = false;
+    for _ in 0..1_000_000 {
+        if unsafe { ptr::read_volatile(status) } == 0 {
+            acknowledged = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !acknowledged {
+        return Err(Status::TimedOut);
+    }
+    DEVICE_IRQ_BOUND.store(false, Ordering::Release);
+    DEVICE_NOTIFICATION.store(0, Ordering::Release);
+    for page in 0..32 {
+        if DMA_AUTHORIZED.load(Ordering::Acquire) & (1 << page) != 0 {
+            smmu::unmap_runtime_page(grant.dma_iova + page * 4096).map_err(|_| Status::Io)?;
+            DMA_FRAME_OBJECTS[page as usize].store(0, Ordering::Release);
+            DMA_AUTHORIZED.fetch_and(!(1 << page), Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
+pub fn write_service_status(pid: u64, pointer: u64) -> Result<(), Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let _guard = lock_state();
+    let state = unsafe { &*STATE.0.get() };
+    if current_task(state) != 0 {
+        return Err(Status::AccessDenied);
+    }
+    let task = pid
+        .checked_sub(1)
+        .filter(|task| *task < SERVICE_COUNT as u64)
+        .ok_or(Status::Invalid)? as usize;
+    let info = state.services[task];
+    copy_to_user(
+        0,
+        pointer,
+        (&info as *const microsystem_abi::service::InfoV1).cast(),
+        mem::size_of::<microsystem_abi::service::InfoV1>(),
+    )
+    .ok_or(Status::Fault)
+}
+
+pub fn stop_service(pid: u64, status: i64) -> Result<(), Status> {
+    if !active_on_current_cpu() {
+        return Err(Status::AccessDenied);
+    }
+    let _guard = lock_state();
+    let state = unsafe { &mut *STATE.0.get() };
+    if current_task(state) != 0 {
+        return Err(Status::AccessDenied);
+    }
+    let task = pid
+        .checked_sub(1)
+        .filter(|task| *task != 0 && *task < SERVICE_COUNT as u64)
+        .ok_or(Status::Invalid)? as usize;
+    match state.threads[task] {
+        ThreadState::Exited => return Err(Status::NotFound),
+        ThreadState::Terminating { .. } => return Err(Status::Busy),
+        ThreadState::Running { cpu } => {
+            state.services[task].state = microsystem_abi::service::STOPPING;
+            state.threads[task] = ThreadState::Terminating { cpu, status };
+            arch::send_reschedule(cpu);
+        }
+        _ => finish_service(state, task, status),
+    }
+    Ok(())
+}
+
+pub fn handle_task_exit(frame: &mut ExceptionFrame, status: i64) -> Option<(u64, u64)> {
     if !active_on_current_cpu() {
         return None;
     }
@@ -1871,13 +2203,14 @@ pub fn handle_application_exit(frame: &mut ExceptionFrame, status: i64) -> Optio
     let cpu = current_cpu();
     let state = unsafe { &mut *STATE.0.get() };
     let task = state.current[cpu];
-    let Some(index) = task.checked_sub(APPLICATION_START) else {
-        return None;
-    };
-    if index >= APPLICATION_COUNT {
+    if task == 0 || task >= APPLICATION_START + APPLICATION_COUNT {
         return None;
     }
-    finish_application(state, task, status);
+    if task < SERVICE_COUNT {
+        finish_service(state, task, status);
+    } else {
+        finish_application(state, task, status);
+    }
     let next = next_other_runnable(state, task, cpu)?;
     set_running(state, cpu, next);
     preempt::load(&state.contexts[next], frame);
@@ -1977,7 +2310,7 @@ fn task_owned_pages(task: usize) -> u32 {
                 .unwrap_or(1),
         );
     }
-    pages
+    pages.saturating_add(virtual_memory::resident_pages(task))
 }
 
 pub fn kill_application(pid: u64, status: i64) -> Result<(), Status> {
@@ -2004,7 +2337,7 @@ pub fn kill_application(pid: u64, status: i64) -> Result<(), Status> {
         _ => None,
     };
     if let Some(cpu) = running_cpu {
-        state.threads[task] = ThreadState::Terminating { cpu };
+        state.threads[task] = ThreadState::Terminating { cpu, status };
         state.applications[index].exit_status = status;
         arch::send_reschedule(cpu);
     } else {
@@ -2042,7 +2375,6 @@ pub fn active_on_current_cpu() -> bool {
     cpu < CPU_COUNT && ACTIVE_CPUS.load(Ordering::Acquire) & (1 << cpu) != 0
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn current_task_owns_console() -> bool {
     if !active_on_current_cpu() {
         return false;
@@ -2064,17 +2396,20 @@ pub fn panic_context(cpu: usize) -> (usize, u64, u64) {
 }
 
 fn switch(frame: &mut ExceptionFrame) {
-    wake_notifications();
     let cpu = current_cpu();
     let state = unsafe { &mut *STATE.0.get() };
     let current = state.current[cpu];
     preempt::save(&mut state.contexts[current], frame);
     if matches!(state.threads[current], ThreadState::Running { cpu: owner } if owner == cpu) {
         state.threads[current] = ThreadState::Runnable;
-    } else if matches!(state.threads[current], ThreadState::Terminating { cpu: owner } if owner == cpu)
-    {
-        let status = state.applications[current - APPLICATION_START].exit_status;
-        finish_application(state, current, status);
+    } else if let ThreadState::Terminating { cpu: owner, status } = state.threads[current] {
+        if owner == cpu {
+            if current < SERVICE_COUNT {
+                finish_service(state, current, status);
+            } else {
+                finish_application(state, current, status);
+            }
+        }
     }
     let Some(next) = next_runnable(state, current, cpu) else {
         return;
@@ -2119,6 +2454,12 @@ fn call(frame: &mut ExceptionFrame) -> u64 {
         return fail(frame, Status::Invalid);
     }
     let server = ENDPOINT_OWNERS[endpoint_index];
+    if matches!(
+        state.threads[server],
+        ThreadState::Exited | ThreadState::Terminating { .. }
+    ) {
+        return fail(frame, Status::Io);
+    }
     let waiting_buffer = match state.threads[server] {
         ThreadState::Receiving {
             endpoint: waiting_endpoint,
@@ -2174,6 +2515,75 @@ fn call(frame: &mut ExceptionFrame) -> u64 {
     2
 }
 
+fn try_call(frame: &mut ExceptionFrame) -> u64 {
+    let state = unsafe { &mut *STATE.0.get() };
+    let caller = current_task(state);
+    if !matches!(state.async_replies[caller], ReplySlot::Idle) {
+        return fail(frame, Status::Busy);
+    }
+    let endpoint =
+        match resolve_endpoint(caller, CapHandle(frame.registers[0] as u32), Rights::WRITE) {
+            Ok(endpoint) => endpoint,
+            Err(status) => return fail(frame, status),
+        };
+    let Some(request) = read_message(caller, frame.registers[1]) else {
+        return fail(frame, Status::Fault);
+    };
+    if request.version != ABI_VERSION
+        || request.caps != [CapHandle::INVALID; MESSAGE_CAPS]
+        || request.flags & MESSAGE_CAP_MOVE_MASK != 0
+    {
+        return fail(frame, Status::Invalid);
+    }
+    let server = ENDPOINT_OWNERS[endpoint - 1];
+    if matches!(state.threads[server], ThreadState::Exited) {
+        return fail(frame, Status::NotFound);
+    }
+    let ThreadState::Receiving {
+        endpoint: waiting,
+        buffer,
+        ..
+    } = state.threads[server]
+    else {
+        return fail(frame, Status::Busy);
+    };
+    if waiting != endpoint || state.endpoints[endpoint - 1].pending.is_some() {
+        return fail(frame, Status::Busy);
+    }
+    if !write_message(server, buffer, &request) {
+        return fail(frame, Status::Fault);
+    }
+    let _ = state.async_replies[caller].begin(server as u32);
+    state.reply_to[server] = Some(caller);
+    state.threads[server] = ThreadState::Runnable;
+    state.contexts[server].registers[0] = Status::Ok as i64 as u64;
+    arch::send_reschedule(0);
+    arch::send_reschedule(1);
+    frame.registers[0] = Status::Ok as i64 as u64;
+    0
+}
+
+fn poll_reply(frame: &mut ExceptionFrame) -> u64 {
+    let state = unsafe { &mut *STATE.0.get() };
+    let caller = current_task(state);
+    match state.async_replies[caller].result() {
+        Ok(message) => {
+            if !write_message(caller, frame.registers[0], &message) {
+                return fail(frame, Status::Fault);
+            }
+            state.async_replies[caller] = ReplySlot::Idle;
+            frame.registers[0] = Status::Ok as i64 as u64;
+            0
+        }
+        Err(status) => {
+            if matches!(state.async_replies[caller], ReplySlot::Failed(_)) {
+                state.async_replies[caller] = ReplySlot::Idle;
+            }
+            fail(frame, status)
+        }
+    }
+}
+
 fn receive(frame: &mut ExceptionFrame) -> u64 {
     let state = unsafe { &*STATE.0.get() };
     let endpoint = match resolve_endpoint(
@@ -2190,7 +2600,7 @@ fn receive(frame: &mut ExceptionFrame) -> u64 {
 }
 
 fn reply_receive(frame: &mut ExceptionFrame) -> u64 {
-    let state = unsafe { &*STATE.0.get() };
+    let state = unsafe { &mut *STATE.0.get() };
     let endpoint = match resolve_endpoint(
         current_task(state),
         CapHandle(frame.registers[0] as u32),
@@ -2203,14 +2613,32 @@ fn reply_receive(frame: &mut ExceptionFrame) -> u64 {
     let buffer = frame.registers[2];
     let deadline = frame.registers[3];
     let server = current_task(state);
-    let Some(caller) = state.reply_to[server] else {
-        return fail(frame, Status::Invalid);
-    };
     let Some(reply) = read_message(server, reply_pointer) else {
         return fail(frame, Status::Fault);
     };
     if reply.version != ABI_VERSION {
         return fail(frame, Status::Invalid);
+    }
+    let Some(caller) = state.reply_to[server] else {
+        // A cancelled caller never receives the result's transferred ownership.
+        for index in 0..MESSAGE_CAPS {
+            if reply.flags & message_cap_move(index) != 0 && reply.caps[index] != CapHandle::INVALID
+            {
+                let _ = delete_capability(server, reply.caps[index]);
+            }
+        }
+        return receive_after_reply(frame, endpoint, buffer, deadline, None);
+    };
+    if state.async_replies[caller].waiting_for(server as u32) {
+        if reply.caps != [CapHandle::INVALID; MESSAGE_CAPS]
+            || reply.flags & MESSAGE_CAP_MOVE_MASK != 0
+        {
+            state.async_replies[caller] = ReplySlot::Failed(Status::NotSupported);
+        } else {
+            let _ = state.async_replies[caller].complete(server as u32, reply);
+        }
+        state.reply_to[server] = None;
+        return receive_after_reply(frame, endpoint, buffer, deadline, None);
     }
     receive_after_reply(frame, endpoint, buffer, deadline, Some((caller, reply)))
 }
@@ -2385,8 +2813,31 @@ fn install_boot_capabilities() -> Result<(), Status> {
     TERMINAL_FILESYSTEM_FRAME_PHYSICAL.store(terminal_filesystem_physical, Ordering::Release);
     let database_filesystem_physical = physical_memory::allocate_zeroed()?;
     DATABASE_FILESYSTEM_FRAME_PHYSICAL.store(database_filesystem_physical, Ordering::Release);
+    let root_filesystem_physical = physical_memory::allocate_zeroed()?;
+    ROOT_FILESYSTEM_FRAME_PHYSICAL.store(root_filesystem_physical, Ordering::Release);
+    let network_filesystem_physical = physical_memory::allocate_zeroed()?;
+    NETWORK_FILESYSTEM_FRAME_PHYSICAL.store(network_filesystem_physical, Ordering::Release);
+    let identity_physical = physical_memory::allocate_zeroed()?;
+    IDENTITY_SNAPSHOT_PHYSICAL.store(identity_physical, Ordering::Release);
+    map_page(task_memory_mut(0).ok_or(Status::Fault)?, microsystem_abi::identity::SNAPSHOT_VA as u64, identity_physical, normal_page_flags());
+    map_page(
+        task_memory_mut(0).ok_or(Status::Fault)?,
+        ROOT_FILESYSTEM_DATA_VA,
+        root_filesystem_physical,
+        normal_page_flags(),
+    );
     let tables = unsafe { &mut *CAPS.0.get() };
     let shared_rights = Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::GRANT.0);
+    NOTIFICATION_OBJECTS[0].store(TERMINAL_CANCEL_OBJECT, Ordering::Release);
+    for (task, rights) in [(WINDOWD_TASK, Rights::WRITE), (TERMINAL_TASK, Rights::READ)] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::GUI_TERMINAL_NOTIFICATION,
+            TERMINAL_CANCEL_OBJECT,
+            ObjectType::Notification,
+            rights,
+            TERMINAL_CANCEL_NODE,
+        )?;
+    }
     for task in [BLOCK_TASK, MFS_TASK] {
         tables[task].insert_root_at(
             microsystem_abi::boot_cap::SHARED_BLOCK_FRAME,
@@ -2440,6 +2891,23 @@ fn install_boot_capabilities() -> Result<(), Status> {
             shared_rights,
             DATABASE_FILESYSTEM_FRAME_NODE,
         )?;
+    }
+    for task in [0, MFS_TASK] {
+        tables[task].insert_root_at(
+            microsystem_abi::boot_cap::ROOT_FILESYSTEM_FRAME,
+            ROOT_FILESYSTEM_FRAME_OBJECT,
+            ObjectType::Frame,
+            shared_rights,
+            ROOT_FILESYSTEM_FRAME_NODE,
+        )?;
+    }
+    for task in [MFS_TASK, NETD_TASK] {
+        tables[task].insert_root_at(microsystem_abi::boot_cap::NETWORK_FILESYSTEM_FRAME,
+            NETWORK_FILESYSTEM_FRAME_OBJECT, ObjectType::Frame, shared_rights, NETWORK_FILESYSTEM_FRAME_NODE)?;
+    }
+    for task in [0, MFS_TASK, SHELL_TASK, WINDOWD_TASK, TERMINAL_TASK, FILES_TASK, MONITOR_TASK, SSHD_TASK, NETD_TASK, DB_TASK] {
+        let rights = if task == 0 { Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0) } else { Rights(Rights::READ.0 | Rights::MAP.0) };
+        tables[task].insert_root_at(microsystem_abi::boot_cap::IDENTITY_SNAPSHOT, IDENTITY_SNAPSHOT_OBJECT, ObjectType::Frame, rights, IDENTITY_SNAPSHOT_NODE)?;
     }
     tables[BLOCK_TASK].insert_root_at(
         microsystem_abi::boot_cap::BLOCK_IRQ_NOTIFICATION,
@@ -2623,6 +3091,7 @@ fn install_boot_capabilities() -> Result<(), Status> {
         (SHELL_TASK, Rights::WRITE),
         (SSHD_TASK, Rights::WRITE),
         (DB_TASK, Rights::WRITE),
+        (NETD_TASK, Rights::WRITE),
         (0, Rights(Rights::WRITE.0 | Rights::GRANT.0)),
     ] {
         insert_endpoint_cap(
@@ -2838,6 +3307,41 @@ fn install_boot_capabilities() -> Result<(), Status> {
         insert_endpoint_cap(tables, WINDOWD_TASK, handle, object, Rights::READ, node)?;
     }
     crate::kprintln!("[ipc] filesystem payload frame isolated from block DMA=true");
+    insert_endpoint_cap(
+        tables,
+        0,
+        microsystem_abi::boot_cap::SERVICE_ENDPOINT,
+        27,
+        Rights::READ,
+        SERVICE_ENDPOINT_NODE,
+    )?;
+    for task in [SHELL_TASK, TERMINAL_TASK] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::SERVICE_ENDPOINT,
+            27,
+            Rights::WRITE,
+            SERVICE_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [
+        (0, Rights::READ),
+        (SHELL_TASK, Rights::WRITE),
+        (TERMINAL_TASK, Rights::WRITE),
+    ] {
+        insert_endpoint_cap(
+            tables,
+            task,
+            microsystem_abi::boot_cap::APPLICATION_ENDPOINT,
+            28,
+            rights,
+            APPLICATION_ENDPOINT_NODE,
+        )?;
+    }
+    for (task, rights) in [(0, Rights::READ), (SHELL_TASK, Rights::WRITE), (TERMINAL_TASK, Rights::WRITE), (SSHD_TASK, Rights::WRITE)] {
+        insert_endpoint_cap(tables, task, microsystem_abi::boot_cap::IDENTITY_ENDPOINT, 29, rights, IDENTITY_ENDPOINT_NODE)?;
+    }
     Ok(())
 }
 
@@ -2901,7 +3405,11 @@ fn stage_cap_transfer(
                 || (capability.node == TERMINAL_FILESYSTEM_FRAME_NODE
                     && capability.object == TERMINAL_FILESYSTEM_FRAME_OBJECT)
                 || (capability.node == DATABASE_FILESYSTEM_FRAME_NODE
-                    && capability.object == DATABASE_FILESYSTEM_FRAME_OBJECT))
+                    && capability.object == DATABASE_FILESYSTEM_FRAME_OBJECT)
+                || (capability.node == ROOT_FILESYSTEM_FRAME_NODE
+                    && capability.object == ROOT_FILESYSTEM_FRAME_OBJECT)
+                || (capability.node == NETWORK_FILESYSTEM_FRAME_NODE
+                    && capability.object == NETWORK_FILESYSTEM_FRAME_OBJECT))
         {
             if let Some(handle) = tables[receiver].handle_for_object_with_rights(
                 capability.object,
@@ -3093,6 +3601,9 @@ fn reclaim_task_capabilities(task: usize) -> ResourceCleanup {
         mappings: clear_task_runtime_mappings(task),
         ..ResourceCleanup::default()
     };
+    let anonymous = virtual_memory::reclaim(task);
+    cleanup.frames = anonymous;
+    cleanup.mappings = cleanup.mappings.saturating_add(anonymous);
     tables[task] = CapabilityTable::new();
 
     for object in frame_objects[..frame_count].iter().copied() {
@@ -3111,13 +3622,14 @@ fn reclaim_task_capabilities(task: usize) -> ResourceCleanup {
                 .map(|region| region.pool)
                 .or_else(|| runtime_frame_pool_owner(object));
             if let Some(region) = region {
+                let pages = region.pages;
                 for frame in &region.frames[..region.pages as usize] {
                     cleanup.mappings = cleanup
                         .mappings
                         .saturating_add(clear_runtime_frame_mappings(*frame));
                 }
                 release_frame_region(object);
-                cleanup.frames = cleanup.frames.saturating_add(region.pages as u32);
+                cleanup.frames = cleanup.frames.saturating_add(pages as u32);
             } else {
                 cleanup.mappings = cleanup
                     .mappings
@@ -3491,7 +4003,9 @@ fn register_notification(object: u32) -> Result<(), Status> {
 
 fn unregister_notification(object: u32) {
     if let Some(slot) = notification_slot(object) {
-        NOTIFICATION_OBJECTS[slot].store(0, Ordering::Release);
+        if object != TERMINAL_CANCEL_OBJECT {
+            NOTIFICATION_OBJECTS[slot].store(0, Ordering::Release);
+        }
         NOTIFICATION_BITS[slot].store(0, Ordering::Release);
     }
 }
@@ -3522,6 +4036,12 @@ fn take_notification_bits(object: u32) -> Option<u64> {
 }
 
 fn allocate_runtime_frame(pool_object: u32) -> Result<u32, Status> {
+    if (current_task(unsafe { &*STATE.0.get() }) >= APPLICATION_START
+        || pool_object == SCRIPT_MEMORY_POOL_OBJECT)
+        && physical_memory::free_frames() <= 64
+    {
+        return Err(Status::NoMemory);
+    }
     let quota = memory_pool_quota(pool_object).ok_or(Status::BadCapability)?;
     let allocated = allocated_pool_frames(pool_object);
     if allocated >= quota {
@@ -3603,11 +4123,10 @@ fn allocate_frame_region(object: u32, pool: u32, pages: usize) -> Result<(), Sta
     Ok(())
 }
 
-fn frame_region(object: u32) -> Option<FrameRegion> {
+fn frame_region(object: u32) -> Option<&'static FrameRegion> {
     unsafe { &*FRAME_REGIONS.0.get() }
         .iter()
         .find(|region| region.object == object)
-        .copied()
 }
 
 fn release_frame_region(object: u32) {
@@ -3642,6 +4161,20 @@ fn runtime_frame_pool_owner(object: u32) -> Option<u32> {
 }
 
 fn runtime_frame_physical(object: u32) -> Option<u64> {
+    let shared = match object {
+        FILESYSTEM_FRAME_OBJECT => Some(&FILESYSTEM_FRAME_PHYSICAL),
+        SSH_FILESYSTEM_FRAME_OBJECT => Some(&SSH_FILESYSTEM_FRAME_PHYSICAL),
+        WINDOWD_FILESYSTEM_FRAME_OBJECT => Some(&WINDOWD_FILESYSTEM_FRAME_PHYSICAL),
+        TERMINAL_FILESYSTEM_FRAME_OBJECT => Some(&TERMINAL_FILESYSTEM_FRAME_PHYSICAL),
+        DATABASE_FILESYSTEM_FRAME_OBJECT => Some(&DATABASE_FILESYSTEM_FRAME_PHYSICAL),
+        ROOT_FILESYSTEM_FRAME_OBJECT => Some(&ROOT_FILESYSTEM_FRAME_PHYSICAL),
+        NETWORK_FILESYSTEM_FRAME_OBJECT => Some(&NETWORK_FILESYSTEM_FRAME_PHYSICAL),
+        IDENTITY_SNAPSHOT_OBJECT => Some(&IDENTITY_SNAPSHOT_PHYSICAL),
+        _ => None,
+    };
+    if let Some(shared) = shared {
+        return Some(shared.load(Ordering::Acquire)).filter(|physical| *physical != 0);
+    }
     let index = object.checked_sub(RUNTIME_FRAME_OBJECT_BASE)? as usize;
     if index >= RUNTIME_FRAME_COUNT {
         return None;
@@ -3663,6 +4196,14 @@ fn reset_runtime_frames() {
 }
 
 fn reset_filesystem_frame() {
+    let address = NETWORK_FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 { let _ = physical_memory::release(address); }
+    let address = IDENTITY_SNAPSHOT_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 { let _ = physical_memory::release(address); }
+    let address = ROOT_FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        let _ = physical_memory::release(address);
+    }
     let address = FILESYSTEM_FRAME_PHYSICAL.swap(0, Ordering::AcqRel);
     if address != 0 {
         let _ = physical_memory::release(address);
@@ -3890,11 +4431,17 @@ fn expire_deadlines() {
 }
 
 fn wake_notifications() {
-    wake_notification_object(DEVICE_NOTIFICATION_OBJECT);
-    for object in &NOTIFICATION_OBJECTS {
-        let object = object.load(Ordering::Acquire);
-        if object != 0 {
-            wake_notification_object(object);
+    let state = unsafe { &mut *STATE.0.get() };
+    for task in 0..state.threads.len() {
+        let ThreadState::WaitingNotification { object, .. } = state.threads[task] else {
+            continue;
+        };
+        let Some(bits) = take_notification_bits(object) else {
+            continue;
+        };
+        if bits != 0 {
+            state.threads[task] = ThreadState::Runnable;
+            state.contexts[task].registers[0] = bits;
         }
     }
 }
@@ -3927,9 +4474,6 @@ fn fail(frame: &mut ExceptionFrame, status: Status) -> u64 {
 }
 
 fn read_message(task: usize, pointer: u64) -> Option<Message> {
-    if !validate_user_range(task, pointer, core::mem::size_of::<Message>() as u64, false) {
-        return None;
-    }
     let mut message = Message::new(0, 0);
     copy_from_user(
         task,
@@ -3941,9 +4485,6 @@ fn read_message(task: usize, pointer: u64) -> Option<Message> {
 }
 
 fn write_message(task: usize, pointer: u64, message: &Message) -> bool {
-    if !validate_user_range(task, pointer, core::mem::size_of::<Message>() as u64, true) {
-        return false;
-    }
     copy_to_user(
         task,
         pointer,
@@ -3963,19 +4504,24 @@ fn validate_user_range(task: usize, pointer: u64, bytes: u64, write: bool) -> bo
     let low_range = pointer >= USER_MIN && end <= STACK_TOP;
     let large_heap_range =
         uses_large_window(task) && pointer >= LARGE_HEAP_START && end <= LARGE_HEAP_END;
-    if !low_range && !large_heap_range {
+    let anonymous_range = pointer >= microsystem_abi::virtual_memory::START
+        && end <= microsystem_abi::virtual_memory::END;
+    if !low_range && !large_heap_range && !anonymous_range {
         return false;
     }
     if bytes == 0 {
         return true;
     }
-    let Some(memory) = task_memory(task) else {
-        return false;
-    };
     let mut page = pointer & !0xfff;
     let last = (end - 1) & !0xfff;
     loop {
-        let Some(descriptor) = user_descriptor(memory, page) else {
+        if (anonymous_range || virtual_memory::is_heap(task, page))
+            && virtual_memory::commit(task, page, write).is_err()
+        {
+            return false;
+        }
+        let Some(descriptor) = task_memory(task).and_then(|memory| user_descriptor(memory, page))
+        else {
             return false;
         };
         if !crate::arch::user_page_accessible(descriptor, write) {
@@ -3990,34 +4536,59 @@ fn validate_user_range(task: usize, pointer: u64, bytes: u64, write: bool) -> bo
 }
 
 fn copy_from_user(task: usize, pointer: u64, destination: *mut u8, bytes: usize) -> Option<()> {
-    for offset in 0..bytes {
-        let source = translated_user_address(task, pointer + offset as u64, false)?;
-        unsafe {
-            destination
-                .add(offset)
-                .write(core::ptr::read_volatile(source as *const u8));
+    if bytes == 0 {
+        return Some(());
+    }
+    if !validate_user_range(task, pointer, u64::try_from(bytes).ok()?, false) {
+        return None;
+    }
+    let memory = task_memory(task)?;
+    let mut offset = 0;
+    while offset < bytes {
+        let address = pointer.checked_add(offset as u64)?;
+        let descriptor = user_descriptor(memory, address)?;
+        let page_offset = address as usize & 0xfff;
+        let chunk = (bytes - offset).min(4096 - page_offset);
+        let source = crate::arch::phys_to_virt(arch::page_table_physical(descriptor)) + page_offset;
+        for index in 0..chunk {
+            unsafe {
+                destination
+                    .add(offset + index)
+                    .write(core::ptr::read_volatile((source + index) as *const u8));
+            }
         }
+        offset += chunk;
     }
     Some(())
 }
 
 fn copy_to_user(task: usize, pointer: u64, source: *const u8, bytes: usize) -> Option<()> {
-    for offset in 0..bytes {
-        let destination = translated_user_address(task, pointer + offset as u64, true)?;
-        unsafe {
-            core::ptr::write_volatile(destination as *mut u8, source.add(offset).read());
-        }
+    if bytes == 0 {
+        return Some(());
     }
-    Some(())
-}
-
-fn translated_user_address(task: usize, pointer: u64, write: bool) -> Option<usize> {
-    if !validate_user_range(task, pointer, 1, write) {
+    if !validate_user_range(task, pointer, u64::try_from(bytes).ok()?, true) {
         return None;
     }
-    let descriptor = user_descriptor(task_memory(task)?, pointer)?;
-    let physical = arch::page_table_physical(descriptor);
-    Some(crate::arch::phys_to_virt(physical) + (pointer as usize & 0xfff))
+    let memory = task_memory(task)?;
+    let mut offset = 0;
+    while offset < bytes {
+        let address = pointer.checked_add(offset as u64)?;
+        let descriptor = user_descriptor(memory, address)?;
+        let page_offset = address as usize & 0xfff;
+        let chunk = (bytes - offset).min(4096 - page_offset);
+        let destination =
+            crate::arch::phys_to_virt(arch::page_table_physical(descriptor)) + page_offset;
+        for index in 0..chunk {
+            unsafe {
+                core::ptr::write_volatile(
+                    (destination + index) as *mut u8,
+                    source.add(offset + index).read(),
+                );
+            }
+        }
+        offset += chunk;
+    }
+    Some(())
 }
 
 fn user_descriptor(memory: &TaskMemory, virtual_address: u64) -> Option<u64> {
@@ -4034,6 +4605,16 @@ fn user_descriptor(memory: &TaskMemory, virtual_address: u64) -> Option<u64> {
         let table = offset / 0x20_0000;
         let index = (offset >> 12) & 0x1ff;
         return Some(memory.large_heap_level3[table][index]);
+    }
+    if (microsystem_abi::virtual_memory::START..microsystem_abi::virtual_memory::END)
+        .contains(&virtual_address)
+    {
+        let branch = memory.level2[(virtual_address >> 21) as usize];
+        if !arch::page_table_present(branch) {
+            return Some(0);
+        }
+        let entries = arch::phys_to_virt(arch::page_table_physical(branch)) as *const u64;
+        return Some(unsafe { *entries.add(((virtual_address >> 12) & 511) as usize) });
     }
     None
 }
@@ -4057,7 +4638,7 @@ fn user_descriptor_mut(memory: &mut TaskMemory, virtual_address: u64) -> Option<
 }
 
 fn uses_large_window(task: usize) -> bool {
-    matches!(task, MFS_TASK | WINDOWD_TASK | DB_TASK)
+    matches!(task, MFS_TASK | WINDOWD_TASK | DB_TASK | NETD_TASK)
 }
 
 fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
@@ -4088,16 +4669,6 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     }
     memory.image.fill(0);
     memory.stack.fill(0);
-    memory.heap.fill(0);
-    if matches!(task, MFS_TASK | DB_TASK) {
-        if memory.large_heap.is_null() {
-            let layout =
-                core::alloc::Layout::from_size_align(LARGE_HEAP_BYTES, 4096).map_err(|_| ())?;
-            memory.large_heap = kernel_heap::allocate_zeroed(layout).map_err(|_| ())?;
-        } else {
-            unsafe { ptr::write_bytes(memory.large_heap, 0, LARGE_HEAP_BYTES) };
-        }
-    }
 
     #[cfg(target_arch = "x86_64")]
     let level0_physical = physical(memory.level0.as_ptr() as usize);
@@ -4107,7 +4678,6 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
     let level3_high_physical = physical(memory.level3_high.as_ptr() as usize);
     let image_physical = physical(memory.image.as_ptr() as usize);
     let stack_physical = physical(memory.stack.as_ptr() as usize);
-    let heap_physical = physical(memory.heap.as_ptr() as usize);
     #[cfg(target_arch = "x86_64")]
     {
         memory.level0[0] = crate::arch::page_table_branch(level1_physical);
@@ -4164,25 +4734,6 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
             stack_physical + offset as u64,
             normal_page_flags(),
         );
-    }
-    for offset in (0..HEAP_BYTES).step_by(4096) {
-        map_page(
-            memory,
-            HEAP_START + offset as u64,
-            heap_physical + offset as u64,
-            normal_page_flags(),
-        );
-    }
-    if matches!(task, MFS_TASK | DB_TASK) {
-        let heap_physical = physical(memory.large_heap as usize);
-        for offset in (0..LARGE_HEAP_BYTES).step_by(4096) {
-            let table = offset / 0x20_0000;
-            let index = (offset >> 12) & 0x1ff;
-            memory.large_heap_level3[table][index] = crate::arch::page_table_entry(
-                heap_physical + offset as u64,
-                crate::arch::normal_page_flags(),
-            );
-        }
     }
     if task == CONSOLE_TASK {
         let uart = CONSOLE_UART.load(Ordering::Acquire);
@@ -4270,6 +4821,33 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         );
     }
 
+    if matches!(task, 0 | MFS_TASK) {
+        let physical = ROOT_FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if physical != 0 {
+            map_page(
+                memory,
+                ROOT_FILESYSTEM_DATA_VA,
+                physical,
+                normal_page_flags(),
+            );
+        } else if task != 0 {
+            return Err(());
+        }
+    }
+    if matches!(task, MFS_TASK | NETD_TASK) {
+        let physical = NETWORK_FILESYSTEM_FRAME_PHYSICAL.load(Ordering::Acquire);
+        if physical == 0 { return Err(()); }
+        map_page(memory, if task == MFS_TASK { NETWORK_FILESYSTEM_DATA_VA } else { FILESYSTEM_DATA_VA }, physical, normal_page_flags());
+    }
+    if matches!(task, MFS_TASK | SHELL_TASK | WINDOWD_TASK | TERMINAL_TASK | FILES_TASK | MONITOR_TASK | SSHD_TASK | NETD_TASK | DB_TASK) {
+        let physical = IDENTITY_SNAPSHOT_PHYSICAL.load(Ordering::Acquire);
+        if physical == 0 { return Err(()); }
+        map_page(memory, microsystem_abi::identity::SNAPSHOT_VA as u64, physical, user_page_flags(false, false));
+    }
+
+    if let Some(grant) = unsafe { *BLOCK_GRANT.0.get() } {
+        map_transport_memory(memory, task, grant);
+    }
     let starts = unsafe { &mut *STARTS.0.get() };
     #[cfg(target_arch = "x86_64")]
     let stack = {
@@ -4298,6 +4876,43 @@ fn load_task(task: usize, bytes: &[u8]) -> Result<(), ()> {
         ),
     };
     Ok(())
+}
+
+fn map_transport_memory(memory: &mut TaskMemory, task: usize, grant: UserTransportGrant) {
+    if matches!(task, BLOCK_TASK | DEVMGR_TASK) {
+        for (address, physical) in [
+            (BLOCK_COMMON_VA, grant.common_physical),
+            (BLOCK_NOTIFY_VA, grant.notify_physical),
+            (BLOCK_ISR_VA, grant.isr_physical),
+            (BLOCK_DEVICE_VA, grant.device_physical),
+        ] {
+            map_page(memory, address, physical, device_page_flags());
+        }
+    }
+    if task == DEVMGR_TASK {
+        map_page(
+            memory,
+            DEVMGR_PCI_CONFIG_VA,
+            grant.pci_function_physical,
+            device_page_flags(),
+        );
+    }
+    if task == BLOCK_TASK {
+        map_page(
+            memory,
+            BLOCK_QUEUE_VA,
+            grant.queue_physical,
+            normal_page_flags(),
+        );
+    }
+    if matches!(task, BLOCK_TASK | MFS_TASK) {
+        map_page(
+            memory,
+            SHARED_DATA_VA,
+            grant.data_physical,
+            normal_page_flags(),
+        );
+    }
 }
 
 fn map_page(memory: &mut TaskMemory, virtual_address: u64, physical: u64, flags: u64) {

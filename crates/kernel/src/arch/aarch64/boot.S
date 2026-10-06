@@ -9,12 +9,17 @@
 
 _start:
     msr daifset, #0xf
+    mov x21, x0
     mrs x20, mpidr_el1
     and x20, x20, #0xff
     cbnz x20, secondary_park
     bl normalize_el
     bl initialize_fp_simd
+    // QEMU's ELF entry may omit x0; preserve a firmware-provided DTB when present.
+    mov x0, x21
+    cbnz x0, 0f
     mov x0, #0x40000000
+0:
     bl set_boot_stack
     bl setup_mmu
     ldr x1, =kernel_main

@@ -114,6 +114,7 @@ fn build(arch: Architecture) -> Result<(), String> {
         "microsystem-terminal",
         "microsystem-files",
         "microsystem-monitor",
+        "microsystem-memoryprobe",
         "microsystem-netd",
         "microsystem-mica-service",
         "microsystem-sshd",
@@ -161,9 +162,11 @@ fn build(arch: Architecture) -> Result<(), String> {
     for directory in [
         "/.system",
         "/.system/fonts",
+        "/.system/input",
         "/.system/mica",
         "/.system/examples",
         "/.system/examples/mica",
+        "/.system/examples/native",
         "/.system/certs",
         "/.system/ssh",
     ] {
@@ -173,14 +176,23 @@ fn build(arch: Architecture) -> Result<(), String> {
             directory,
         ]))?;
     }
+    let input_files = Command::new(host_binary("mfsctl")).args([
+        "ls", disk.to_str().ok_or("invalid disk path")?, "/.system/input",
+    ]).output().map_err(|error| error.to_string())?;
+    if !input_files.status.success() { return Err("cannot inspect input dictionary directory".into()); }
+    if !String::from_utf8_lossy(&input_files.stdout).lines().any(|path| path == "/.system/input/pinyin.tsv") {
+        run(Command::new(host_binary("mfsctl")).args([
+            "seed", disk.to_str().ok_or("invalid disk path")?, "assets/input/pinyin.tsv", "/.system/input/pinyin.tsv",
+        ]))?;
+    }
     run(Command::new(host_binary("mfsctl")).args([
-        "put",
+        "seed",
         disk.to_str().ok_or("invalid disk path")?,
         "build/unifont-17.0.05.ufb",
         "/.system/fonts/unifont-17.0.05.ufb",
     ]))?;
     run(Command::new(host_binary("mfsctl")).args([
-        "put",
+        "seed",
         disk.to_str().ok_or("invalid disk path")?,
         "build/ca-bundle.derpack",
         "/.system/certs/ca-bundle.derpack",
@@ -190,20 +202,34 @@ fn build(arch: Architecture) -> Result<(), String> {
         "fs-status",
         "http-status",
         "gui-counter",
+        "desktop-probe",
         "browser",
         "editor",
     ] {
         let source = format!("assets/mica/{example}.mica");
         let destination = format!("/.system/examples/mica/{example}.mica");
         run(Command::new(host_binary("mfsctl")).args([
-            "put",
+            "seed",
             disk.to_str().ok_or("invalid disk path")?,
             &source,
             &destination,
         ]))?;
     }
+    for example in ["counter", "spinner", "memoryprobe"] {
+        let source = PathBuf::from("target")
+            .join(arch.target())
+            .join("release")
+            .join(format!("microsystem-{example}"));
+        let destination = format!("/.system/examples/native/{example}.elf");
+        run(Command::new(host_binary("mfsctl")).args([
+            "seed",
+            disk.to_str().ok_or("invalid disk path")?,
+            source.to_str().ok_or("invalid native path")?,
+            &destination,
+        ]))?;
+    }
     run(Command::new(host_binary("mfsctl")).args([
-        "put",
+        "seed",
         disk.to_str().ok_or("invalid disk path")?,
         "assets/ssh/mica-policy",
         "/.system/ssh/mica-policy",
@@ -527,7 +553,9 @@ fn create_bootfs(arch: Architecture) -> Result<(), String> {
         b"init\ndevmgr\nconsole\nblock\nmfs\ndb\nshell\nnetd\nsshd\nwindowd\nterminal\nfiles\nmonitor\n",
     );
     append_newc(&mut archive, 0, "TRAILER!!!", 0, &[]);
-    fs::write("build/bootfs.cpio", archive).map_err(|error| error.to_string())
+    fs::write("build/bootfs.cpio", &archive).map_err(|error| error.to_string())?;
+    let name = match arch { Architecture::Aarch64 => "aarch64", Architecture::Riscv64 => "riscv64", Architecture::X86_64 => "x86_64" };
+    fs::write(format!("build/bootfs-{name}.cpio"), &archive).map_err(|error| error.to_string())
 }
 
 fn append_newc(out: &mut Vec<u8>, inode: u32, name: &str, mode: u32, data: &[u8]) {
@@ -823,6 +851,16 @@ fn test() -> Result<(), String> {
         "microsystem-gui",
         "-p",
         "microsystem-mica",
+        "-p",
+        "microsystem-shell",
+        "-p",
+        "microsystem-fs",
+        "-p",
+        "microsystem-init",
+        "-p",
+        "microsystem-netd",
+        "-p",
+        "microsystem-identity",
     ]))?;
     let smoke = Path::new("scripts/smoke-qemu.sh");
     if smoke.exists() {

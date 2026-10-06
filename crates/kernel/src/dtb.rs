@@ -1,4 +1,7 @@
 const FDT_MAGIC: u32 = 0xd00d_feed;
+const MAX_RESERVED_REGIONS: usize = 32;
+const EMPTY_RANGE: microsystem_kernel::memory::PhysicalRange =
+    microsystem_kernel::memory::PhysicalRange { base: 0, bytes: 0 };
 
 #[derive(Clone, Copy)]
 pub struct PlatformInfo {
@@ -7,6 +10,12 @@ pub struct PlatformInfo {
     pub cpus: usize,
     pub ram_base: usize,
     pub ram_bytes: usize,
+    pub ram_regions:
+        [microsystem_kernel::memory::PhysicalRange; microsystem_kernel::memory::MAX_MEMORY_REGIONS],
+    pub ram_region_count: usize,
+    pub reserved_regions: [microsystem_kernel::memory::PhysicalRange; MAX_RESERVED_REGIONS],
+    pub reserved_region_count: usize,
+    pub memory_map_overflow: bool,
     pub uart_base: usize,
     pub rtc_base: usize,
     pub clint_base: usize,
@@ -24,7 +33,7 @@ pub struct PlatformInfo {
     pub iommu_sid_base: u32,
     pub iommu_map_length: u32,
     pub iommu_map_mask: u32,
-    pcie_intx: [u32; 16],
+    pub(crate) pcie_intx: [u32; 16],
     pub has_pcie: bool,
 }
 
@@ -36,11 +45,68 @@ pub fn discover(physical: usize) -> PlatformInfo {
         return invalid(0);
     }
     let bytes = be_u32(header, 4) as usize;
+    if !(40..=2 * 1024 * 1024).contains(&bytes) {
+        return invalid(bytes);
+    }
     let blob = unsafe { core::slice::from_raw_parts(pointer, bytes) };
     let Ok(tree) = fdt::Fdt::new(blob) else {
         return invalid(bytes);
     };
-    let memory = tree.memory().regions().next();
+    let mut ram_regions = [EMPTY_RANGE; microsystem_kernel::memory::MAX_MEMORY_REGIONS];
+    let mut ram_region_count = 0;
+    let mut memory_map_overflow = false;
+    'memory: for node in tree
+        .all_nodes()
+        .filter(|node| node.name == "memory" || node.name.starts_with("memory@"))
+    {
+        for region in node.reg().into_iter().flatten() {
+            let Some(bytes) = region.size.filter(|bytes| *bytes != 0) else {
+                continue;
+            };
+            if ram_region_count == ram_regions.len() {
+                memory_map_overflow = true;
+                break 'memory;
+            }
+            ram_regions[ram_region_count] = microsystem_kernel::memory::PhysicalRange {
+                base: region.starting_address as u64,
+                bytes: bytes as u64,
+            };
+            ram_region_count += 1;
+        }
+    }
+    let mut reserved_regions = [EMPTY_RANGE; MAX_RESERVED_REGIONS];
+    let mut reserved_region_count = 0;
+    for reservation in tree.memory_reservations() {
+        if !push_reserved(
+            &mut reserved_regions,
+            &mut reserved_region_count,
+            reservation.address() as u64,
+            reservation.size() as u64,
+        ) {
+            memory_map_overflow = true;
+            break;
+        }
+    }
+    if let Some(reserved_node) = tree.find_node("/reserved-memory") {
+        'nodes: for child in reserved_node.children() {
+            if let Some(regions) = child.reg() {
+                for region in regions {
+                    if let Some(bytes) = region.size {
+                        if !push_reserved(
+                            &mut reserved_regions,
+                            &mut reserved_region_count,
+                            region.starting_address as u64,
+                            bytes as u64,
+                        ) {
+                            memory_map_overflow = true;
+                            break 'nodes;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let memory = ram_regions.first().filter(|_| ram_region_count != 0);
     let uart_base = first_region(&tree, &["arm,pl011", "ns16550a"]);
     let rtc_base = first_region(&tree, &["arm,pl031", "google,goldfish-rtc"]);
     let clint_base = first_region(
@@ -83,10 +149,13 @@ pub fn discover(physical: usize) -> PlatformInfo {
         valid: true,
         bytes,
         cpus: tree.cpus().count(),
-        ram_base: memory
-            .map(|region| region.starting_address as usize)
-            .unwrap_or(0),
-        ram_bytes: memory.and_then(|region| region.size).unwrap_or(0),
+        ram_base: memory.map(|region| region.base as usize).unwrap_or(0),
+        ram_bytes: memory.map(|region| region.bytes as usize).unwrap_or(0),
+        ram_regions,
+        ram_region_count,
+        reserved_regions,
+        reserved_region_count,
+        memory_map_overflow,
         uart_base,
         rtc_base,
         clint_base,
@@ -110,48 +179,22 @@ pub fn discover(physical: usize) -> PlatformInfo {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn discover(_physical: usize) -> PlatformInfo {
-    let mut pcie_intx = [0u32; 16];
-    for slot in 0..4 {
-        for pin in 0..4 {
-            pcie_intx[slot * 4 + pin] = 16 + ((slot + pin) & 3) as u32;
-        }
-    }
-    PlatformInfo {
-        valid: true,
-        bytes: 0,
-        cpus: 2,
-        ram_base: 0,
-        ram_bytes: 256 * 1024 * 1024,
-        uart_base: 0x3f8,
-        rtc_base: 0,
-        clint_base: 0,
-        plic_base: 0,
-        plic_bytes: 0,
-        gicd_base: 0xfee0_0000,
-        gicr_base: 0xfec0_0000,
-        smmu_base: 0xfed9_0000,
-        riscv_iommu_base: 0,
-        riscv_iommu_bytes: 0,
-        pcie_base: 0xb000_0000,
-        pcie_mmio_base: 0xc000_0000,
-        pcie_mmio_bytes: 0x1000_0000,
-        iommu_rid_base: 0,
-        iommu_sid_base: 0,
-        iommu_map_length: 0x1_0000,
-        iommu_map_mask: 0xffff,
-        pcie_intx,
-        has_pcie: true,
-    }
+pub fn discover(physical: usize) -> PlatformInfo {
+    crate::x86_firmware::discover(physical)
 }
 
-fn invalid(bytes: usize) -> PlatformInfo {
+pub(crate) fn invalid(bytes: usize) -> PlatformInfo {
     PlatformInfo {
         valid: false,
         bytes,
         cpus: 0,
         ram_base: 0,
         ram_bytes: 0,
+        ram_regions: [EMPTY_RANGE; microsystem_kernel::memory::MAX_MEMORY_REGIONS],
+        ram_region_count: 0,
+        reserved_regions: [EMPTY_RANGE; MAX_RESERVED_REGIONS],
+        reserved_region_count: 0,
+        memory_map_overflow: true,
         uart_base: 0,
         rtc_base: 0,
         clint_base: 0,
@@ -172,6 +215,24 @@ fn invalid(bytes: usize) -> PlatformInfo {
         pcie_intx: [0; 16],
         has_pcie: false,
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn push_reserved(
+    ranges: &mut [microsystem_kernel::memory::PhysicalRange; MAX_RESERVED_REGIONS],
+    count: &mut usize,
+    base: u64,
+    bytes: u64,
+) -> bool {
+    if bytes == 0 {
+        return true;
+    }
+    if *count == ranges.len() || base.checked_add(bytes).is_none() {
+        return false;
+    }
+    ranges[*count] = microsystem_kernel::memory::PhysicalRange { base, bytes };
+    *count += 1;
+    true
 }
 
 impl PlatformInfo {

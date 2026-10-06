@@ -71,6 +71,7 @@ impl<'a> ElfImage<'a> {
             ph_count,
         };
         let mut seen = [None; 32];
+        let mut entry_is_executable = false;
         if ph_count > seen.len() {
             return Err(Status::NotSupported);
         }
@@ -89,6 +90,8 @@ impl<'a> ElfImage<'a> {
             {
                 return Err(Status::AccessDenied);
             }
+            entry_is_executable |=
+                segment.executable && segment.virtual_address <= entry && entry < end;
             let file_end = segment
                 .file_offset
                 .checked_add(segment.file_size)
@@ -117,6 +120,9 @@ impl<'a> ElfImage<'a> {
             }
             seen[index] = Some(segment);
         }
+        if !entry_is_executable {
+            return Err(Status::Invalid);
+        }
         Ok(image)
     }
 
@@ -129,6 +135,7 @@ impl<'a> ElfImage<'a> {
             let offset = self.ph_offset + index * 56;
             match u32_at(self.bytes, offset) {
                 Ok(PT_LOAD) => Some(parse_segment(self.bytes, offset)),
+                Ok(2 | 3) => Some(Err(Status::NotSupported)),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             }

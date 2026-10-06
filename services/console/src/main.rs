@@ -12,14 +12,10 @@ const DATA: usize = 0x00;
 const FLAGS: usize = 0x18;
 #[cfg(target_arch = "aarch64")]
 const RX_EMPTY: u32 = 1 << 4;
-#[cfg(target_arch = "aarch64")]
-const TX_FULL: u32 = 1 << 5;
 #[cfg(target_arch = "riscv64")]
 const LINE_STATUS: usize = 0x05;
 #[cfg(target_arch = "riscv64")]
 const RX_READY: u8 = 1 << 0;
-#[cfg(target_arch = "riscv64")]
-const TX_READY: u8 = 1 << 5;
 const REVOCATION_PROBE_VA: u64 = 0x0058_0000;
 
 #[unsafe(no_mangle)]
@@ -29,11 +25,11 @@ pub extern "C" fn _start(uart: usize) -> ! {
         microsystem_user_rt::exit(2);
     }
     let mut request = Message::new(protocol::CONSOLE, 0);
+    let _ = microsystem_user_rt::debug_write(b"[ipc] resident console endpoint=1 ready\n");
+    let _ = microsystem_user_rt::service_online();
     if microsystem_user_rt::ipc_recv(boot_cap::CONSOLE_ENDPOINT, &mut request, 0).is_err() {
         microsystem_user_rt::exit(3);
     }
-    let _ = microsystem_user_rt::debug_write(b"[ipc] resident console endpoint=1 ready\n");
-    let _ = microsystem_user_rt::service_online();
     let mut deferred_signal = None;
     let mut revocation_probe = None;
     loop {
@@ -173,13 +169,9 @@ fn handle(
                 return Status::Invalid;
             }
             let bytes = words_as_bytes(&request.words[1..5]);
-            #[cfg(target_arch = "x86_64")]
-            let _ = microsystem_user_rt::debug_write(&bytes[..length]);
-            #[cfg(not(target_arch = "x86_64"))]
-            for &byte in &bytes[..length] {
-                put(uart, byte);
-            }
-            Status::Ok
+            microsystem_user_rt::console_write_bytes(&bytes[..length])
+                .err()
+                .unwrap_or(Status::Ok)
         }
         value if value == Operation::Read as u16 => match get(uart) {
             Some(byte) => {
@@ -194,19 +186,6 @@ fn handle(
 
 fn words_as_bytes(words: &[u64]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn put(uart: usize, byte: u8) {
-    #[cfg(target_arch = "aarch64")]
-    while read32(uart + FLAGS) & TX_FULL != 0 {
-        core::hint::spin_loop();
-    }
-    #[cfg(target_arch = "riscv64")]
-    while read8(uart + LINE_STATUS) & TX_READY == 0 {
-        core::hint::spin_loop();
-    }
-    unsafe { core::ptr::write_volatile((uart + DATA) as *mut u8, byte) };
 }
 
 fn get(uart: usize) -> Option<u8> {

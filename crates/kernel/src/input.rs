@@ -92,9 +92,9 @@ pub fn poll() -> Option<InputEvent> {
         dma_barrier();
         put16(queue, AVAIL_OFFSET + 2, available.wrapping_add(1));
         dma_barrier();
-        let notify = read16(device.transport.common + 30) as usize
-            * device.transport.notify_multiplier as usize;
-        write16(device.transport.notify + notify, 0);
+        if let Some(notify) = device.transport.queue_notify_offset() {
+            write16(device.transport.notify + notify, 0);
+        }
         unsafe { DEVICES[index] = Some(device) };
         return Some(event);
     }
@@ -129,7 +129,7 @@ fn activate_one(
     .map_err(|_| ())?;
     let stream_id = platform.stream_id(device.requester_id()).ok_or(())?;
     let physical = crate::arch::virt_to_phys(queue as usize as u64).ok_or(())?;
-    smmu::map_gui_aux_page(iova, physical).map_err(|_| ())?;
+    smmu::map_gui_aux_page(stream_id, iova, physical).map_err(|_| ())?;
     smmu::attach_stream(stream_id).map_err(|_| ())?;
     negotiate(transport)?;
     let bytes = unsafe { &mut (*queue).0 };
@@ -169,7 +169,7 @@ fn activate_one(
     );
     put16(bytes, AVAIL_OFFSET + 2, QUEUE_SIZE);
     dma_barrier();
-    let notify = read16(transport.common + 30) as usize * transport.notify_multiplier as usize;
+    let notify = transport.queue_notify_offset().ok_or(())?;
     write16(transport.notify + notify, 0);
     Ok(InputDevice {
         transport,

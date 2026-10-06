@@ -8,13 +8,14 @@ build = "../user-build.rs"
 
 [dependencies]
 microsystem-abi = { path = "../../crates/abi" }
+microsystem-identity = { path = "../../crates/identity" }
 microsystem-fs = { path = "../fs" }
 microsystem-shell = { path = "../shell" }
 microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
 
 [features]
 default = []
-user-bin = ["dep:microsystem-user-rt"]
+user-bin = ["dep:microsystem-user-rt", "microsystem-shell/user-bin"]
 
 [[bin]]
 name = "microsystem-terminal"

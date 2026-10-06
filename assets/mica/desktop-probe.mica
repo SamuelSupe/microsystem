@@ -1,0 +1,44 @@
+--!mica 1
+--!allow gui.window
+
+local gui = require("gui")
+local first, err = gui.window {title = "Desktop Probe A", x = 24, y = 32, width = 380, height = 220}
+if not first then error(err.message) end
+local field = gui.text_input {
+    text = "Alpha",
+    on_change = function(text) print("probe-a:" + text) end,
+}
+first:set_root(gui.column {padding = 16, gap = 12, children = {
+    gui.label {text = "Copy, compose, then close this window"}, field,
+}})
+local second, err = gui.window {title = "Desktop Probe B", x = 450, y = 32, width = 380, height = 220}
+if not second then error(err.message) end
+second:set_root(gui.column {padding = 16, gap = 12, children = {
+    gui.label {text = "The second window survives the first"},
+    gui.text_input {text = "Beta", on_change = function(text) print("probe-b:" + text) end},
+}})
+local extra_c = gui.window {title = "Capacity C"}
+local extra_d = gui.window {title = "Capacity D"}
+assert(extra_c and extra_d)
+local overflow, err = gui.window {title = "Overflow"}
+assert(not overflow and err)
+extra_c:close()
+extra_d:close()
+print("probe:window-quota=true")
+gui.clipboard.write("shared-text")
+local text = gui.clipboard.read()
+assert(text == "shared-text")
+print("probe:clipboard-api=true")
+local bad, err = pcall(function() second:set_root(field) end)
+assert(not bad)
+print("probe:widget-isolation=true")
+second:run()
+print("probe:clipboard-and-composition=true")
+local third, err = gui.window {title = "Desktop Probe C", x = 24, y = 32, width = 380, height = 220}
+if not third then error(err.message) end
+local stale, err = pcall(function() field:set_text("stale") end)
+assert(not stale)
+print("probe:stale-widget-rejected=true")
+third:set_root(gui.label {text = "Window resources were reused"})
+third:run()
+print("probe:complete=true")

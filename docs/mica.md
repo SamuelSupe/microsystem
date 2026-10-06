@@ -61,7 +61,7 @@ a 32 KiB output/broker ring and a 16-page (64 KiB) per-process session region at
 than copied into the small inline source field.
 
 The kernel-side layout is separate from VM accounting: the kernel heap is
-128 MiB; every ordinary EL0 address space has a 64 KiB stack, a 1 MiB user heap,
+64 MiB; every ordinary EL0 address space has a 64 KiB stack, a 1 MiB user heap,
 and a `0xe0000`-byte Mica/task image window. The Mica process is an ordinary
 `ThreadStartEx` application (dynamic PID range starts at 14), not a resident
 service slot.
@@ -114,8 +114,9 @@ following capabilities are passed to the Mica task:
 | system info (optional) | `READ` | `sys.stats` only when allowed |
 
 The desktop Reader entry is fixed in init: its bundled path, manifest and
-launcher policy contain only `gui.window` and `net.browse`. A GUI client cannot
-replace that path or broaden the policy through the launcher endpoint.
+launcher policy contain `gui.window`, `net.browse` and `fs.write:/data`. A GUI
+client cannot replace that path or broaden the policy through the launcher
+endpoint.
 
 GUI file sessions additionally receive a 64 KiB command `FrameRegion`, a 4 KiB
 event `Frame` and a dedicated GUI endpoint. These are installed atomically by
@@ -161,6 +162,8 @@ event and endpoint capabilities described above.
 | `args` | `get`, `all` |
 
 Filesystem writes support atomic temporary-file/rename and optional `fsync`.
+`fs.stat(path)` returns type, size, mode, uid, gid and modified (Unix seconds).
+Mode contains only permission bits; missing timestamp information is zero.
 `read_file` defaults to 64 KiB and accepts at most 256 KiB. Broker transfers
 are capped at 32 KiB per request. `proc.spawn` is policy-owned and only starts
 static bootfs application ELFs; Mica itself is intentionally not a valid
@@ -174,8 +177,8 @@ For the bundled Reader, `net.browse` gates only its `http.get` GET path and
 allows the host to be selected at runtime; raw resolve/TCP/UDP and every
 non-GET method still require exact `net.connect:host:port` permission. Headers
 are limited to 16 KiB, requests to 32 KiB, and `read_all()` defaults to 1 MiB
-(maximum 4 MiB). Redirect handling is absent: a 3xx response is returned
-as-is and no `Location` follow-up is performed. The response table exposes the
+(maximum 4 MiB). The generic HTTP API returns a 3xx response as-is and does
+not follow `Location`. The response table exposes the
 first `Content-Type` value (maximum 256 bytes) as `content_type` and the first
 `Location` value (maximum 2,048 bytes) as `location`; arbitrary response
 headers are not exposed.
@@ -258,7 +261,7 @@ the launcher's `--allow gui.window` rule and the entry-point policy. SSH uses
 the maximum policy in `/.system/ssh/mica-policy`. If GPU/windowd is absent the
 launcher returns `NotSupported`.
 
-`require("gui")` exposes a retained, single-window toolkit:
+`require("gui")` exposes a retained toolkit with up to four windows per script:
 
 ```text
 window, label, button, text_input, checkbox, list, scroll,
@@ -272,9 +275,22 @@ or clear the same callbacks after construction. Row/column/scroll use
 bounded integer flex layout with `padding`, `gap`, fixed dimensions and `grow`.
 Scroll handles bounded wheel scrolling but is not a focus/click target. List and
 Canvas own their own client clips; Canvas is limited to the six validated GUI
-drawing commands. One script owns one top-level window; close requests are
-delivered through the GUI event ring and init allows a two-second cleanup
-window before reclaiming the session.
+drawing commands. Each window owns its widget tree and display sequence;
+cross-window widget sharing and stale widget handles are rejected. `window:run()`
+dispatches events and callbacks for all session windows and returns when that
+window closes. Close requests for the last window allow two seconds of cleanup
+before init reclaims a nonresponsive session. A window can be created again
+after another closes without retaining the old widget resources.
+
+Focused text inputs support Left/Right and Home/End caret movement,
+Backspace/Delete by UTF-8 character, and Ctrl+A whole-field selection. Typing
+replaces that selection. Clicking focuses the field at its end; Tab cycles
+focus and Enter submits. Ctrl+C/X/V copies/cuts/pastes a Ctrl+A selection using
+the shared 4 KiB UTF-8 clipboard; `gui.clipboard.read()` and `.write(text)` expose
+the same store. Ctrl+Space toggles dictionary Pinyin composition, with a visible
+preedit/candidate overlay, Space/Enter or number-key selection, Backspace and
+Escape cancellation. See `docs/gui.md` for dictionary limits and configuration.
+Pointer-positioned caret placement and partial selection are not implemented.
 
 The host is connected to windowd with `protocol::GUI = 6`: a 64 KiB command
 FrameRegion, a 4 KiB event Frame, a dedicated endpoint and
@@ -329,30 +345,39 @@ restricted document reader built entirely with the Mica GUI and HTTP modules:
 
 ```text
 mica --gui --timeout 86400s --allow gui.window \
-  --allow net.browse \
+  --allow net.browse --allow fs.write:/data \
   /.system/examples/mica/browser.mica -- https://example.com/
 ```
 
 The script owns one 760x620 window with address, back/forward/reload and Go
-controls, a paged document list, and previous/next page controls. It uses
-`http.get`, accepts a maximum 98,304-byte response body, renders at most 96
-logical lines (64 characters per line), and shows 18 lines per page. It accepts
-UTF-8 `text/plain` and `text/html`; other content types and invalid UTF-8 are
-reported in the document. The HTML reader is a bounded state-machine subset:
+controls, a save-path field and Save button, a paged document list, and
+previous/next page controls. It uses `http.get`, accepts response bodies up to
+98,304 bytes, and renders at most 96 logical lines of 64 characters, with 18
+lines per page. It accepts UTF-8 `text/plain` and `text/html`; other content
+types and invalid UTF-8 are reported in the document. The HTML reader is a
+bounded state-machine subset:
 `head`/`title`, `p`, `div`, `h1`-`h3`, `li`, `pre`, `a`, `br`, comments, and entity
 decoding. Script and style bodies are skipped; JavaScript, CSS, images, forms,
-downloads, cookies, and persistence are not implemented.
+cookies, automatic downloads, and persistent browsing history are not
+implemented. The Save control writes the raw response body to a chosen `/data`
+file only after an explicit click. Its editable path defaults to
+`/data/reader.html`; each save is limited to 32,512 bytes and uses atomic
+replacement with fsync.
 
 Links may be absolute, root-relative, or same-origin relative paths. A page
 link whose origin differs from the current page is rejected; a user can still
 enter a different HTTP(S) origin explicitly in the address field. Fragments
-are removed before a request is sent, and a non-HTTP(S) scheme is rejected. A
-3xx response is displayed with its `Location` as a link; the reader never
-follows redirects automatically. Back/forward history and reload are local
-in-memory state. The example declares unscoped `net.browse`, so its address
-bar can select a dynamic host for GET without granting raw DNS/TCP/UDP or
-non-GET methods; exact `net.connect:host:port` rules remain the path for those
-operations.
+are removed before a request is sent, and a non-HTTP(S) scheme is rejected.
+The Reader follows up to eight HTTP(S) redirects, resolving absolute and
+relative `Location` values against the current URL. A redirect may select a
+different host because the bundled app already has unscoped `net.browse`; page
+links remain same-origin, and the HTTP library itself still returns raw 3xx
+responses. Back/forward history and reload are local in-memory state; a failed
+back/forward request leaves the history cursor and address on the current
+entry. The Save operation uses the Reader's `fs.write:/data` grant; the
+filesystem grant does not include file reads, raw DNS/TCP/UDP or non-GET
+methods. Exact
+`net.connect:host:port` rules remain the path for those network operations.
 
 The HTTP response table includes bounded `content_type` (at most 256 bytes) and
 `location` (at most 2,048 bytes) fields in addition to `status`,
@@ -377,6 +402,8 @@ exited with status 0. Refresh-run screenshot CRCs were `2286d988` (pre),
 browser evidence is in `target/unified-browser-public-internet-final.log`,
 `target/unified-browser-public-internet-fsck.log`, `target/gui-browser-fixture.log`,
 and `target/mica-dns-fixture.log`.
+Those recorded runs predate automatic redirects and the Save control; they do
+not validate either behavior.
 The public capture [`target/browser-internet-reader-imagebound-final.png`](../target/browser-internet-reader-imagebound-final.png)
 shows `https://example.com/` with `HTTP 200 — https://example.com` and
 `# Example Domain`.
@@ -472,7 +499,9 @@ The final repository still intentionally has these limits:
 
 - no low-level TLS broker (`net.tls_connect` is NotSupported), HTTP/HTTPS is
   the only trusted TLS surface;
-- no redirects, HTTP/2, proxy, cookies, WebSocket or streaming response API;
+- no automatic redirects in the generic HTTP API, HTTP/2, proxy, cookies,
+  WebSocket or streaming response API; the bundled Reader alone follows up to
+  eight HTTP(S) redirects;
 - one bounded session per Mica process, bounded sockets/transfers and buffered
   responses; no dynamic linking or disk ELF loading;
 - no general capability delegation to scripts, raw device access, or arbitrary

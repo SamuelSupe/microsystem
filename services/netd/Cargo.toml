@@ -8,16 +8,21 @@ build = "../user-build.rs"
 
 [dependencies]
 microsystem-abi = { path = "../../crates/abi" }
-microsystem-user-rt = { path = "../../crates/user-rt", optional = true }
+microsystem-identity = { path = "../../crates/identity" }
+microsystem-user-rt = { path = "../../crates/user-rt", optional = true, features = ["large-heap"] }
 smoltcp = { version = "0.13.1", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
+    "proto-ipv6",
+    "proto-ipv6-slaac",
+    "proto-dhcpv4",
     "proto-dns",
     "socket-tcp",
     "socket-udp",
     "socket-dns",
-    "iface-max-addr-count-1",
-    "iface-max-route-count-1",
+    "socket-dhcpv4",
+    "iface-max-addr-count-8",
+    "iface-max-route-count-4",
     "iface-neighbor-cache-count-8",
 ] }
 

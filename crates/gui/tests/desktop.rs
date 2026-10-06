@@ -63,17 +63,62 @@ fn rejects_invalid_titles_and_geometry_without_allocating_slots() {
 }
 
 #[test]
-fn desktop_capacity_covers_three_builtin_and_eight_dynamic_windows() {
+fn desktop_capacity_covers_builtin_and_multiple_application_windows() {
     let mut desktop = Desktop::new();
-    for client in 1..=11 {
+    for client in 1..=3 {
         desktop
             .create_window(client, rect(20, 20, 320, 220), b"window")
-            .expect("desktop must hold the three builtins plus eight GUI apps");
+            .unwrap();
+    }
+    for client in 4..4 + gui::MAX_DYNAMIC_CLIENTS as u8 {
+        for _ in 0..gui::MAX_CLIENT_WINDOWS {
+            desktop.create_window(client, rect(20, 20, 320, 220), b"window").unwrap();
+        }
     }
     assert_eq!(
         desktop.create_window(12, rect(20, 20, 320, 220), b"overflow"),
         Err(Status::Invalid)
     );
+    let removed = desktop.window_for_client(4).unwrap().id;
+    desktop.remove_window(removed).unwrap();
+    let replacement = desktop.create_window(4, rect(20, 20, 320, 220), b"replacement").unwrap();
+    assert_ne!(replacement, removed);
+    assert_eq!(desktop.z_order().filter(|window| window.client == 4).count(), gui::MAX_CLIENT_WINDOWS);
+}
+
+#[test]
+fn composition_commits_selected_utf8_and_discards_on_focus_change() {
+    use microsystem_gui::composition::{Composition, Input};
+    let mut input = Composition::new("ni\t你\nni\t尼\nnihao\t你好\n");
+    input.focus(1);
+    assert!(matches!(input.key(57, true, true, false, false, None), Input::Consumed));
+    for letter in b"ni" { input.key(30, true, false, false, false, Some(*letter)); }
+    assert_eq!(input.candidates()[..2], ["你", "尼"]);
+    let Input::Commit { text, length } = input.key(3, true, false, false, false, None) else { panic!("candidate missing"); };
+    assert_eq!(core::str::from_utf8(&text[..length]).unwrap(), "尼");
+    for letter in b"nihao" { input.key(30, true, false, false, false, Some(*letter)); }
+    assert!(input.focus(2));
+    assert!(input.text().is_empty());
+    assert!(matches!(input.key(28, true, false, false, false, None), Input::Pass));
+    for letter in b"nihao" { input.key(30, true, false, false, false, Some(*letter)); }
+    input.key(14, true, false, false, false, None);
+    assert_eq!(input.text(), "niha");
+    input.key(1, true, false, false, false, None);
+    assert!(input.text().is_empty());
+}
+
+#[test]
+fn composition_bounds_preedit_and_ignores_invalid_dictionary_entries() {
+    use microsystem_gui::composition::{Composition, Input};
+    let mut input = Composition::new("a\t123456789\na\t\na\t啊\nmalformed\n");
+    input.key(57, true, true, false, false, None);
+    input.key(30, true, false, false, false, Some(b'a'));
+    assert_eq!(input.candidates()[0], "啊");
+    assert!(matches!(input.key(46, true, true, false, false, Some(b'c')), Input::Pass));
+    for _ in 0..40 { input.key(30, true, false, false, false, Some(b'a')); }
+    assert_eq!(input.text().len(), 32);
+    let Input::Commit { text, length } = input.key(28, true, false, false, false, None) else { panic!("raw preedit missing"); };
+    assert_eq!(&text[..length], &[b'a'; 32]);
 }
 
 #[test]

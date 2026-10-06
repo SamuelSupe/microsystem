@@ -67,8 +67,13 @@ pub fn activate(platform: PlatformInfo) -> Result<(), ()> {
     let stream_id = platform
         .stream_id(device.requester_id())
         .ok_or_else(|| activation_failed("stream-id"))?;
-    smmu::map_gui_pages(framebuffer_physical(), FRAMEBUFFER_PAGES, queue_physical())
-        .map_err(|_| activation_failed("dma-map"))?;
+    smmu::map_gui_pages(
+        stream_id,
+        framebuffer_physical(),
+        FRAMEBUFFER_PAGES,
+        queue_physical(),
+    )
+    .map_err(|_| activation_failed("dma-map"))?;
     smmu::attach_stream(stream_id).map_err(|_| activation_failed("iommu-attach"))?;
     negotiate(transport).map_err(|_| activation_failed("features"))?;
     configure_queue(transport).map_err(|_| activation_failed("queue"))?;
@@ -265,8 +270,7 @@ fn submit(transport: pci::VirtioTransport, request: &[u8]) -> Result<(), ()> {
     dma_barrier();
     put_u16(queue, AVAIL_OFFSET + 2, available.wrapping_add(1));
     dma_barrier();
-    let notify_offset =
-        read16(transport.common + 30) as usize * transport.notify_multiplier as usize;
+    let notify_offset = transport.queue_notify_offset().ok_or(())?;
     write16(transport.notify + notify_offset, 0);
     let deadline = crate::arch::clock_nanos().saturating_add(5_000_000_000);
     loop {

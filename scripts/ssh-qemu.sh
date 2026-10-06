@@ -5,6 +5,10 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/qemu-arch.sh"
 
+image_path="${MICROSYSTEM_DISK_PATH:-$repo_root/build/microsystem.img}"
+case "$image_path" in /*) ;; *) image_path="$repo_root/$image_path" ;; esac
+mfsctl="${MICROSYSTEM_MFSCTL:-$repo_root/target/release/mfsctl}"
+
 timeout_seconds="$MICROSYSTEM_SSH_QEMU_TIMEOUT"
 [[ -n "$timeout_seconds" ]] || timeout_seconds=45
 ssh_port="$SSH_PORT"
@@ -115,8 +119,8 @@ for command_name in "$MICROSYSTEM_QEMU_BINARY" ssh ssh-keygen timeout python3; d
   fi
 done
 if [[ ! -f "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" ||
-      ! -f build/microsystem.img || ! -f build/ssh/id_ed25519 ||
-      ! -x target/release/mfsctl ]]; then
+      ! -f "$image_path" || ! -f build/ssh/id_ed25519 ||
+      ! -x "$mfsctl" ]]; then
   echo "ssh-qemu: build artifacts are missing; run make build first" >&2
   exit 2
 fi
@@ -155,15 +159,15 @@ if value == nil then
 end
 print("ssh-mica-file=" + bytes.to_string(value))
 MICA
-if ! target/release/mfsctl mkdir build/microsystem.img /data >"$fixture_dir/mkdir.log" 2>&1; then
+if ! "$mfsctl" mkdir "$image_path" /data >"$fixture_dir/mkdir.log" 2>&1; then
   :
 fi
-if ! target/release/mfsctl put build/microsystem.img "$fixture_dir/payload.txt" /data/ssh-mica-payload >"$fixture_dir/payload.log" 2>&1; then
+if ! "$mfsctl" put "$image_path" "$fixture_dir/payload.txt" /data/ssh-mica-payload >"$fixture_dir/payload.log" 2>&1; then
   echo "ssh-qemu: failed to install Mica SSH filesystem fixture" >&2
   cat "$fixture_dir/payload.log" >&2 || true
   exit 1
 fi
-if ! target/release/mfsctl put build/microsystem.img "$fixture_dir/allowed.mica" /data/ssh-mica.mica >"$fixture_dir/script.log" 2>&1; then
+if ! "$mfsctl" put "$image_path" "$fixture_dir/allowed.mica" /data/ssh-mica.mica >"$fixture_dir/script.log" 2>&1; then
   echo "ssh-qemu: failed to install Mica SSH script fixture" >&2
   cat "$fixture_dir/script.log" >&2 || true
   exit 1
@@ -191,7 +195,7 @@ setsid "$MICROSYSTEM_QEMU_BINARY" \
   -accel tcg,thread=multi -smp 2 -m 256M -nographic \
   "${MICROSYSTEM_QEMU_BOOT_ARGS[@]}" \
   -kernel "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
-  -drive "if=none,file=$repo_root/build/microsystem.img,format=raw,cache=writeback,id=disk0" \
+  -drive "if=none,file=$image_path,format=raw,cache=writeback,id=disk0" \
   -device "virtio-blk-pci,drive=disk0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=2" \
   -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:$ssh_port-10.0.2.15:22" \
   -device "virtio-net-pci,netdev=net0,${MICROSYSTEM_VIRTIO_PCI_OPTIONS}addr=6,mac=52:54:00:12:34:56" \
@@ -206,9 +210,9 @@ qemu_pid=$!
 required_markers='[bootfs] valid=true entries=25 static-elfs=24
 [service] resident EL0 address-spaces=13 asids=[0x20..0x2c]
 [service] resident EL0 ready=8/8 online=8/8 switches=
-[proc] dynamic application capacity=8 first-pid=14 independent-slots=true
+[proc] dynamic application capacity=16 first-pid=14 independent-slots=true
 [net] netd ready ipv4=10.0.2.15 outbound=true raw-device-isolated=true
-[ssh] sshd ready address=10.0.2.15 port=22 auth=publickey user=micro'
+[ssh] sshd ready address=10.0.2.15 port=22 auth=publickey accounts=persistent'
 fatal_re='\[panic\]|DMA fault|translation fault|gerror=0x[1-9a-f][0-9a-f]*|allocator fault'
 deadline=$((SECONDS + timeout_seconds))
 while (( SECONDS < deadline )); do

@@ -52,7 +52,7 @@ GUI ABI 与 capability 边界保持不变；下面仓库内的 PNG 是此前的 
 
 ![通过 GUI/VNC 路径捕获的 MicroSystem 桌面](docs/assets/microsystem-vnc.png)
 
-*这是此前 VNC-backed GUI 运行产生的 QMP screendump，不是 mockup，也不是 VNC 客户端外壳截图；本次仅整理文档，没有现场重新捕获。*
+*这是此前 VNC-backed GUI 运行产生的 QMP screendump，不是 mockup，也不是 VNC 客户端外壳截图。本轮功能改进的定向运行记录另见运行手册。*
 
 ## 系统架构
 
@@ -132,15 +132,21 @@ ARCH=riscv64 qemu-system-riscv64 \
 make run
 ```
 
-shell 文件系统命令使用绝对路径，同时支持简写和显式 `fs` 命名空间：
-`ls/list`、`cat/read`、`stat`、`touch/create`、`cp`、`write`、`mkdir`、
+shell 文件系统命令支持绝对路径和相对于 `cd` 工作目录的路径，同时支持简写和显式 `fs` 命名空间：
+`ls/list`、`cat/read`、`stat`、`touch/create`、`cp`、`write`、`append`、`mkdir`、
 `rmdir`、`mv/rename`、`rm/remove/unlink`、`fsync` 和 `sync`。文件传输受
 4 KiB 文件系统共享帧限制。
+
+文件命令的完整参数可用单引号或双引号包围：`write "work notes" "hello"`、
+`append "work notes" " world"`、`grep "hello world" "work notes"`。
+引号不执行转义、变量展开或参数拼接。`append` 会创建不存在的文件，并在一次
+文件系统服务请求内追加内容；持久化仍需 `fsync` 或 `sync`。
+`mv 文件 目录` 会移动到该目录下，并拒绝覆盖已存在的目标。
 
 串口 shell 的完整命令面还包括 `help`、`pwd`、`cd`、`echo`、`clear`、
 `history`、`ps`、`kill`、`wait`、`uptime`、`sleep`、`date`、`free`、
 `sysinfo`，以及 `head`、`tail`、`wc`、`hexdump/xxd`、`grep`、`find`、
-`tree`、`du`、`df`；网络命令为 `curl`、`nslookup`、`netstat`，程序命令为
+`tree`、`du`、`df`；网络命令为 `curl`、`nslookup`、`netstat`、`net`，程序命令为
 `run`、`mica`，系统命令为 `exit`、`shutdown`、`poweroff`、`reboot`。
 `fs <command>` 暴露相同的文件系统命名空间和别名；支持有界选项
 `head/tail -n N`、`mkdir -p`、`cp -r`、`rm -r`。
@@ -175,9 +181,43 @@ curl -s -o /data/response https://example.com/
 是 UTF-8，`-o` 会把响应原子写入绝对 MFS 路径并 fsync。原始 TCP/UDP、
 POST/PUT/PATCH/DELETE 以及低层 TLS broker 不属于该命令边界。
 
-GUI Terminal 与串口 shell 共享文件系统 parser、别名、绝对路径语义和 MFS
-broker 行为。GUI Terminal 通过有界 terminal frame 暴露文件系统子集；进程、
-网络、Mica 和电源命令仍属于串口 shell。
+GUI Terminal 与串口 shell 共享文件系统 parser、别名、引号参数、工作目录路径
+解析和 MFS broker 行为。GUI Terminal 还提供真实应用进程列表 `ps`、`kill/wait`、
+系统与时间信息、历史记录、`netstat` 和电源控制；DNS、curl、SQL 和 Mica
+执行通过串口 shell 使用。
+
+两个终端均支持 `service list`、`service status NAME`、`service stop NAME` 和
+`service restart NAME`。init 按依赖顺序恢复服务，并限制重试次数。GUI Terminal
+的 `sleep`/`wait` 异步执行，可用 Ctrl+C 中断，期间仍能操作桌面。原生进程
+容量为 16；堆与匿名区域按需分配，分配器支持超出初始堆的分配及回收。
+`make test-recovery` 使用独立磁盘副本验证 AArch64 服务恢复与命令中断。
+整体功能完善进度见[工作清单](.workflow/os-maturity/plan.md)。
+
+账户、角色、文件/进程所属用户、公钥管理、SSH 主机密钥轮换与本地审计见
+[账户契约](docs/identity.md)。使用 `user list`、`whoami`、
+`user add alice operator`、`user key-add alice HEX`、`user switch alice` 和
+`user audit`；`make test-identity` 使用独立磁盘验证。串口是受信任的 root
+管理入口，远程登录只支持 Ed25519 公钥。退出桌面切换到只读 guest。
+
+从磁盘安装和运行静态 ELF：
+
+```text
+app install example v1 /.system/examples/native/counter.elf 64 stats
+app run example
+app update example v2 /.system/examples/native/counter.elf 64 all
+app rollback example
+app info example
+```
+
+每个版本保存 ELF 校验和及能力授权，启动前重新校验；更新不影响已运行
+进程的镜像。`64` 表示初始 1 MiB 堆之外最多 64 页匿名内存，`stats` 授予
+系统计数器读取权限，`all` 授予计数器及随机数读取权限。`app exec /绝对路径`
+可运行未安装的静态 ELF，使用默认内存预算及空的信息能力授权。
+
+Mica GUI 应用支持四个独立窗口、共享 UTF-8 剪贴板和基础拼音输入
+（Ctrl+Space）。Ctrl+A 后 Ctrl+C/X/V 操作输入框选区；Terminal 用
+Ctrl+Shift+C/V 复制和粘贴当前输入行。`make test-desktop` 验证重复窗口
+生命周期、剪贴板及中文编辑。边界和可编辑词典见 [桌面文档](docs/gui.md)。
 
 运行 GUI profile。QEMU 命令会打印 VNC/QMP 端点；默认 VNC 端口是 `5900`。
 
@@ -191,19 +231,23 @@ Mica 示例：
 mica -e 'print(40 + 2)'
 mica --gui --timeout 86400s --allow gui.window /mica/gui-counter.mica
 mica --gui --timeout 86400s --allow gui.window --allow net.browse \
+  --allow fs.write:/data \
   /.system/examples/mica/browser.mica -- https://example.com/
 ```
 
+Reader 最多跟随 8 次 HTTP(S) 重定向；点击 Save 可将不超过 32,512 字节的原始
+响应原子保存到 `/data`。网页中的链接仍限制为同源。
+
 ## 已记录的验收证据
 
-仓库保留了详细 runbook 与原始 workflow 结果。当前证据包括上面的 RISC-V
+仓库保留了详细 runbook 与原始 workflow 结果。较早的验收记录包括上面的 RISC-V
 QEMU 串口/IOMMU/设备 gate、AArch64 build 与串口 shutdown，以及聚焦的 x86_64
 QEMU 验收（常驻服务、Intel VT-d、VirtIO-blk INTx、block/MFS I/O 与 shell
 shutdown）。此外还有 `make test` 内建
 host suites `81/81`，以及另行 shell parser `6/6`（合并记录 `87/87`）。精确的
 `make ARCH=aarch64 test`、`make ARCH=riscv64 test` 与 `make ARCH=x86_64 test` 的
-完整矩阵仍为
-`validation in progress`；本次文档更新不重跑它们。证据来源与边界见
+完整矩阵尚未全部通过：最新 AArch64 矩阵通过 host suites 和串口 smoke 后，
+在断电持久化阶段失败；挂载卷重启恢复也仍有未解决问题。本轮定向验收与旧矩阵证据分别记录。证据来源与边界见
 [`docs/runbook.md`](docs/runbook.md) 和
 [`.workflow/microsystem-kernel/results/tests.md`](.workflow/microsystem-kernel/results/tests.md)。
 

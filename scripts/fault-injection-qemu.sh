@@ -38,13 +38,15 @@ if ! command -v "$MICROSYSTEM_QEMU_BINARY" >/dev/null 2>&1; then
 	exit 2
 fi
 kernel="$repo_root/target/$MICROSYSTEM_TARGET/release/microsystem-kernel"
-base_image="$repo_root/build/microsystem.img"
-mfsctl="$repo_root/target/release/mfsctl"
+base_image="${MICROSYSTEM_DISK_PATH:-$repo_root/build/microsystem.img}"
+mfsctl="${MICROSYSTEM_MFSCTL:-$repo_root/target/release/mfsctl}"
 if [[ ! -f "$kernel" || ! -f "$base_image" || ! -x "$mfsctl" ]]; then
   echo "fault-injection-qemu: build ELF, disk image, or mfsctl is missing" >&2
   exit 2
 fi
-for source in "$repo_root/services/fs/src/main.rs" "$repo_root/crates/kernel/src/service_runtime.rs" "$repo_root/build/bootfs.cpio"; do
+archive="$repo_root/build/bootfs-$MICROSYSTEM_ARCH.cpio"
+[[ -f "$archive" ]] || archive="$repo_root/build/bootfs.cpio"
+for source in "$repo_root/services/fs/src/main.rs" "$repo_root/crates/kernel/src/service_runtime.rs" "$archive"; do
   if [[ "$kernel" -ot "$source" ]]; then
     echo "fault-injection-qemu: release kernel is older than $source; run make build first" >&2
     exit 2

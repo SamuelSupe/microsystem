@@ -8,13 +8,17 @@ use microsystem_abi::{
 };
 use microsystem_gui::{Desktop, WindowState, replace_display_list, validate_command_stream};
 
+use microsystem_gui::composition;
+
 const FRAMEBUFFER_VA: u64 = 0x0080_0000;
 const FRAMEBUFFER_PAGES: u32 = gui::WIDTH * gui::HEIGHT * 4 / 4096;
 const DISPLAY_LIST_VA: u64 = 0x00b0_0000;
-const DISPLAY_LIST_ARENA_BYTES: usize = gui::MAX_DYNAMIC_CLIENTS * gui::COMMAND_BYTES;
-const DISPLAY_LIST_PAGES: u32 = ((DISPLAY_LIST_ARENA_BYTES + gui::COMMAND_BYTES) / 4096) as u32;
+const DISPLAY_LIST_ARENA_BYTES: usize =
+    gui::MAX_DYNAMIC_CLIENTS * gui::MAX_CLIENT_WINDOWS * gui::COMMAND_BYTES;
+const DISPLAY_LIST_PAGES: u32 =
+    ((DISPLAY_LIST_ARENA_BYTES + gui::COMMAND_BYTES + composition::DICTIONARY_BYTES) / 4096) as u32;
 const DISPLAY_LIST_STAGING_VA: u64 = DISPLAY_LIST_VA + DISPLAY_LIST_ARENA_BYTES as u64;
-const DYNAMIC_SHARED_VA: u64 = 0x00c0_0000;
+const DYNAMIC_SHARED_VA: u64 = 0x00e0_0000;
 const DYNAMIC_SHARED_STRIDE: u64 = 0x0002_0000;
 const FILESYSTEM_SHARED_VA: u64 = 0x005e_0000;
 const TERMINAL_SHARED_VA: u64 = 0x0061_0000;
@@ -65,6 +69,55 @@ const EMPTY_RECT: gui::Rect = gui::Rect {
     width: 0,
     height: 0,
 };
+const COMPOSITION_RECT: gui::Rect = gui::Rect {
+    x: 12,
+    y: 568,
+    width: 1000,
+    height: 66,
+};
+
+struct Clipboard {
+    data: [u8; gui::CLIPBOARD_BYTES],
+    length: usize,
+}
+
+impl Clipboard {
+    const fn new() -> Self {
+        Self {
+            data: [0; gui::CLIPBOARD_BYTES],
+            length: 0,
+        }
+    }
+
+    fn set(&mut self, bytes: &[u8]) -> Status {
+        if bytes.len() > self.data.len() || core::str::from_utf8(bytes).is_err() {
+            return Status::Invalid;
+        }
+        self.data.fill(0);
+        self.data[..bytes.len()].copy_from_slice(bytes);
+        self.length = bytes.len();
+        Status::Ok
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.data[..self.length]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WindowLayer {
+    window: u32,
+    display_bytes: usize,
+    sequence: u64,
+}
+
+impl WindowLayer {
+    const EMPTY: Self = Self {
+        window: 0,
+        display_bytes: 0,
+        sequence: 0,
+    };
+}
 
 #[derive(Clone, Copy)]
 struct DynamicClient {
@@ -72,15 +125,13 @@ struct DynamicClient {
     application: u16,
     token: u64,
     pid: u64,
-    window: u32,
+    layers: [WindowLayer; gui::MAX_CLIENT_WINDOWS],
     commands: CapHandle,
     events: CapHandle,
     notification: CapHandle,
     pending: Option<Message>,
     pending_events: [Option<gui::Event>; PENDING_EVENT_CAPACITY],
     pending_event_count: usize,
-    display_bytes: usize,
-    sequence: u64,
     damage: [gui::Rect; gui::MAX_DAMAGE_RECTS],
     damage_count: usize,
     full_redraw: bool,
@@ -92,19 +143,26 @@ impl DynamicClient {
         application: 0,
         token: 0,
         pid: 0,
-        window: 0,
+        layers: [WindowLayer::EMPTY; gui::MAX_CLIENT_WINDOWS],
         commands: CapHandle::INVALID,
         events: CapHandle::INVALID,
         notification: CapHandle::INVALID,
         pending: None,
         pending_events: [None; PENDING_EVENT_CAPACITY],
         pending_event_count: 0,
-        display_bytes: 0,
-        sequence: 0,
         damage: [EMPTY_RECT; gui::MAX_DAMAGE_RECTS],
         damage_count: 0,
         full_redraw: false,
     };
+
+    fn layer(&self, requested: u64) -> Result<usize, Status> {
+        self.layers
+            .iter()
+            .position(|layer| {
+                layer.window != 0 && (requested == 0 || layer.window as u64 == requested)
+            })
+            .ok_or(Status::NotFound)
+    }
 }
 
 struct DirtyRegions {
@@ -247,7 +305,19 @@ impl FontCache {
             entries: [CachedGlyph::EMPTY; GLYPH_CACHE_SIZE],
         };
         let mut header = [0u8; 16];
-        cache.available = read_font_range(0, &mut header).is_ok()
+        let deadline = microsystem_user_rt::clock_now()
+            .unwrap_or(0)
+            .saturating_add(120_000_000_000);
+        let loaded = loop {
+            if read_font_range(0, &mut header).is_ok() {
+                break true;
+            }
+            if microsystem_user_rt::clock_now().unwrap_or(deadline) >= deadline {
+                break false;
+            }
+            let _ = microsystem_user_rt::yield_now();
+        };
+        cache.available = loaded
             && &header[..4] == b"UFB1"
             && u32::from_le_bytes(header[12..16].try_into().unwrap_or([0; 4])) == 36;
         let marker = if cache.available {
@@ -298,35 +368,71 @@ impl FontCache {
 }
 
 fn read_font_range(offset: u64, output: &mut [u8]) -> Result<(), Status> {
+    if read_file_range(UNIFONT_PATH, offset, output)? < output.len() {
+        return Err(Status::Io);
+    }
+    Ok(())
+}
+
+fn read_file_range(path: &[u8], offset: u64, output: &mut [u8]) -> Result<usize, Status> {
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            UNIFONT_PATH.as_ptr(),
-            FILESYSTEM_SHARED_VA as *mut u8,
-            UNIFONT_PATH.len(),
-        );
+        core::ptr::copy_nonoverlapping(path.as_ptr(), FILESYSTEM_SHARED_VA as *mut u8, path.len());
         microsystem_user_rt::fence();
     }
     let mut request = Message::new(
         protocol::FILESYSTEM,
         filesystem::Operation::ReadRange as u16,
     );
-    request.words[0] = UNIFONT_PATH.len() as u64;
+    request.words[0] = path.len() as u64;
     request.words[2] = offset;
     request.caps[0] = boot_cap::WINDOWD_FILESYSTEM_FRAME;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
-    microsystem_user_rt::ipc_call(boot_cap::GUI_FILESYSTEM_ENDPOINT, &request, &mut reply, 0)?;
-    if reply.words[5] as i64 != Status::Ok as i64 || (reply.words[0] as usize) < output.len() {
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(5_000_000_000);
+    microsystem_user_rt::ipc_call(
+        boot_cap::GUI_FILESYSTEM_ENDPOINT,
+        &request,
+        &mut reply,
+        deadline,
+    )?;
+    if reply.words[5] as i64 != Status::Ok as i64 || reply.words[0] > 4096 {
         return Err(Status::Io);
     }
+    let length = (reply.words[0] as usize).min(output.len());
     unsafe {
         microsystem_user_rt::fence();
         core::ptr::copy_nonoverlapping(
             FILESYSTEM_SHARED_VA as *const u8,
             output.as_mut_ptr(),
-            output.len(),
+            length,
         );
     }
-    Ok(())
+    Ok(length)
+}
+
+fn load_dictionary() -> &'static str {
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (DISPLAY_LIST_STAGING_VA as usize + gui::COMMAND_BYTES) as *mut u8,
+            composition::DICTIONARY_BYTES,
+        )
+    };
+    let mut length = 0;
+    while length < bytes.len() {
+        let end = (length + 4096).min(bytes.len());
+        let Ok(count) = read_file_range(
+            b"/.system/input/pinyin.tsv",
+            length as u64,
+            &mut bytes[length..end],
+        ) else {
+            return composition::DEFAULT_DICTIONARY;
+        };
+        length += count;
+        if count < 4096 {
+            return core::str::from_utf8(&bytes[..length])
+                .unwrap_or(composition::DEFAULT_DICTIONARY);
+        }
+    }
+    composition::DEFAULT_DICTIONARY
 }
 
 #[unsafe(no_mangle)]
@@ -374,8 +480,11 @@ pub extern "C" fn _start() -> ! {
     let mut desktop = Desktop::new();
     let mut dynamic_clients = [DynamicClient::EMPTY; gui::MAX_DYNAMIC_CLIENTS];
     let mut config_pending = None;
+    let mut fixed_pending = [None; 3];
     let mut terminal = TerminalView::new();
+    let mut clipboard = Clipboard::new();
     let mut font = FontCache::load();
+    let mut composition = composition::Composition::new(load_dictionary());
     clear(framebuffer, BACKGROUND);
     fill_rect(
         framebuffer,
@@ -393,7 +502,7 @@ pub extern "C" fn _start() -> ! {
         (boot_cap::GUI_FILES_ENDPOINT, 2u8, b"Files".as_slice()),
         (boot_cap::GUI_MONITOR_ENDPOINT, 3u8, b"Monitor".as_slice()),
     ];
-    for (endpoint, client, title) in clients {
+    for (index, (endpoint, client, title)) in clients.into_iter().enumerate() {
         let mut request = Message::new(protocol::GUI, 0);
         if microsystem_user_rt::ipc_recv(endpoint, &mut request, 0).is_err()
             || request.protocol != protocol::GUI
@@ -419,7 +528,8 @@ pub extern "C" fn _start() -> ! {
             .unwrap_or(1)
             .saturating_add(10_000_000);
         match microsystem_user_rt::ipc_reply_recv(endpoint, &reply, &mut next, deadline) {
-            Err(Status::TimedOut | Status::Busy) | Ok(()) => {}
+            Err(Status::TimedOut | Status::Busy) => {}
+            Ok(()) => fixed_pending[index] = Some(next),
             Err(_) => microsystem_user_rt::exit(6),
         }
     }
@@ -455,12 +565,34 @@ pub extern "C" fn _start() -> ! {
     let mut control = false;
     let mut shift = false;
     let mut unicode = UnicodeInput::new();
+    let mut pending_composition: Option<([u8; 64], usize, u32)> = None;
     let mut input_reported = false;
     let mut redraw_pending = false;
     let mut dirty = DirtyRegions::new();
     let mut next_frame = microsystem_user_rt::clock_now().unwrap_or(0);
     loop {
         let mut dynamic_changed = false;
+        for (index, (endpoint, client, title)) in clients.into_iter().enumerate() {
+            if service_fixed_client(
+                endpoint,
+                client,
+                title,
+                &mut fixed_pending[index],
+                &mut desktop,
+                &mut terminal,
+            )
+            .unwrap_or_else(|_| microsystem_user_rt::exit(12))
+            {
+                dirty.mark_full();
+                redraw_pending = true;
+            }
+        }
+        if terminal.poll() {
+            if let Some(window) = desktop.window_for_client(1) {
+                dirty.push(window_paint_bounds(window.rect));
+            }
+            redraw_pending = true;
+        }
         match service_dynamic_config(&mut config_pending, &mut dynamic_clients, &mut desktop) {
             Ok(true) => {
                 dirty.mark_full();
@@ -476,6 +608,7 @@ pub extern "C" fn _start() -> ! {
                 &mut desktop,
                 display_lists,
                 display_staging,
+                &mut clipboard,
             )
             .unwrap_or_else(|_| microsystem_user_rt::exit(11));
             dynamic_changed |= changed;
@@ -498,10 +631,26 @@ pub extern "C" fn _start() -> ! {
         if dynamic_changed && !dirty.is_empty() {
             redraw_pending = true;
         }
+        if let Some((text, length, window)) = pending_composition {
+            let result = dynamic_index_for_window(&desktop, Some(window))
+                .ok_or(Status::NotFound)
+                .and_then(|index| {
+                    push_text_batch(
+                        index,
+                        &mut dynamic_clients,
+                        window,
+                        core::str::from_utf8(&text[..length]).unwrap_or(""),
+                    )
+                });
+            if result != Err(Status::Busy) {
+                pending_composition = None;
+            }
+        }
         for _ in 0..INPUT_BATCH_LIMIT {
             let input_blocked = dynamic_clients
                 .iter()
-                .any(|client| client.pending_event_count != 0);
+                .any(|client| client.pending_event_count != 0)
+                || pending_composition.is_some();
             if input_blocked {
                 break;
             }
@@ -514,6 +663,56 @@ pub extern "C" fn _start() -> ! {
             let desktop_before = capture_desktop_visual(&desktop);
             let previous_focus = desktop.focused();
             let previous_pointer = pointer;
+            let mut composition_changed = composition.focus(previous_focus.unwrap_or(0));
+            if event.event_type == 1 && event.code < 0x100 {
+                match event.code {
+                    29 | 97 => control = event.value != 0,
+                    42 | 54 => shift = event.value != 0,
+                    56 | 100 => alt = event.value != 0,
+                    _ => {}
+                }
+                match composition.key(
+                    event.code,
+                    event.value == 1,
+                    control,
+                    shift,
+                    alt,
+                    keycode_to_ascii(event.code, false),
+                ) {
+                    composition::Input::Pass => {}
+                    input => {
+                        if event.code == 57 && control { unicode.reset(); }
+                        if let composition::Input::Commit { text, length } = input {
+                            let value = core::str::from_utf8(&text[..length]).unwrap_or("");
+                            if terminal_focused(&desktop) {
+                                terminal_changed = terminal.push_text(value);
+                            } else if let Some(index) =
+                                dynamic_index_for_window(&desktop, previous_focus)
+                            {
+                                if push_text_batch(
+                                    index,
+                                    &mut dynamic_clients,
+                                    previous_focus.unwrap_or(0),
+                                    value,
+                                ) == Err(Status::Busy)
+                                {
+                                    pending_composition =
+                                        Some((text, length, previous_focus.unwrap_or(0)));
+                                }
+                            }
+                            let _ = microsystem_user_rt::debug_write(
+                                b"[gui] composition committed=true\n",
+                            );
+                        }
+                        if terminal_changed && let Some(window) = desktop.window_for_client(1) {
+                            dirty.push(window_paint_bounds(window.rect));
+                        }
+                        dirty.push(COMPOSITION_RECT);
+                        redraw_pending = true;
+                        continue;
+                    }
+                }
+            }
             match (event.event_type, event.code) {
                 (1, 56 | 100) => alt = event.value != 0,
                 (1, 29 | 97) => control = event.value != 0,
@@ -625,7 +824,20 @@ pub extern "C" fn _start() -> ! {
                     changed = true;
                     terminal_changed = true;
                 }
-                (1, code) if event.value == 1 && !alt && terminal_focused(&desktop) => {
+                (1, 46) if event.value == 1 && control && shift && terminal_focused(&desktop) => {
+                    let _ = clipboard.set(&terminal.line[..terminal.line_length]);
+                }
+                (1, 47) if event.value == 1 && control && shift && terminal_focused(&desktop) => {
+                    if let Ok(text) = core::str::from_utf8(clipboard.bytes()) {
+                        changed = terminal.push_text(text);
+                        terminal_changed = changed;
+                    }
+                }
+                (1, 46) if event.value == 1 && control && terminal_focused(&desktop) => {
+                    changed = terminal.cancel();
+                    terminal_changed = changed;
+                }
+                (1, code) if event.value == 1 && !alt && !control && terminal_focused(&desktop) => {
                     if let Some(byte) = keycode_to_ascii(code, shift) {
                         changed = terminal.push(byte);
                         terminal_changed = changed;
@@ -660,6 +872,11 @@ pub extern "C" fn _start() -> ! {
                     }
                 }
                 _ => {}
+            }
+            composition_changed |= composition.focus(desktop.focused().unwrap_or(0));
+            if composition_changed {
+                dirty.push(COMPOSITION_RECT);
+                redraw_pending = true;
             }
             route_dynamic_input(
                 event,
@@ -718,6 +935,7 @@ pub extern "C" fn _start() -> ! {
                     framebuffer,
                     core::slice::from_ref(&present),
                 );
+                draw_composition(framebuffer, &composition, &mut font);
                 draw_pointer(framebuffer, pointer.0, pointer.1);
                 let _ = microsystem_user_rt::gui_present_rect(region, present);
             }
@@ -894,7 +1112,11 @@ fn service_dynamic_config(
                 let commands = request.caps[0];
                 let events = request.caps[1];
                 let notification = request.caps[2];
-                match microsystem_user_rt::frame_map(commands, command_va, Rights::READ) {
+                match microsystem_user_rt::frame_map(
+                    commands,
+                    command_va,
+                    Rights(Rights::READ.0 | Rights::WRITE.0),
+                ) {
                     Err(status) => {
                         let _ = microsystem_user_rt::debug_write_u64(
                             b"[gui] mica command map failed status=",
@@ -969,6 +1191,7 @@ fn service_dynamic_client(
     desktop: &mut Desktop,
     display_lists: &mut [u8],
     display_staging: &mut [u8],
+    clipboard: &mut Clipboard,
 ) -> Result<bool, Status> {
     if !clients[index].active {
         return Ok(false);
@@ -988,7 +1211,7 @@ fn service_dynamic_client(
     } else {
         match request.opcode {
             value if value == gui::Operation::CreateWindow as u16 => {
-                if clients[index].window != 0 {
+                if clients[index].layers.iter().all(|layer| layer.window != 0) {
                     Status::Busy
                 } else {
                     let header = dynamic_present_header(index);
@@ -1006,23 +1229,29 @@ fn service_dynamic_client(
                             width: request.words[2] as u32,
                             height: request.words[3] as u32,
                         };
+                        let previous_focus = desktop.focused();
                         match desktop.create_window(
                             4 + index as u8,
                             rect,
                             &header.title[..title_bytes],
                         ) {
                             Ok(window) => {
-                                clients[index].window = window;
+                                let slot = clients[index]
+                                    .layers
+                                    .iter()
+                                    .position(|layer| layer.window == 0)
+                                    .unwrap();
+                                clients[index].layers[slot] = WindowLayer {
+                                    window,
+                                    ..WindowLayer::EMPTY
+                                };
+                                clear_close_request(index);
                                 clients[index].full_redraw = true;
                                 reply.words[0] = window as u64;
                                 reply.words[1] = gui::WIDTH as u64;
                                 reply.words[2] = gui::HEIGHT as u64;
                                 push_configure(window, desktop, clients);
-                                let _ = push_event(
-                                    index,
-                                    clients,
-                                    event_word(gui::EventKind::Focus, window, 1),
-                                );
+                                push_focus_change(previous_focus, desktop, clients);
                                 push_expose(window, desktop, clients);
                                 changed = true;
                                 Status::Ok
@@ -1033,8 +1262,14 @@ fn service_dynamic_client(
                 }
             }
             value if value == gui::Operation::Present as u16 => {
-                match snapshot_display_list(index, clients, desktop, display_lists, display_staging)
-                {
+                match snapshot_display_list(
+                    index,
+                    request.words[0],
+                    clients,
+                    desktop,
+                    display_lists,
+                    display_staging,
+                ) {
                     Ok(()) => {
                         changed = true;
                         Status::Ok
@@ -1048,7 +1283,12 @@ fn service_dynamic_client(
                 if title_bytes > header.title.len() {
                     Status::Invalid
                 } else {
-                    match desktop.set_title(clients[index].window, &header.title[..title_bytes]) {
+                    match clients[index].layer(request.words[0]).and_then(|slot| {
+                        desktop.set_title(
+                            clients[index].layers[slot].window,
+                            &header.title[..title_bytes],
+                        )
+                    }) {
                         Ok(()) => {
                             clients[index].full_redraw = true;
                             changed = true;
@@ -1059,7 +1299,11 @@ fn service_dynamic_client(
                 }
             }
             value if value == gui::Operation::QueryGeometry as u16 => {
-                match desktop.window(clients[index].window) {
+                match clients[index]
+                    .layer(request.words[0])
+                    .ok()
+                    .and_then(|slot| desktop.window(clients[index].layers[slot].window))
+                {
                     Some(window) => {
                         reply.words[0] = window.rect.x as u64;
                         reply.words[1] = window.rect.y as u64;
@@ -1071,7 +1315,11 @@ fn service_dynamic_client(
                 }
             }
             value if value == gui::Operation::WindowAction as u16 => {
-                let window = clients[index].window;
+                let previous_focus = desktop.focused();
+                let slot = clients[index].layer(request.words[1]).ok();
+                let window = slot
+                    .map(|slot| clients[index].layers[slot].window)
+                    .unwrap_or(0);
                 let action = match request.words[0] as u16 {
                     1 => Some(gui::WindowAction::Minimize),
                     2 => Some(gui::WindowAction::Maximize),
@@ -1080,15 +1328,23 @@ fn service_dynamic_client(
                     _ => None,
                 };
                 match action {
-                    Some(action) => match desktop.action(window, action) {
+                    Some(action) => match if action == gui::WindowAction::Close {
+                        desktop.remove_window(window)
+                    } else {
+                        desktop.action(window, action)
+                    } {
                         Ok(()) => {
                             clients[index].full_redraw = true;
-                            if action != gui::WindowAction::Close {
+                            if action == gui::WindowAction::Close {
+                                clients[index].layers[slot.unwrap()] = WindowLayer::EMPTY;
+                                clear_close_request(index);
+                            } else {
                                 push_configure(window, desktop, clients);
                                 if action != gui::WindowAction::Minimize {
                                     push_expose(window, desktop, clients);
                                 }
                             }
+                            push_focus_change(previous_focus, desktop, clients);
                             changed = true;
                             Status::Ok
                         }
@@ -1100,12 +1356,89 @@ fn service_dynamic_client(
             value if value == gui::Operation::EventConsumed as u16 => {
                 acknowledge_event(index, request.words[0] as u32)
             }
+            value if value == gui::Operation::ClipboardWrite as u16 => {
+                let length = request.words[0] as usize;
+                if length > gui::CLIPBOARD_BYTES {
+                    Status::Invalid
+                } else {
+                    let source = unsafe {
+                        core::slice::from_raw_parts(
+                            (dynamic_command_va(index) as usize + gui::COMMAND_HEADER_BYTES)
+                                as *const u8,
+                            length,
+                        )
+                    };
+                    display_staging[..length].copy_from_slice(source);
+                    clipboard.set(&display_staging[..length])
+                }
+            }
+            value if value == gui::Operation::ClipboardRead as u16 => {
+                let target = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (dynamic_command_va(index) as usize + gui::COMMAND_HEADER_BYTES) as *mut u8,
+                        clipboard.length,
+                    )
+                };
+                target.copy_from_slice(clipboard.bytes());
+                microsystem_user_rt::fence();
+                reply.words[0] = clipboard.length as u64;
+                Status::Ok
+            }
             _ => Status::Invalid,
         }
     };
     reply.words[5] = status as i64 as u64;
     reply_endpoint(endpoint, &reply, &mut clients[index].pending)?;
     Ok(changed)
+}
+
+fn service_fixed_client(
+    endpoint: CapHandle,
+    client: u8,
+    title: &[u8],
+    pending: &mut Option<Message>,
+    desktop: &mut Desktop,
+    terminal: &mut TerminalView,
+) -> Result<bool, Status> {
+    let Some(request) = poll_endpoint(endpoint, pending)? else {
+        return Ok(false);
+    };
+    let mut reply = Message::new(protocol::GUI, request.opcode);
+    let valid =
+        request.protocol == protocol::GUI && request.opcode == gui::Operation::CreateWindow as u16;
+    if valid {
+        let id = if let Some(window) = desktop.window_for_client(client) {
+            window.id
+        } else {
+            desktop.create_window(
+                client,
+                gui::Rect {
+                    x: request.words[0] as i32,
+                    y: request.words[1] as i32,
+                    width: request.words[2] as u32,
+                    height: request.words[3] as u32,
+                },
+                title,
+            )?
+        };
+        desktop.action(id, gui::WindowAction::Restore)?;
+        if client == 1 {
+            let mut abandoned = Message::new(0, 0);
+            let _ = microsystem_user_rt::ipc_poll_reply(&mut abandoned);
+            terminal.reset();
+        }
+        reply.words[..3].copy_from_slice(&[id as u64, gui::WIDTH as u64, gui::HEIGHT as u64]);
+        let _ = microsystem_user_rt::debug_write_u64(
+            b"[gui] fixed client reconnected client=",
+            client as u64,
+            b"\n",
+        );
+    } else {
+        delete_message_caps(&request);
+        reply.words[5] = Status::Invalid as i64 as u64;
+    }
+    reply_endpoint(endpoint, &reply, pending)?;
+    Ok(valid)
 }
 
 fn poll_endpoint(
@@ -1154,9 +1487,12 @@ fn release_dynamic_client(
     clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
     desktop: &mut Desktop,
 ) {
+    let previous_focus = desktop.focused();
     let client = clients[index];
-    if client.window != 0 {
-        let _ = desktop.remove_window(client.window);
+    for layer in client.layers {
+        if layer.window != 0 {
+            let _ = desktop.remove_window(layer.window);
+        }
     }
     let _ = microsystem_user_rt::frame_unmap(client.commands, dynamic_command_va(index));
     let _ = microsystem_user_rt::frame_unmap(client.events, dynamic_event_va(index));
@@ -1164,6 +1500,7 @@ fn release_dynamic_client(
     let _ = microsystem_user_rt::cap_delete(client.events);
     let _ = microsystem_user_rt::cap_delete(client.commands);
     clients[index] = DynamicClient::EMPTY;
+    push_focus_change(previous_focus, desktop, clients);
     let _ = microsystem_user_rt::debug_write_u64(
         b"[gui] mica client unregistered endpoint=",
         index as u64,
@@ -1173,18 +1510,20 @@ fn release_dynamic_client(
 
 fn snapshot_display_list(
     index: usize,
+    requested: u64,
     clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
     desktop: &Desktop,
     display_lists: &mut [u8],
     display_staging: &mut [u8],
 ) -> Result<(), Status> {
+    let slot = clients[index].layer(requested)?;
     let first = dynamic_present_header(index);
     if first.magic != gui::PRESENT_MAGIC
         || first.version != gui::VERSION
         || first.flags != 0
         || first.command_bytes as usize > gui::COMMAND_PAYLOAD_BYTES
         || first.damage_count as usize > gui::MAX_DAMAGE_RECTS
-        || first.sequence <= clients[index].sequence
+        || first.sequence <= clients[index].layers[slot].sequence
     {
         return Err(Status::Invalid);
     }
@@ -1204,7 +1543,7 @@ fn snapshot_display_list(
     }
     validate_command_stream(snapshot)?;
     let window = desktop
-        .window(clients[index].window)
+        .window(clients[index].layers[slot].window)
         .ok_or(Status::NotFound)?;
     let client_bounds = gui::Rect {
         x: 0,
@@ -1233,13 +1572,13 @@ fn snapshot_display_list(
         }
     }
     validate_client_bounds(snapshot, window.rect)?;
-    let start = index * gui::COMMAND_BYTES;
+    let start = (index * gui::MAX_CLIENT_WINDOWS + slot) * gui::COMMAND_BYTES;
     replace_display_list(
         &mut display_lists[start..start + gui::COMMAND_BYTES],
         snapshot,
     )?;
-    clients[index].display_bytes = bytes;
-    clients[index].sequence = first.sequence;
+    clients[index].layers[slot].display_bytes = bytes;
+    clients[index].layers[slot].sequence = first.sequence;
     let damage_count = first.damage_count as usize;
     clients[index].damage_count = damage_count;
     let content_x = window.rect.x + 2;
@@ -1314,6 +1653,11 @@ fn acknowledge_event(index: usize, tail: u32) -> Status {
     Status::Ok
 }
 
+fn clear_close_request(index: usize) {
+    let header = unsafe { &mut *(dynamic_event_va(index) as *mut gui::EventRingHeaderV1) };
+    header.flags &= !gui::EVENT_RING_FLAG_CLOSE_REQUESTED;
+}
+
 fn retry_pending_event(
     index: usize,
     clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
@@ -1334,7 +1678,12 @@ fn push_event(
     clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
     event: gui::Event,
 ) -> Result<(), Status> {
-    match write_event(index, clients, event) {
+    let result = if clients[index].pending_event_count != 0 {
+        Err(Status::Busy)
+    } else {
+        write_event(index, clients, event)
+    };
+    match result {
         Err(Status::Busy) => {
             let client = &mut clients[index];
             if client.pending_event_count == client.pending_events.len() {
@@ -1346,6 +1695,35 @@ fn push_event(
         }
         result => result,
     }
+}
+
+fn push_text_batch(
+    index: usize,
+    clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
+    window: u32,
+    text: &str,
+) -> Result<(), Status> {
+    clients[index].layer(window as u64)?;
+    let header = unsafe { &*(dynamic_event_va(index) as *const gui::EventRingHeaderV1) };
+    if header.magic != gui::EVENT_MAGIC
+        || header.capacity as usize != gui::EVENT_CAPACITY
+        || header.head.saturating_sub(header.tail) > header.capacity as u32
+    {
+        return Err(Status::Invalid);
+    }
+    let available = PENDING_EVENT_CAPACITY - clients[index].pending_event_count
+        + if clients[index].pending_event_count == 0 {
+            (header.capacity as u32 - header.head.saturating_sub(header.tail)) as usize
+        } else {
+            0
+        };
+    if text.chars().count() > available {
+        return Err(Status::Busy);
+    }
+    for character in text.chars() {
+        let _ = push_text_event(index, clients, window, character as u32);
+    }
+    Ok(())
 }
 
 fn write_event(
@@ -1372,7 +1750,8 @@ fn write_event(
                 + last as usize * core::mem::size_of::<gui::Event>())
                 as *mut gui::Event;
             let current = unsafe { core::ptr::read_volatile(pointer) };
-            if current.kind == gui::EventKind::PointerMove as u16 {
+            if current.kind == gui::EventKind::PointerMove as u16 && current.window == event.window
+            {
                 unsafe { core::ptr::write_volatile(pointer, event) };
                 header.dropped_pointer_moves = header.dropped_pointer_moves.saturating_add(1);
                 return Ok(());
@@ -1401,6 +1780,26 @@ fn dynamic_index_for_window(desktop: &Desktop, window: Option<u32>) -> Option<us
         .filter(|index| *index < gui::MAX_DYNAMIC_CLIENTS)
 }
 
+fn push_focus_change(
+    previous: Option<u32>,
+    desktop: &Desktop,
+    clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
+) {
+    let current = desktop.focused();
+    if previous == current {
+        return;
+    }
+    for (window, focused) in [(previous, 0), (current, 1)] {
+        if let Some(index) = dynamic_index_for_window(desktop, window) {
+            let _ = push_event(
+                index,
+                clients,
+                event_word(gui::EventKind::Focus, window.unwrap_or(0), focused),
+            );
+        }
+    }
+}
+
 fn request_close(
     window: u32,
     desktop: &Desktop,
@@ -1410,7 +1809,15 @@ fn request_close(
         return false;
     };
     let header = unsafe { &mut *(dynamic_event_va(index) as *mut gui::EventRingHeaderV1) };
-    header.flags |= gui::EVENT_RING_FLAG_CLOSE_REQUESTED;
+    if clients[index]
+        .layers
+        .iter()
+        .filter(|layer| layer.window != 0)
+        .count()
+        == 1
+    {
+        header.flags |= gui::EVENT_RING_FLAG_CLOSE_REQUESTED;
+    }
     let _ = push_event(
         index,
         clients,
@@ -1443,7 +1850,13 @@ fn activate_application(
             clients
                 .iter()
                 .find(|client| client.active && client.application == application as u16)
-                .and_then(|client| (client.window != 0).then_some(client.window))
+                .and_then(|client| {
+                    client
+                        .layers
+                        .iter()
+                        .find(|layer| layer.window != 0)
+                        .map(|layer| layer.window)
+                })
         });
     if let Some(window) = window {
         let _ = desktop.action(window, gui::WindowAction::Restore);
@@ -1520,7 +1933,7 @@ fn taskbar_window_at(desktop: &Desktop, x: i32) -> Option<u32> {
 fn taskbar_metrics(count: usize) -> (i32, u32) {
     let count = count.max(1) as i32;
     let gap = 6;
-    let width = ((gui::WIDTH as i32 - 40 - gap * (count - 1)) / count).clamp(58, 118);
+    let width = ((gui::WIDTH as i32 - 40 - gap * (count - 1)) / count).clamp(18, 118);
     let total = width * count + gap * (count - 1);
     ((gui::WIDTH as i32 - total) / 2, width as u32)
 }
@@ -1573,22 +1986,8 @@ fn route_dynamic_input(
     clients: &mut [DynamicClient; gui::MAX_DYNAMIC_CLIENTS],
 ) {
     let current_focus = desktop.focused();
-    if previous_focus != current_focus {
-        if let Some(index) = dynamic_index_for_window(desktop, previous_focus) {
-            let _ = push_event(
-                index,
-                clients,
-                event_word(gui::EventKind::Focus, previous_focus.unwrap_or(0), 0),
-            );
-        }
-        if let Some(index) = dynamic_index_for_window(desktop, current_focus) {
-            let _ = push_event(
-                index,
-                clients,
-                event_word(gui::EventKind::Focus, current_focus.unwrap_or(0), 1),
-            );
-        }
-    }
+    if previous_focus != current_focus { unicode.reset(); }
+    push_focus_change(previous_focus, desktop, clients);
     let Some(index) = dynamic_index_for_window(desktop, current_focus) else {
         unicode.reset();
         return;
@@ -1659,7 +2058,7 @@ fn route_dynamic_input(
                 event.words[1] = input.value.max(0) as u32;
                 event.words[2] = (control as u32) | ((shift as u32) << 1) | ((alt as u32) << 2);
                 let _ = push_event(index, clients, event);
-                if input.value != 1 || alt {
+                if input.value != 1 || alt || control {
                     return;
                 }
                 if let Some(byte) = keycode_to_ascii(input.code, shift) {
@@ -1880,7 +2279,7 @@ fn render(
         );
         draw_window_controls(framebuffer, window.rect, active);
         if window.client == 1 {
-            draw_terminal(framebuffer, window.rect, terminal);
+            draw_terminal(framebuffer, window.rect, terminal, font);
         } else if window.client == 2 {
             draw_files(framebuffer, window.rect);
         } else if window.client == 3 {
@@ -1888,11 +2287,13 @@ fn render(
         } else if window.client >= 4 {
             let index = window.client as usize - 4;
             if let Some(client) = dynamic_clients.get(index).filter(|client| client.active) {
-                let start = index * gui::COMMAND_BYTES;
-                let end = start
-                    .saturating_add(client.display_bytes)
-                    .min(display_lists.len());
-                render_display_list(framebuffer, window.rect, &display_lists[start..end], font);
+                if let Ok(slot) = client.layer(window.id as u64) {
+                    let start = (index * gui::MAX_CLIENT_WINDOWS + slot) * gui::COMMAND_BYTES;
+                    let end = start
+                        .saturating_add(client.layers[slot].display_bytes)
+                        .min(display_lists.len());
+                    render_display_list(framebuffer, window.rect, &display_lists[start..end], font);
+                }
             }
         }
         draw_resize_grip(framebuffer, window.rect, active);
@@ -2760,6 +3161,9 @@ struct TerminalView {
     length: usize,
     line: [u8; TERMINAL_LINE_BYTES],
     line_length: usize,
+    pending: bool,
+    accepted: bool,
+    cancel_bit: u64,
 }
 
 impl TerminalView {
@@ -2769,6 +3173,9 @@ impl TerminalView {
             length: 0,
             line: [0; TERMINAL_LINE_BYTES],
             line_length: 0,
+            pending: false,
+            accepted: false,
+            cancel_bit: 0,
         };
         terminal.append(b"MicroSystem GUI Terminal\nType 'help' for commands.\n\nmicro> ");
         terminal
@@ -2777,11 +3184,13 @@ impl TerminalView {
     fn reset(&mut self) {
         self.length = 0;
         self.line_length = 0;
+        self.pending = false;
+        self.accepted = false;
         self.append(b"MicroSystem GUI Terminal\n\nmicro> ");
     }
 
     fn push(&mut self, byte: u8) -> bool {
-        if self.line_length == self.line.len() {
+        if self.pending || self.line_length == self.line.len() {
             return false;
         }
         self.line[self.line_length] = byte;
@@ -2790,47 +3199,132 @@ impl TerminalView {
         true
     }
 
-    fn backspace(&mut self) -> bool {
-        if self.line_length == 0 {
+    fn push_text(&mut self, text: &str) -> bool {
+        if self.pending
+            || text.len() > self.line.len() - self.line_length
+            || text.contains(['\n', '\r', '\0'])
+        {
             return false;
         }
+        self.line[self.line_length..self.line_length + text.len()].copy_from_slice(text.as_bytes());
+        self.line_length += text.len();
+        self.append(text.as_bytes());
+        !text.is_empty()
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.pending || self.line_length == 0 {
+            return false;
+        }
+        let previous = self.line_length;
         self.line_length -= 1;
-        self.length = self.length.saturating_sub(1);
+        while self.line_length != 0 && self.line[self.line_length] & 0xc0 == 0x80 {
+            self.line_length -= 1;
+        }
+        self.length = self.length.saturating_sub(previous - self.line_length);
         true
     }
 
     fn submit(&mut self) {
-        let mut command = [0u8; TERMINAL_LINE_BYTES];
-        let command_length = self.line_length;
-        command[..command_length].copy_from_slice(&self.line[..command_length]);
+        if self.pending {
+            return;
+        }
         self.append(b"\n");
-        let mut request = Message::new(protocol::GUI, gui::Operation::TerminalCommand as u16);
-        pack_terminal_text(&mut request, &command[..command_length]);
+        self.pending = true;
+        self.accepted = false;
+        self.cancel_bit = (self.cancel_bit << 1) & i64::MAX as u64;
+        if self.cancel_bit == 0 {
+            self.cancel_bit = 1;
+        }
+    }
+
+    fn cancel(&mut self) -> bool {
+        if !self.pending {
+            self.append(b"^C\n");
+            self.line_length = 0;
+            self.append(b"micro> ");
+            return true;
+        }
+        if !self.accepted {
+            self.append(b"cancelled\n");
+            self.finish_command();
+            return true;
+        }
+        let _ = microsystem_user_rt::notification_signal(
+            boot_cap::GUI_TERMINAL_NOTIFICATION,
+            self.cancel_bit,
+        );
+        false
+    }
+
+    fn poll(&mut self) -> bool {
+        if !self.pending {
+            return false;
+        }
+        if !self.accepted {
+            let mut command = [0u8; TERMINAL_LINE_BYTES];
+            command[..self.line_length].copy_from_slice(&self.line[..self.line_length]);
+            let mut request = Message::new(protocol::GUI, gui::Operation::TerminalCommand as u16);
+            pack_terminal_text(&mut request, &command[..self.line_length]);
+            request.words[5] = self.cancel_bit;
+            match microsystem_user_rt::ipc_try_call(boot_cap::GUI_TERMINAL_EVENTS, &request) {
+                Ok(()) => self.accepted = true,
+                Err(Status::Busy) => return false,
+                Err(_) => {
+                    self.append(b"terminal service unavailable\n");
+                    self.finish_command();
+                    return true;
+                }
+            }
+        }
         let mut reply = Message::new(protocol::GUI, 0);
-        if microsystem_user_rt::ipc_call(boot_cap::GUI_TERMINAL_EVENTS, &request, &mut reply, 0)
-            .is_ok()
-            && reply.protocol == protocol::GUI
-            && reply.opcode == gui::Operation::TerminalCommand as u16
+        match microsystem_user_rt::ipc_poll_reply(&mut reply) {
+            Err(Status::Busy) => return false,
+            Err(_) => {
+                self.append(b"terminal service unavailable\n");
+                self.finish_command();
+                return true;
+            }
+            Ok(()) => {}
+        }
+        if reply.protocol == protocol::GUI && reply.opcode == gui::Operation::TerminalCommand as u16
         {
             if reply.flags & CLEAR_REPLY != 0 {
                 self.reset();
-                return;
+                return true;
             }
             if let Some(text) = unpack_terminal_text(&reply) {
                 self.append(text);
+                if !text.is_empty() && !text.ends_with(b"\n") {
+                    self.append(b"\n");
+                }
             }
         } else {
             self.append(b"terminal service unavailable\n");
         }
+        self.finish_command();
+        true
+    }
+
+    fn finish_command(&mut self) {
+        self.pending = false;
+        self.accepted = false;
         self.line_length = 0;
         self.append(b"micro> ");
+        let _ = microsystem_user_rt::debug_write(
+            b"[gui] terminal command completed asynchronous=true\n",
+        );
     }
 
     fn append(&mut self, text: &[u8]) {
         for byte in text.iter().copied() {
             if self.length == self.bytes.len() {
-                let keep = self.bytes.len() / 2;
-                self.bytes.copy_within(self.length - keep..self.length, 0);
+                let mut start = self.bytes.len() / 2;
+                while start < self.length && self.bytes[start] & 0xc0 == 0x80 {
+                    start += 1;
+                }
+                let keep = self.length - start;
+                self.bytes.copy_within(start..self.length, 0);
                 self.length = keep;
             }
             self.bytes[self.length] = byte;
@@ -2869,7 +3363,12 @@ fn unpack_terminal_text(message: &Message) -> Option<&[u8]> {
     Some(&bytes[..length])
 }
 
-fn draw_terminal(framebuffer: &mut [u32], rect: gui::Rect, terminal: &TerminalView) {
+fn draw_terminal(
+    framebuffer: &mut [u32],
+    rect: gui::Rect,
+    terminal: &TerminalView,
+    font: &mut FontCache,
+) {
     let panel = gui::Rect {
         x: rect.x + 10,
         y: rect.y + microsystem_gui::TITLE_BAR_HEIGHT + 10,
@@ -2894,43 +3393,107 @@ fn draw_terminal(framebuffer: &mut [u32], rect: gui::Rect, terminal: &TerminalVi
     let top = panel.y + 14;
     let right = panel.x + panel.width as i32 - 10;
     let bottom = panel.y + panel.height as i32 - 10;
-    let columns = ((right - left) / 12).max(1) as usize;
     let visible_lines = ((bottom - top) / 18).max(1) as usize;
+    let text = core::str::from_utf8(&terminal.bytes[..terminal.length]).unwrap_or("");
     let mut total_lines = 1usize;
-    let mut column = 0usize;
-    for byte in terminal.bytes[..terminal.length].iter().copied() {
-        if byte == b'\n' {
+    let mut x = left;
+    for character in text.chars() {
+        if character == '\n' {
             total_lines += 1;
-            column = 0;
+            x = left;
         } else {
-            if column == columns {
+            let width = if character.is_ascii() { 12 } else { 18 };
+            if x + width > right {
                 total_lines += 1;
-                column = 0;
+                x = left;
             }
-            column += 1;
+            x += width;
         }
     }
     let first_line = total_lines.saturating_sub(visible_lines);
     let mut line = 0usize;
-    let mut column = 0usize;
-    for byte in terminal.bytes[..terminal.length].iter().copied() {
-        if byte == b'\n' {
+    x = left;
+    for character in text.chars() {
+        if character == '\n' {
             line += 1;
-            column = 0;
+            x = left;
             continue;
         }
-        if column == columns {
+        let width = if character.is_ascii() { 12 } else { 18 };
+        if x + width > right {
             line += 1;
-            column = 0;
+            x = left;
         }
         if line >= first_line {
-            let x = left + column as i32 * 12;
             let y = top + (line - first_line) as i32 * 18;
             if y + 14 <= bottom {
-                draw_glyph_scaled(framebuffer, x, y, byte, 0x00d9_e6f7);
+                if character.is_ascii() {
+                    draw_glyph_scaled(framebuffer, x, y, character as u8, 0x00d9_e6f7);
+                } else {
+                    let mut encoded = [0; 4];
+                    draw_utf8_text(
+                        framebuffer,
+                        x,
+                        y,
+                        character.encode_utf8(&mut encoded),
+                        0x00d9_e6f7,
+                        panel,
+                        font,
+                    );
+                }
             }
         }
-        column += 1;
+        x += width;
+    }
+}
+
+fn draw_composition(
+    framebuffer: &mut [u32],
+    composition: &composition::Composition,
+    font: &mut FontCache,
+) {
+    if !composition.enabled || !rect_is_dirty(COMPOSITION_RECT) {
+        return;
+    }
+    fill_round_rect(framebuffer, COMPOSITION_RECT, 0x00f7_faff, 8);
+    stroke_rect(framebuffer, COMPOSITION_RECT, BORDER_ACTIVE, 1);
+    draw_text(framebuffer, 24, 578, b"PINYIN  CTRL+SPACE", MUTED_TEXT);
+    draw_text(framebuffer, 262, 578, composition.text().as_bytes(), TEXT);
+    let mut x = 24;
+    for (index, candidate) in composition
+        .candidates()
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| !text.is_empty())
+    {
+        let width = 28 + candidate.chars().count() as u32 * 18;
+        if x + width as i32 > 1000 {
+            break;
+        }
+        if index == composition.selected() {
+            fill_round_rect(
+                framebuffer,
+                gui::Rect {
+                    x,
+                    y: 600,
+                    width,
+                    height: 25,
+                },
+                ACCENT_TINT,
+                4,
+            );
+        }
+        draw_text(framebuffer, x + 4, 605, &[b'1' + index as u8], MUTED_TEXT);
+        draw_utf8_text(
+            framebuffer,
+            x + 22,
+            605,
+            candidate,
+            TEXT,
+            COMPOSITION_RECT,
+            font,
+        );
+        x += width as i32 + 8;
     }
 }
 

@@ -5,6 +5,10 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/qemu-arch.sh"
 
+image_path="${MICROSYSTEM_DISK_PATH:-$repo_root/build/microsystem.img}"
+case "$image_path" in /*) ;; *) image_path="$repo_root/$image_path" ;; esac
+mfsctl="${MICROSYSTEM_MFSCTL:-$repo_root/target/release/mfsctl}"
+
 timeout_seconds="${MICROSYSTEM_GUI_QEMU_TIMEOUT:-45}"
 browser_http_port="${MICROSYSTEM_GUI_BROWSER_HTTP_PORT:-18083}"
 log_file="${MICROSYSTEM_GUI_QEMU_LOG:-$repo_root/target/gui-qemu.log}"
@@ -70,8 +74,8 @@ if [[ ! -f "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" ]]; then
   echo "gui-qemu: built kernel ELF is missing; run make build first" >&2
   exit 2
 fi
-if [[ ! -f build/microsystem.img || ! -x target/release/mfsctl ]]; then
-  echo "gui-qemu: build/microsystem.img is missing; run make build first" >&2
+if [[ ! -f "$image_path" || ! -x "$mfsctl" ]]; then
+  echo "gui-qemu: image $image_path is missing; run make build first" >&2
   exit 2
 fi
 
@@ -122,8 +126,8 @@ cleanup() {
   rm -f "$qmp_socket"
   rm -f "$serial_fifo"
   if [[ "$counter_image_backed_up" == 1 && -f "$counter_image_backup" ]]; then
-    cp "$counter_image_backup" build/microsystem.img || true
-    if ! cmp -s "$counter_image_backup" build/microsystem.img; then
+    cp "$counter_image_backup" "$image_path" || true
+    if ! cmp -s "$counter_image_backup" "$image_path"; then
       echo "gui-qemu: restored MFS1 image differs from backup" >&2
       status=1
     fi
@@ -143,7 +147,7 @@ trap cleanup EXIT INT TERM
 # restored by cleanup, so the GUI gate never leaves test data in the caller's
 # MFS1 artifact.
 mkdir -p "$counter_fixture_dir"
-cp build/microsystem.img "$counter_image_backup"
+cp "$image_path" "$counter_image_backup"
 counter_image_backed_up=1
 cat >"$counter_fixture_dir/counter.mica" <<'MICA'
 --!mica 1
@@ -178,8 +182,8 @@ app:set_root(gui.column {
 })
 app:run()
 MICA
-"$repo_root/target/release/mfsctl" mkdir build/microsystem.img /mica >"$counter_fixture_dir/mkdir.log" 2>&1 || true
-if ! "$repo_root/target/release/mfsctl" put build/microsystem.img \
+"$mfsctl" mkdir "$image_path" /mica >"$counter_fixture_dir/mkdir.log" 2>&1 || true
+if ! "$mfsctl" put "$image_path" \
   "$counter_fixture_dir/counter.mica" /mica/gui-counter.mica \
   >"$counter_fixture_dir/put.log" 2>&1; then
   echo "gui-qemu: failed to inject Counter Mica script into MFS1" >&2
@@ -200,7 +204,7 @@ mkdir -p "$browser_fixture_dir"
 sed \
   -e "s|https://example.com/|http://10.0.2.2:${browser_http_port}/index.html|" \
   "$browser_source" >"$browser_fixture_dir/browser.mica"
-if ! "$repo_root/target/release/mfsctl" put build/microsystem.img \
+if ! "$mfsctl" put "$image_path" \
   "$browser_fixture_dir/browser.mica" /mica/gui-browser.mica \
   >"$browser_fixture_dir/browser-put.log" 2>&1; then
   echo "gui-qemu: failed to inject Mica Reader asset into MFS1" >&2
@@ -218,23 +222,23 @@ if [[ ! -f "$editor_source" ]]; then
 fi
 mkdir -p "$editor_fixture_dir"
 printf 'First editor line\r\nOriginal second line\r\n' >"$editor_fixture_dir/editor-note.txt"
-"$repo_root/target/release/mfsctl" mkdir build/microsystem.img /data \
+"$mfsctl" mkdir "$image_path" /data \
   >"$editor_fixture_dir/mkdir.log" 2>&1 || true
-if ! "$repo_root/target/release/mfsctl" put build/microsystem.img \
+if ! "$mfsctl" put "$image_path" \
   "$editor_source" /mica/editor.mica \
   >"$editor_fixture_dir/editor-put.log" 2>&1; then
   echo "gui-qemu: failed to inject Mica Editor asset into MFS1" >&2
   cat "$editor_fixture_dir/editor-put.log" >&2 || true
   exit 1
 fi
-if ! "$repo_root/target/release/mfsctl" put build/microsystem.img \
+if ! "$mfsctl" put "$image_path" \
   "$editor_fixture_dir/editor-note.txt" /data/editor-note.txt \
   >"$editor_fixture_dir/note-put.log" 2>&1; then
   echo "gui-qemu: failed to inject editor note fixture into MFS1" >&2
   cat "$editor_fixture_dir/note-put.log" >&2 || true
   exit 1
 fi
-if ! "$repo_root/target/release/mfsctl" put build/microsystem.img \
+if ! "$mfsctl" put "$image_path" \
   "$editor_fixture_dir/editor-note.txt" /data/note.txt \
   >"$editor_fixture_dir/default-note-put.log" 2>&1; then
   echo "gui-qemu: failed to inject desktop Editor note fixture into MFS1" >&2
@@ -305,9 +309,9 @@ required_markers=(
   "[bootfs] valid=true entries=25 static-elfs=24"
   "[service] resident EL0 address-spaces=13 asids=[0x20..0x2c]"
   "[service] resident EL0 ready=13/13 online=13/13 switches="
-  "[proc] dynamic application capacity=8 first-pid=14 independent-slots=true"
+  "[proc] dynamic application capacity=16 first-pid=14 independent-slots=true"
   "[gui] virtio-gpu scanout ready"
-  "[net] virtio-net ready mac=52:54:00:12:34:56 ipv4=10.0.2.15/24 rx-buffers=2"
+  "[net] virtio-net ready mac=52:54:00:12:34:56 rx-buffers=2"
   "[gui] unifont runtime loaded=true cache=128 fallback=ascii"
   "[gui] windowd ready resolution=1024x768 format=XRGB8888 clients=3 renderer=commands"
   "[gui] renderer damage-merge=true local-window-damage=true command-cull=true glyph-cache=2way input-batch=16"
@@ -1175,7 +1179,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
     browser_endpoint_received_before = serial_contents().count(browser_endpoint_received_marker)
     browser_endpoint_unregistered_before = serial_contents().count(browser_endpoint_unregistered_marker)
     send_serial(
-        "mica --gui --timeout 60s --allow gui.window --allow net.browse "
+        "mica --gui --timeout 60s --allow gui.window --allow net.browse --allow fs.write:/data "
         "/mica/gui-browser.mica"
     )
     wait_for_marker_count(

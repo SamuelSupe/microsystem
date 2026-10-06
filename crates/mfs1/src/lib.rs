@@ -35,7 +35,11 @@ const SUPERBLOCK_SIZE: usize = 64;
 const RECORD_HEADER_SIZE: usize = 64;
 const FEATURE_SEGMENT_LAYOUT: u32 = 1 << 0;
 const FEATURE_SEGMENT_DIRECTORY: u32 = 1 << 1;
-const KNOWN_FEATURES: u32 = FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY;
+const FEATURE_RANGE_WRITES: u32 = 1 << 2;
+const FEATURE_ATTRIBUTES: u32 = 1 << 3;
+const KNOWN_FEATURES: u32 =
+    FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY | FEATURE_RANGE_WRITES | FEATURE_ATTRIBUTES;
+const MAX_RANGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 128;
 const MAX_PATH_BYTES: usize = 255;
 const MAX_MATERIALIZED_PATHS: usize = 4096;
@@ -104,6 +108,8 @@ pub enum Error {
     NoSpace,
     NameTooLong,
     Utf8,
+    CrossDevice,
+    ReadOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -139,8 +145,66 @@ impl std::error::Error for Error {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Node {
-    File(Vec<u8>),
-    Directory,
+    File(Vec<u8>, Attributes),
+    Directory(Attributes),
+}
+
+/// Ownership, permission bits and Unix timestamps (seconds). Reads use noatime;
+/// a missing realtime source is represented by zero, rather than boot uptime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Attributes {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub created: u64,
+    pub modified: u64,
+    pub accessed: u64,
+    pub changed: u64,
+}
+
+impl Attributes {
+    fn new(directory: bool, time: u64) -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            mode: if directory { 0o755 } else { 0o644 },
+            created: time,
+            modified: time,
+            accessed: time,
+            changed: time,
+        }
+    }
+
+    fn encode(self) -> Vec<u8> {
+        let mut data = vec![0; 48];
+        put_u32(&mut data, 0, self.uid);
+        put_u32(&mut data, 4, self.gid);
+        put_u32(&mut data, 8, self.mode);
+        for (offset, time) in [
+            (16, self.created),
+            (24, self.modified),
+            (32, self.accessed),
+            (40, self.changed),
+        ] {
+            put_u64(&mut data, offset, time);
+        }
+        data
+    }
+
+    fn decode(data: &[u8]) -> Result<Self, Error> {
+        if data.len() != 48 || get_u32(data, 8) > 0o777 || get_u32(data, 12) != 0 {
+            return Err(Error::Corrupt);
+        }
+        Ok(Self {
+            uid: get_u32(data, 0),
+            gid: get_u32(data, 4),
+            mode: get_u32(data, 8),
+            created: get_u64(data, 16),
+            modified: get_u64(data, 24),
+            accessed: get_u64(data, 32),
+            changed: get_u64(data, 40),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,8 +220,13 @@ enum NodeView<'a> {
 }
 
 impl Node {
+    pub fn attributes(&self) -> Attributes {
+        match self {
+            Self::File(_, attributes) | Self::Directory(attributes) => *attributes,
+        }
+    }
     pub fn is_dir(&self) -> bool {
-        matches!(self, Self::Directory)
+        matches!(self, Self::Directory(_))
     }
 }
 
@@ -288,6 +357,8 @@ impl Superblock {
 #[derive(Clone, Debug)]
 enum Mutation {
     Put(String, Vec<u8>),
+    Patch(String, usize, Vec<u8>),
+    Attributes(String, Attributes),
     Mkdir(String),
     Remove(String),
     Rename(String, String),
@@ -302,6 +373,8 @@ enum RecordKind {
     Rename = 4,
     Commit = 5,
     Padding = 6,
+    Patch = 7,
+    Attributes = 8,
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +395,7 @@ pub struct FileSystem<D: BlockDevice> {
     protected: [SegmentDirectory; 2],
     entries: BTreeMap<String, Node>,
     dirty: Vec<Mutation>,
+    timestamp: u64,
 }
 
 pub fn format<D: BlockDevice>(mut device: D) -> Result<FileSystem<D>, Error> {
@@ -332,7 +406,7 @@ pub fn format<D: BlockDevice>(mut device: D) -> Result<FileSystem<D>, Error> {
         return Err(Error::NoSpace);
     }
     let superblock = Superblock {
-        features: FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY,
+        features: KNOWN_FEATURES,
         generation: 1,
         transaction: 0,
         total_blocks: device.block_count(),
@@ -342,7 +416,7 @@ pub fn format<D: BlockDevice>(mut device: D) -> Result<FileSystem<D>, Error> {
         directory: SegmentDirectory::EMPTY,
     };
     let mut entries = BTreeMap::new();
-    entries.insert("/".to_string(), Node::Directory);
+    entries.insert("/".to_string(), Node::Directory(Attributes::new(true, 0)));
     let encoded = superblock.encode();
     device.write_block(0, &encoded)?;
     device.write_block(1, &encoded)?;
@@ -353,6 +427,7 @@ pub fn format<D: BlockDevice>(mut device: D) -> Result<FileSystem<D>, Error> {
         protected: [superblock.directory; 2],
         entries,
         dirty: Vec::new(),
+        timestamp: 0,
     })
 }
 
@@ -376,44 +451,46 @@ fn audit_mount<D: BlockDevice>(mut device: D) -> Result<(FileSystem<D>, Metadata
             .and_then(|superblock| protection_for(superblock).ok())
             .unwrap_or(SegmentDirectory::EMPTY),
     ];
-    let mut replayed = [None, None];
+    // Validate older state first and release its materialized file bodies before
+    // replaying the newer copy. Keeping both caches alive doubles volume-image
+    // memory and can make a healthy filesystem fail to mount under its budget.
+    let order = if copies[0]
+        .zip(copies[1])
+        .is_some_and(|(a, b)| a.generation > b.generation)
+    {
+        [1, 0]
+    } else {
+        [0, 1]
+    };
+    let mut selected = None;
+    let mut entries = None;
     let mut replay_verified = 0u8;
-    for index in 0..copies.len() {
+    for index in order {
         let Some(superblock) = copies[index] else {
             continue;
         };
         if superblock.total_blocks != device.block_count() || validate_head(superblock).is_err() {
             continue;
         }
+        drop(entries.take());
         match replay(&mut device, superblock) {
-            Ok(entries) => {
-                replayed[index] = Some(entries);
+            Ok(decoded) => {
+                selected = Some(index);
+                entries = Some(decoded);
                 replay_verified += 1;
             }
             Err(Error::Io) => return Err(Error::Io),
+            Err(error @ (Error::NoSpace | Error::Busy)) => return Err(error),
             Err(_) => {}
         }
     }
-
-    let selected = match (replayed[0].is_some(), replayed[1].is_some()) {
-        (true, true) => {
-            if copies[0].unwrap().generation == copies[1].unwrap().generation
-                && copies[0] != copies[1]
-            {
-                return Err(Error::Corrupt);
-            }
-            if copies[1].unwrap().generation > copies[0].unwrap().generation {
-                1
-            } else {
-                0
-            }
-        }
-        (true, false) => 0,
-        (false, true) => 1,
-        (false, false) => return Err(Error::Corrupt),
-    };
-    let entries = replayed[selected].take().ok_or(Error::Corrupt)?;
+    if replay_verified == 2 && matches!((copies[0], copies[1]), (Some(a), Some(b)) if a.generation == b.generation && a != b) { return Err(Error::Corrupt); }
+    let selected = selected.ok_or(Error::Corrupt)?;
     let superblock = copies[selected].ok_or(Error::Corrupt)?;
+    let entries = match entries {
+        Some(entries) => entries,
+        None => replay(&mut device, superblock)?,
+    };
     Ok((
         FileSystem {
             device,
@@ -421,6 +498,7 @@ fn audit_mount<D: BlockDevice>(mut device: D) -> Result<(FileSystem<D>, Metadata
             protected,
             entries,
             dirty: Vec::new(),
+            timestamp: 0,
         },
         MetadataReport {
             selected_superblock: selected as u8,
@@ -431,6 +509,34 @@ fn audit_mount<D: BlockDevice>(mut device: D) -> Result<(FileSystem<D>, Metadata
 }
 
 impl<D: BlockDevice> FileSystem<D> {
+    pub fn set_timestamp(&mut self, unix_seconds: u64) {
+        self.timestamp = unix_seconds;
+    }
+
+    pub fn attributes(&self, path: &str) -> Result<Attributes, Error> {
+        let path = normalize(path)?;
+        if self.view(&path).is_none() {
+            return Err(Error::NotFound);
+        }
+        self.attributes_before(&path, self.dirty.len())
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn set_attributes(&mut self, path: &str, mut attributes: Attributes) -> Result<(), Error> {
+        let path = normalize(path)?;
+        if attributes.mode > 0o777 {
+            return Err(Error::Invalid);
+        }
+        if self.view(&path).is_none() {
+            return Err(Error::NotFound);
+        }
+        if self.timestamp != 0 {
+            attributes.changed = self.timestamp;
+        }
+        self.dirty.try_reserve(1).map_err(|_| Error::NoSpace)?;
+        self.dirty.push(Mutation::Attributes(path, attributes));
+        Ok(())
+    }
     pub fn mount(mut device: D) -> Result<Self, Error> {
         let mut first = [0u8; BLOCK_SIZE];
         let mut second = [0u8; BLOCK_SIZE];
@@ -454,8 +560,10 @@ impl<D: BlockDevice> FileSystem<D> {
             {
                 continue;
             }
-            let Ok(entries) = replay(&mut device, superblock) else {
-                continue;
+            let entries = match replay(&mut device, superblock) {
+                Ok(entries) => entries,
+                Err(error @ (Error::Io | Error::NoSpace | Error::Busy)) => return Err(error),
+                Err(_) => continue,
             };
             return Ok(Self {
                 device,
@@ -463,6 +571,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 protected,
                 entries,
                 dirty: Vec::new(),
+                timestamp: 0,
             });
         }
         Err(Error::Corrupt)
@@ -528,8 +637,16 @@ impl<D: BlockDevice> FileSystem<D> {
             .try_reserve_exact(data.len())
             .map_err(|_| Error::NoSpace)?;
         contents.extend_from_slice(data);
-        self.dirty.try_reserve(1).map_err(|_| Error::NoSpace)?;
-        self.dirty.push(Mutation::Put(path, contents));
+        let mut attributes = self
+            .attributes(&path)
+            .unwrap_or_else(|_| Attributes::new(false, self.timestamp));
+        if self.timestamp != 0 {
+            attributes.modified = self.timestamp;
+            attributes.changed = self.timestamp;
+        }
+        self.dirty.try_reserve(2).map_err(|_| Error::NoSpace)?;
+        self.dirty.push(Mutation::Put(path.clone(), contents));
+        self.dirty.push(Mutation::Attributes(path, attributes));
         Ok(())
     }
 
@@ -539,8 +656,72 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(Error::AlreadyExists);
         }
         self.require_parent(&path)?;
-        self.dirty.push(Mutation::Mkdir(path));
+        self.dirty.try_reserve(2).map_err(|_| Error::NoSpace)?;
+        self.dirty.push(Mutation::Mkdir(path.clone()));
+        self.dirty.push(Mutation::Attributes(
+            path,
+            Attributes::new(true, self.timestamp),
+        ));
         Ok(())
+    }
+
+    /// Replaces a byte range without rewriting the rest of the file. The offset
+    /// may be at EOF, but cannot leave a hole. This operation durably commits
+    /// preceding buffered mutations, then publishes one range transaction.
+    /// Failure before publication preserves file contents and length.
+    pub fn write_range(&mut self, path: &str, offset: usize, data: &[u8]) -> Result<(), Error> {
+        self.write_ranges(path, &[(offset, data)])
+    }
+
+    /// Applies ordered ranges in one durable transaction. Overlapping ranges
+    /// use the last supplied bytes; validation/allocation precede publication.
+    pub fn write_ranges(&mut self, path: &str, ranges: &[(usize, &[u8])]) -> Result<(), Error> {
+        let path = normalize(path)?;
+        let mut size = match self.view(&path) {
+            Some(NodeView::File(bytes)) => bytes.len(),
+            Some(NodeView::Directory) => return Err(Error::IsDirectory),
+            None => return Err(Error::NotFound),
+        };
+        let mut patches = Vec::new();
+        patches
+            .try_reserve_exact(ranges.len().checked_add(1).ok_or(Error::NoSpace)?)
+            .map_err(|_| Error::NoSpace)?;
+        for (offset, data) in ranges {
+            if *offset > size {
+                return Err(Error::Invalid);
+            }
+            let end = offset
+                .checked_add(data.len())
+                .filter(|end| *end <= MAX_RANGE_FILE_BYTES)
+                .ok_or(Error::NoSpace)?;
+            size = size.max(end);
+            if !data.is_empty() {
+                patches.push(Mutation::Patch(
+                    copy_string(&path)?,
+                    *offset,
+                    copy_bytes(data)?,
+                ));
+            }
+        }
+        if patches.is_empty() {
+            return Ok(());
+        }
+        self.sync()?;
+        let Some(Node::File(bytes, _)) = self.entries.get_mut(&path) else {
+            return Err(Error::NotFound);
+        };
+        if size > bytes.len() {
+            bytes
+                .try_reserve_exact(size - bytes.len())
+                .map_err(|_| Error::NoSpace)?;
+        }
+        let mut attributes = self.attributes(&path)?;
+        if self.timestamp != 0 {
+            attributes.modified = self.timestamp;
+            attributes.changed = self.timestamp;
+        }
+        patches.push(Mutation::Attributes(path, attributes));
+        self.commit(&patches)
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
@@ -578,9 +759,6 @@ impl<D: BlockDevice> FileSystem<D> {
         let path = normalize(path)?;
         if !matches!(self.view(&path), Some(NodeView::Directory)) {
             return Err(Error::NotDirectory);
-        }
-        if self.entries.len().saturating_add(self.dirty.len()) > MAX_MATERIALIZED_PATHS {
-            return Err(Error::NoSpace);
         }
         let paths = self.materialized_paths()?;
         let prefix = if path == "/" {
@@ -733,7 +911,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.device.flush()?;
         self.device.commit_stage(CommitStage::GcDataFlushed);
         let next = Superblock {
-            features: FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY,
+            features: KNOWN_FEATURES,
             generation,
             transaction: txid,
             total_blocks: self.superblock.total_blocks,
@@ -786,7 +964,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.device.flush()?;
         self.device.commit_stage(CommitStage::GcDataFlushed);
         let next = Superblock {
-            features: FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY,
+            features: KNOWN_FEATURES,
             generation,
             transaction: txid,
             total_blocks: self.superblock.total_blocks,
@@ -924,7 +1102,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 .commit_stage(CommitStage::TransactionDataFlushed);
         }
         let next = Superblock {
-            features: FEATURE_SEGMENT_LAYOUT | FEATURE_SEGMENT_DIRECTORY,
+            features: KNOWN_FEATURES,
             generation,
             transaction: txid,
             total_blocks: self.superblock.total_blocks,
@@ -989,6 +1167,38 @@ impl<D: BlockDevice> FileSystem<D> {
         self.view_before(path, self.dirty.len())
     }
 
+    fn attributes_before(&self, path: &str, end: usize) -> Option<Attributes> {
+        for (index, mutation) in self.dirty[..end].iter().enumerate().rev() {
+            match mutation {
+                Mutation::Attributes(candidate, attributes) if candidate == path => {
+                    return Some(*attributes);
+                }
+                Mutation::Mkdir(candidate) if candidate == path => {
+                    return Some(Attributes::new(true, 0));
+                }
+                Mutation::Put(candidate, _) if candidate == path => {
+                    return Some(
+                        self.attributes_before(path, index)
+                            .unwrap_or_else(|| Attributes::new(false, 0)),
+                    );
+                }
+                Mutation::Remove(candidate) if subtree_suffix(path, candidate).is_some() => {
+                    return None;
+                }
+                Mutation::Rename(from, to) => {
+                    if let Some(suffix) = subtree_suffix(path, to) {
+                        return self.attributes_before(&(from.clone() + suffix), index);
+                    }
+                    if subtree_suffix(path, from).is_some() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.entries.get(path).map(Node::attributes)
+    }
+
     fn view_before<'a>(&'a self, path: &str, end: usize) -> Option<NodeView<'a>> {
         for (index, mutation) in self.dirty[..end].iter().enumerate().rev() {
             match mutation {
@@ -1015,8 +1225,8 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         self.entries.get(path).map(|node| match node {
-            Node::File(data) => NodeView::File(data),
-            Node::Directory => NodeView::Directory,
+            Node::File(data, _) => NodeView::File(data),
+            Node::Directory(_) => NodeView::Directory,
         })
     }
 
@@ -1033,7 +1243,8 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         for mutation in &self.dirty {
             match mutation {
-                Mutation::Put(path, _) | Mutation::Mkdir(path) => {
+                Mutation::Attributes(_, _) => {}
+                Mutation::Put(path, _) | Mutation::Patch(path, _, _) | Mutation::Mkdir(path) => {
                     if !paths.contains(path) {
                         if paths.len() == MAX_MATERIALIZED_PATHS {
                             return Err(Error::NoSpace);
@@ -1082,6 +1293,7 @@ fn has_later_commit<D: BlockDevice>(device: &mut D, selected: Superblock) -> Res
             let (record, consumed) = match read_record(device, block, end) {
                 Ok(record) => record,
                 Err(Error::Io) => return Err(Error::Io),
+                Err(error @ (Error::NoSpace | Error::Busy)) => return Err(error),
                 Err(_) => return Ok(true),
             };
             if record.kind == RecordKind::Commit
@@ -1098,6 +1310,8 @@ fn has_later_commit<D: BlockDevice>(device: &mut D, selected: Superblock) -> Res
 fn observe_transaction(mutation: &Mutation) -> bool {
     match mutation {
         Mutation::Put(path, _)
+        | Mutation::Patch(path, _, _)
+        | Mutation::Attributes(path, _)
         | Mutation::Mkdir(path)
         | Mutation::Remove(path)
         | Mutation::Rename(path, _) => path == "/faultcut",
@@ -1137,6 +1351,32 @@ fn records_for(txid: u64, generation: u64, mutations: &[Mutation]) -> Vec<Record
                     }
                 }
             }
+            Mutation::Patch(path, offset, data) => {
+                let max_data =
+                    SEGMENT_BLOCKS as usize * BLOCK_SIZE - RECORD_HEADER_SIZE - path.len();
+                for (index, chunk) in data.chunks(max_data).enumerate() {
+                    records.push(Record {
+                        kind: RecordKind::Patch,
+                        txid,
+                        generation,
+                        object: object_number(path),
+                        logical_offset: (offset + index * max_data) as u64,
+                        path: path.clone(),
+                        secondary: String::new(),
+                        data: chunk.to_vec(),
+                    });
+                }
+            }
+            Mutation::Attributes(path, attributes) => records.push(Record {
+                kind: RecordKind::Attributes,
+                txid,
+                generation,
+                object: object_number(path),
+                logical_offset: 0,
+                path: path.clone(),
+                secondary: String::new(),
+                data: attributes.encode(),
+            }),
             Mutation::Mkdir(path) => records.push(Record {
                 kind: RecordKind::Mkdir,
                 txid,
@@ -1185,37 +1425,76 @@ fn records_for(txid: u64, generation: u64, mutations: &[Mutation]) -> Vec<Record
 fn snapshot_mutations(entries: &BTreeMap<String, Node>) -> Vec<Mutation> {
     let mut mutations = Vec::new();
     for (path, node) in entries {
-        if path == "/" {
-            continue;
+        if path != "/" {
+            match node {
+                Node::File(data, _) => mutations.push(Mutation::Put(path.clone(), data.clone())),
+                Node::Directory(_) => mutations.push(Mutation::Mkdir(path.clone())),
+            }
         }
-        match node {
-            Node::File(data) => mutations.push(Mutation::Put(path.clone(), data.clone())),
-            Node::Directory => mutations.push(Mutation::Mkdir(path.clone())),
-        }
+        mutations.push(Mutation::Attributes(path.clone(), node.attributes()));
     }
     mutations
 }
 
-fn apply_record(entries: &mut BTreeMap<String, Node>, record: Record) -> Result<(), Error> {
+fn apply_record(
+    entries: &mut BTreeMap<String, Node>,
+    record: Record,
+    relaxed: bool,
+) -> Result<(), Error> {
     match record.kind {
         RecordKind::Put => {
             let offset = usize::try_from(record.logical_offset).map_err(|_| Error::Corrupt)?;
             if offset == 0 {
-                entries.insert(record.path, Node::File(record.data));
+                let attributes = entries
+                    .get(&record.path)
+                    .map(Node::attributes)
+                    .unwrap_or_else(|| Attributes::new(false, 0));
+                entries.insert(record.path, Node::File(record.data, attributes));
                 return Ok(());
             }
-            let Some(Node::File(data)) = entries.get_mut(&record.path) else {
+            let Some(Node::File(data, _)) = entries.get_mut(&record.path) else {
                 return Err(Error::Corrupt);
             };
             if data.len() != offset {
                 return Err(Error::Corrupt);
             }
-            data.try_reserve_exact(record.data.len())
+            data.try_reserve(record.data.len())
                 .map_err(|_| Error::NoSpace)?;
             data.extend_from_slice(&record.data);
             Ok(())
         }
         RecordKind::Mkdir => apply(entries, Mutation::Mkdir(record.path)),
+        RecordKind::Attributes => {
+            let attributes = Attributes::decode(&record.data)?;
+            if relaxed && !entries.contains_key(&record.path) {
+                return Ok(());
+            }
+            apply(entries, Mutation::Attributes(record.path, attributes))
+        }
+        RecordKind::Patch => {
+            let offset = usize::try_from(record.logical_offset).map_err(|_| Error::Corrupt)?;
+            let end = offset
+                .checked_add(record.data.len())
+                .filter(|end| *end <= MAX_RANGE_FILE_BYTES)
+                .ok_or(Error::Corrupt)?;
+            // Victim planning may remove the base Put before retained patches
+            // are replayed. The final state diff restores the complete file.
+            if relaxed && !entries.contains_key(&record.path) {
+                entries.insert(
+                    record.path.clone(),
+                    Node::File(Vec::new(), Attributes::new(false, 0)),
+                );
+            }
+            if relaxed && let Some(Node::File(bytes, _)) = entries.get_mut(&record.path) {
+                if offset > bytes.len() {
+                    bytes
+                        .try_reserve_exact(end - bytes.len())
+                        .map_err(|_| Error::NoSpace)?;
+                    bytes.resize(offset, 0);
+                }
+            }
+            apply(entries, Mutation::Patch(record.path, offset, record.data))
+        }
         RecordKind::Remove => apply(entries, Mutation::Remove(record.path)),
         RecordKind::Rename => apply(entries, Mutation::Rename(record.path, record.secondary)),
         RecordKind::Commit | RecordKind::Padding => Err(Error::Corrupt),
@@ -1231,6 +1510,22 @@ fn append_directory_records<D: BlockDevice>(
 ) -> Result<(), Error> {
     let mut unavailable = directory_mask(&protected[0]) | directory_mask(&protected[1]);
     unavailable |= directory_mask(directory);
+    let transaction_blocks = encoded_record_blocks(records)?;
+    if transaction_blocks <= SEGMENT_BLOCKS {
+        if let Some(tail) = directory.as_mut_slice().last_mut() {
+            let remaining = SEGMENT_BLOCKS - tail.used as u64;
+            if remaining != 0 && remaining < transaction_blocks {
+                // Keeping a small transaction in one segment avoids linking
+                // successive GC victims through boundary-spanning commits.
+                write_padding(
+                    device,
+                    segment_start(tail.index) + tail.used as u64,
+                    remaining,
+                )?;
+                tail.used = SEGMENT_BLOCKS as u16;
+            }
+        }
+    }
     for record in records {
         let bytes = encode_record(record)?;
         let blocks = bytes.len() as u64 / BLOCK_SIZE as u64;
@@ -1448,6 +1743,8 @@ fn read_record_identity<D: BlockDevice>(
         4 => RecordKind::Rename,
         5 => RecordKind::Commit,
         6 => RecordKind::Padding,
+        7 => RecordKind::Patch,
+        8 => RecordKind::Attributes,
         _ => return Err(Error::Corrupt),
     };
     if kind == RecordKind::Padding && blocks > SEGMENT_BLOCKS {
@@ -1520,13 +1817,21 @@ fn state_diff(base: &BTreeMap<String, Node>, target: &BTreeMap<String, Node>) ->
     removed.sort_by_key(|path| core::cmp::Reverse(path.len()));
     let mut mutations: Vec<Mutation> = removed.into_iter().map(Mutation::Remove).collect();
     for (path, node) in target {
-        if path == "/" || base.get(path) == Some(node) {
+        if base.get(path) == Some(node) {
             continue;
         }
-        match node {
-            Node::File(data) => mutations.push(Mutation::Put(path.clone(), data.clone())),
-            Node::Directory => mutations.push(Mutation::Mkdir(path.clone())),
+        let data_changed = match (base.get(path), node) {
+            (Some(Node::File(previous, _)), Node::File(current, _)) => previous != current,
+            (Some(Node::Directory(_)), Node::Directory(_)) => false,
+            _ => true,
+        };
+        if data_changed && path != "/" {
+            match node {
+                Node::File(data, _) => mutations.push(Mutation::Put(path.clone(), data.clone())),
+                Node::Directory(_) => mutations.push(Mutation::Mkdir(path.clone())),
+            }
         }
+        mutations.push(Mutation::Attributes(path.clone(), node.attributes()));
     }
     mutations
 }
@@ -1609,7 +1914,7 @@ struct ReplayState {
 impl ReplayState {
     fn new(relaxed: bool) -> Self {
         let mut entries = BTreeMap::new();
-        entries.insert("/".to_string(), Node::Directory);
+        entries.insert("/".to_string(), Node::Directory(Attributes::new(true, 0)));
         Self {
             entries,
             pending: Vec::new(),
@@ -1624,13 +1929,18 @@ impl ReplayState {
         }
         self.pending_tx = record.txid;
         match record.kind {
-            RecordKind::Put | RecordKind::Mkdir | RecordKind::Remove | RecordKind::Rename => {
+            RecordKind::Attributes
+            | RecordKind::Put
+            | RecordKind::Patch
+            | RecordKind::Mkdir
+            | RecordKind::Remove
+            | RecordKind::Rename => {
                 self.pending.push(record);
             }
             RecordKind::Commit => {
                 for record in self.pending.drain(..) {
                     let kind = record.kind;
-                    if let Err(error) = apply_record(&mut self.entries, record) {
+                    if let Err(error) = apply_record(&mut self.entries, record, self.relaxed) {
                         if !(self.relaxed && kind == RecordKind::Rename && error == Error::NotFound)
                         {
                             return Err(error);
@@ -1748,6 +2058,8 @@ fn read_record<D: BlockDevice>(
         4 => RecordKind::Rename,
         5 => RecordKind::Commit,
         6 => RecordKind::Padding,
+        7 => RecordKind::Patch,
+        8 => RecordKind::Attributes,
         _ => return Err(Error::Corrupt),
     };
     let path_len = get_u16(&bytes, 24) as usize;
@@ -1785,10 +2097,37 @@ fn read_record<D: BlockDevice>(
 fn apply(entries: &mut BTreeMap<String, Node>, mutation: Mutation) -> Result<(), Error> {
     match mutation {
         Mutation::Put(path, data) => {
-            entries.insert(path, Node::File(data));
+            let attributes = entries
+                .get(&path)
+                .map(Node::attributes)
+                .unwrap_or_else(|| Attributes::new(false, 0));
+            entries.insert(path, Node::File(data, attributes));
+        }
+        Mutation::Patch(path, offset, patch) => {
+            let Some(Node::File(data, _)) = entries.get_mut(&path) else {
+                return Err(Error::Corrupt);
+            };
+            if offset > data.len() {
+                return Err(Error::Corrupt);
+            }
+            let end = offset
+                .checked_add(patch.len())
+                .filter(|end| *end <= MAX_RANGE_FILE_BYTES)
+                .ok_or(Error::Corrupt)?;
+            if end > data.len() {
+                data.try_reserve_exact(end - data.len())
+                    .map_err(|_| Error::NoSpace)?;
+                data.resize(end, 0);
+            }
+            data[offset..end].copy_from_slice(&patch);
+        }
+        Mutation::Attributes(path, attributes) => {
+            match entries.get_mut(&path).ok_or(Error::Corrupt)? {
+                Node::File(_, current) | Node::Directory(current) => *current = attributes,
+            }
         }
         Mutation::Mkdir(path) => {
-            entries.insert(path, Node::Directory);
+            entries.insert(path, Node::Directory(Attributes::new(true, 0)));
         }
         Mutation::Remove(path) => {
             let prefix = path.clone() + "/";
@@ -1819,10 +2158,14 @@ fn apply(entries: &mut BTreeMap<String, Node>, mutation: Mutation) -> Result<(),
 
 fn mutation_touches(mutation: &Mutation, path: &str) -> bool {
     match mutation {
-        Mutation::Put(candidate, _) | Mutation::Mkdir(candidate) | Mutation::Remove(candidate) => {
-            candidate == path
+        Mutation::Put(candidate, _)
+        | Mutation::Patch(candidate, _, _)
+        | Mutation::Attributes(candidate, _)
+        | Mutation::Mkdir(candidate)
+        | Mutation::Remove(candidate) => candidate == path,
+        Mutation::Rename(from, to) => {
+            subtree_suffix(path, from).is_some() || subtree_suffix(path, to).is_some()
         }
-        Mutation::Rename(from, to) => from == path || to == path,
     }
 }
 
@@ -1849,7 +2192,7 @@ fn copy_string(value: &str) -> Result<String, Error> {
     Ok(output)
 }
 
-fn normalize(path: &str) -> Result<String, Error> {
+pub fn normalize(path: &str) -> Result<String, Error> {
     if !path.starts_with('/') || path.as_bytes().contains(&0) {
         return Err(Error::Invalid);
     }

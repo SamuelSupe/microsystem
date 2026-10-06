@@ -7,12 +7,13 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use microsystem_abi::{
     FilesystemStatsV1, Message, Status, SystemStats, boot_cap, gui, network, process, protocol,
     time,
 };
 use microsystem_fs::Operation as FsOperation;
-use microsystem_shell::{Command, parse, resolve_path};
+use microsystem_shell::{Command, parse, program_name, resolve_path};
 
 const INLINE_TEXT_BYTES: usize = 40;
 const SHARED_DATA: usize = 0x0061_0000;
@@ -21,6 +22,8 @@ const COMMAND_BYTES: usize = 512;
 const HISTORY_ENTRIES: usize = 32;
 const SHARED_TEXT_MAGIC: u64 = 0x5445_524d_5348_4152;
 const CLEAR_REPLY: u16 = 1;
+static CANCEL_MASK: AtomicU64 = AtomicU64::new(1);
+static CANCEL_PENDING: AtomicBool = AtomicBool::new(false);
 
 struct TerminalState {
     cwd: String,
@@ -111,6 +114,17 @@ fn execute(request: &Message, state: &mut TerminalState) -> Message {
         return reply;
     };
     state.record(command);
+    let mask = if request.words[5].is_power_of_two() && request.words[5] <= i64::MAX as u64 {
+        request.words[5]
+    } else {
+        1
+    };
+    CANCEL_MASK.store(mask, Ordering::Relaxed);
+    // Preserve an early cancel for this job while draining delayed cancels
+    // from the preceding command.
+    let cancelled = microsystem_user_rt::notification_poll(boot_cap::GUI_TERMINAL_NOTIFICATION)
+        .is_ok_and(|bits| bits & mask != 0);
+    CANCEL_PENDING.store(cancelled, Ordering::Relaxed);
     let mut output = Text::new();
     match parse(command) {
         Ok(Command::Empty) => {}
@@ -120,8 +134,11 @@ fn execute(request: &Message, state: &mut TerminalState) -> Message {
         }
         Ok(Command::Help) => output.push(
             b"help pwd cd echo clear history ps kill wait uptime sleep date free sysinfo\n\
-ls cat head tail wc hexdump grep find tree du df stat touch cp write\n\
-mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
+ls cat head tail wc hexdump grep find tree du df stat chmod chown touch cp write append\n\
+mkdir rmdir mv rm fsync sync netstat net service exit shutdown poweroff reboot\n\
+net [status|config|dhcp|static|default|reset]\n\
+service [list|status|restart|stop] [NAME]\n\
+app [list|info|install|update|rollback|run|exec]\nuser [list|whoami|add|role|enable|disable|keys|key-add|key-remove|switch|logout|audit|host-key]\nvolume [list|create IMAGE MIB|mount IMAGE POINT [ro]|unmount POINT]\n",
         ),
         Ok(Command::Pwd) => {
             let _ = writeln!(output, "{}", state.cwd);
@@ -142,7 +159,27 @@ mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
                 let _ = writeln!(output, "{:>3}  {}", index + 1, command);
             }
         }
-        Ok(Command::Ps) | Ok(Command::SystemInfo) => write_system_info(&mut output),
+        Ok(Command::Ps) => write_processes(&mut output),
+        Ok(Command::Service(arguments)) => {
+            if let Err(status) = microsystem_shell::service_command(arguments, &mut output) {
+                write_status(&mut output, "service", status);
+            }
+        }
+        Ok(Command::SystemInfo) => write_system_info(&mut output),
+        Ok(Command::User(arguments)) => {
+            if let Err(status) = microsystem_shell::identity_command(arguments, boot_cap::GUI_TERMINAL_COMMANDS, SHARED_DATA, &mut output) { write_status(&mut output, "user", status); }
+            if arguments.starts_with("switch ") || arguments == "logout" { state.history.clear(); }
+        }
+        Ok(Command::App(arguments)) => {
+            if let Err(status) = microsystem_shell::app_command(
+                arguments,
+                boot_cap::GUI_TERMINAL_COMMANDS,
+                SHARED_DATA,
+                &mut output,
+            ) {
+                write_status(&mut output, "app", status);
+            }
+        }
         Ok(Command::Uptime) => {
             let _ = writeln!(output, "uptime: {} ms", uptime() / 1_000_000);
             let _ = microsystem_user_rt::debug_write(
@@ -152,7 +189,7 @@ mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
         Ok(Command::Date) => write_date(&mut output),
         Ok(Command::Sleep(value)) => match parse_duration_ns(value) {
             Some(duration) if sleep_ns(duration).is_ok() => {}
-            Some(_) => output.push(b"sleep: failed\n"),
+            Some(_) => output.push(b"sleep: interrupted or failed\n"),
             None => output.push(b"sleep: invalid duration\n"),
         },
         Ok(Command::Kill { pid, status }) => write_kill(&mut output, pid, status),
@@ -191,8 +228,51 @@ mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
                 }
             })
         }
-        Ok(Command::Df) => fs_df(&mut output),
+        Ok(Command::Df(path)) => with_path(state, path, &mut output, |path, output| { fs_df(path, output); Ok(()) }),
+        Ok(Command::Mounts) => match fs_request(FsOperation::MountList, "/", &[], 0) {
+            Ok(reply) => {
+                let bytes = unsafe { core::slice::from_raw_parts(SHARED_DATA as *const u8, reply.words[0] as usize) };
+                output.push(bytes);
+            }
+            Err(status) => write_status(&mut output, "volume", status),
+        },
+        Ok(Command::VolumeCreate { image, mib }) => with_path(state, image, &mut output, |image, output| {
+            fs_request(FsOperation::FormatImage, image, &[], mib as u64)?;
+            output.push(b"volume: ok\n");
+            Ok(())
+        }),
+        Ok(Command::Mount { image, point, readonly }) => {
+            match (state.resolve(image), state.resolve(point)) {
+                (Ok(image), Ok(point)) => match fs_request(FsOperation::MountImage, &image, point.as_bytes(), readonly as u64) {
+                    Ok(_) => output.push(b"volume: ok\n"),
+                    Err(status) => write_status(&mut output, "volume", status),
+                },
+                _ => write_status(&mut output, "volume", Status::Invalid),
+            }
+        }
+        Ok(Command::Unmount(point)) => with_path(state, point, &mut output, |point, output| {
+            fs_request(FsOperation::Unmount, point, &[], 0)?;
+            output.push(b"volume: ok\n");
+            Ok(())
+        }),
         Ok(Command::Stat(path)) => with_path(state, path, &mut output, fs_stat),
+        Ok(Command::Chmod { mode, path }) => with_path(state, path, &mut output, |path, output| {
+            fs_request(FsOperation::Chmod, path, &[], mode as u64)?;
+            output.push(b"chmod: ok\n");
+            Ok(())
+        }),
+        Ok(Command::Chown { uid, gid, path }) => {
+            with_path(state, path, &mut output, |path, output| {
+                fs_request(
+                    FsOperation::Chown,
+                    path,
+                    &[],
+                    uid as u64 | ((gid as u64) << 32),
+                )?;
+                output.push(b"chown: ok\n");
+                Ok(())
+            })
+        }
         Ok(Command::Touch(path)) => with_path(state, path, &mut output, fs_touch),
         Ok(Command::Copy {
             source,
@@ -217,6 +297,17 @@ mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
                 fs_mutation("write", FsOperation::Write, path, value.as_bytes(), output)
             })
         }
+        Ok(Command::Append { path, value }) => {
+            with_path(state, path, &mut output, |path, output| {
+                fs_mutation(
+                    "append",
+                    FsOperation::Append,
+                    path,
+                    value.as_bytes(),
+                    output,
+                )
+            })
+        }
         Ok(Command::Mkdir { path, parents }) => {
             with_path(state, path, &mut output, |path, output| {
                 match fs_mkdir(path, parents) {
@@ -234,15 +325,18 @@ mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
             source,
             destination,
         }) => match (state.resolve(source), state.resolve(destination)) {
-            (Ok(source), Ok(destination)) => {
-                let _ = fs_mutation(
-                    "mv",
-                    FsOperation::Rename,
-                    &source,
-                    destination.as_bytes(),
-                    &mut output,
-                );
-            }
+            (Ok(source), Ok(destination)) => match copy_target(&source, &destination) {
+                Ok(target) => {
+                    let _ = fs_mutation(
+                        "mv",
+                        FsOperation::Rename,
+                        &source,
+                        target.as_bytes(),
+                        &mut output,
+                    );
+                }
+                Err(status) => write_status(&mut output, "mv", status),
+            },
             _ => output.push(b"mv: invalid path\n"),
         },
         Ok(Command::Unlink { path, recursive }) => {
@@ -271,10 +365,13 @@ mkdir rmdir mv rm fsync sync netstat exit shutdown poweroff reboot\n",
             let _ = fs_mutation("sync", FsOperation::Sync, "/", &[], &mut output);
         }
         Ok(Command::FsHelp) => output.push(
-            b"fs: ls cat head tail wc hexdump grep find tree du df stat touch cp [-r]\n\
-write mkdir [-p] rmdir mv rm [-r] fsync sync\n",
+            b"fs: ls cat head tail wc hexdump grep find tree du df stat chmod chown touch cp [-r]\n\
+write append mkdir [-p] rmdir mv rm [-r] fsync sync\n",
         ),
         Ok(Command::Netstat) => write_netstat(&mut output),
+        Ok(Command::Network(arguments)) => {
+            if let Err(status) = microsystem_shell::network_command(arguments, boot_cap::GUI_TERMINAL_COMMANDS, SHARED_DATA, &mut output) { let _ = writeln!(output, "net: {status:?}"); }
+        }
         Ok(Command::Nslookup(_)) => output.push(b"nslookup: use the serial shell\n"),
         Ok(Command::Curl(_))
         | Ok(Command::Run(_))
@@ -331,6 +428,43 @@ fn write_system_info(output: &mut Text) {
     );
 }
 
+fn write_processes(output: &mut Text) {
+    output.push(b"PID NAME STATE STATUS\n");
+    let mut cursor = process::FIRST_APPLICATION_PID;
+    while cursor != 0 {
+        let mut request = Message::new(protocol::PROCESS, process::Operation::List as u16);
+        request.words[0] = cursor;
+        let mut reply = Message::new(protocol::PROCESS, 0);
+        if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0)
+            .is_err()
+            || reply.protocol != protocol::PROCESS
+            || reply.words[5] as i64 != Status::Ok as i64
+        {
+            output.push(b"ps: unavailable\n");
+            return;
+        }
+        if reply.words[0] == 0 {
+            return;
+        }
+        let name = program_name(reply.words[4]).unwrap_or("application");
+        if reply.words[1] != 0 {
+            let _ = writeln!(output, "{} {} running -", reply.words[0], name);
+        } else {
+            let _ = writeln!(
+                output,
+                "{} {} exited {}",
+                reply.words[0], name, reply.words[2] as i64
+            );
+        }
+        let next = reply.words[3];
+        if next != 0 && next <= cursor {
+            output.push(b"ps: invalid cursor\n");
+            return;
+        }
+        cursor = next;
+    }
+}
+
 fn write_kill(output: &mut Text, pid: &str, status: Option<&str>) {
     let (Ok(pid), Ok(status)) = (pid.parse::<u64>(), status.unwrap_or("-15").parse::<i64>()) else {
         output.push(b"kill: invalid pid or status\n");
@@ -355,6 +489,10 @@ fn write_wait(output: &mut Text, pid: &str) {
         return;
     };
     loop {
+        if command_cancelled() {
+            output.push(b"wait: interrupted\n");
+            return;
+        }
         let mut request = Message::new(protocol::PROCESS, process::Operation::Wait as u16);
         request.words[0] = pid;
         let mut reply = Message::new(protocol::PROCESS, 0);
@@ -415,11 +553,20 @@ fn parse_duration_ns(value: &str) -> Option<u64> {
 
 fn sleep_ns(mut duration: u64) -> Result<(), Status> {
     while duration != 0 {
-        let chunk = duration.min(1_000_000_000);
+        if command_cancelled() {
+            return Err(Status::TimedOut);
+        }
+        let chunk = duration.min(50_000_000);
         time_request(time::Operation::Sleep, chunk)?;
         duration -= chunk;
     }
     Ok(())
+}
+
+fn command_cancelled() -> bool {
+    CANCEL_PENDING.swap(false, Ordering::Relaxed)
+        || microsystem_user_rt::notification_poll(boot_cap::GUI_TERMINAL_NOTIFICATION)
+            .is_ok_and(|bits| bits & CANCEL_MASK.load(Ordering::Relaxed) != 0)
 }
 
 fn write_date(output: &mut Text) {
@@ -492,6 +639,14 @@ impl fmt::Display for Ipv4 {
 }
 
 fn request_power(reboot: bool, output: &mut Text) {
+    let allowed =
+        unsafe { microsystem_identity::read_shared(microsystem_abi::identity::SNAPSHOT_VA) }
+            .and_then(|state| state.actor(8, 0, microsystem_user_rt::clock_now()?))
+            .is_ok_and(|actor| actor.administrator());
+    if !allowed {
+        output.push(b"power control: administrator required\n");
+        return;
+    }
     if fs_request(FsOperation::Sync, "/", &[], 0).is_err() {
         output.push(b"power: filesystem sync failed\n");
         return;
@@ -521,6 +676,14 @@ fn fs_stat(path: &str, output: &mut Text) -> Result<(), Status> {
         }
         _ => return Err(Status::Io),
     }
+    let _ = writeln!(
+        output,
+        "mode={:03o} uid={} gid={} modified={}",
+        stat.words[2],
+        stat.words[3] as u32,
+        stat.words[3] >> 32,
+        stat.words[4]
+    );
     report_filesystem_command(b"stat");
     Ok(())
 }
@@ -771,8 +934,8 @@ fn fs_usage(path: &str, depth: usize) -> Result<u64, Status> {
     Ok(total)
 }
 
-fn fs_df(output: &mut Text) {
-    let Ok(reply) = fs_request(FsOperation::Stats, "/", &[], 0) else {
+fn fs_df(path: &str, output: &mut Text) {
+    let Ok(reply) = fs_request(FsOperation::Stats, path, &[], 0) else {
         output.push(b"df: unavailable\n");
         return;
     };
@@ -1008,11 +1171,17 @@ fn fs_request(
     request.words[2] = word2;
     request.caps[0] = boot_cap::GUI_TERMINAL_COMMANDS;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
+    let timeout = if operation == FsOperation::FormatImage {
+        120_000_000_000
+    } else {
+        5_000_000_000
+    };
+    let deadline = microsystem_user_rt::clock_now()?.saturating_add(timeout);
     microsystem_user_rt::ipc_call(
         boot_cap::TERMINAL_FILESYSTEM_ENDPOINT,
         &request,
         &mut reply,
-        0,
+        deadline,
     )?;
     if reply.protocol != protocol::FILESYSTEM {
         return Err(Status::Io);
@@ -1020,7 +1189,11 @@ fn fs_request(
     let status = status_from_raw(reply.words[5] as i64);
     let returns_shared_bytes = matches!(
         operation,
-        FsOperation::List | FsOperation::Read | FsOperation::ReadRange | FsOperation::Stats
+        FsOperation::List
+            | FsOperation::Read
+            | FsOperation::ReadRange
+            | FsOperation::Stats
+            | FsOperation::MountList
     );
     if status != Status::Ok || (returns_shared_bytes && reply.words[0] as usize > SHARED_BYTES) {
         return Err(if status == Status::Ok {

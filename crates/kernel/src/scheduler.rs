@@ -48,14 +48,17 @@ impl Scheduler {
     }
 
     pub fn create(&mut self, task: u32) -> Result<u32, Status> {
-        let slot = self
+        let index = self
             .threads
-            .iter_mut()
-            .find(|thread| thread.state == ThreadState::Empty)
+            .iter()
+            .position(|thread| thread.state == ThreadState::Empty)
             .ok_or(Status::NoMemory)?;
+        if self.len == MAX_THREADS {
+            return Err(Status::Busy);
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        *slot = Thread {
+        self.threads[index] = Thread {
             id,
             task,
             state: ThreadState::Ready,
@@ -82,16 +85,24 @@ impl Scheduler {
     }
 
     pub fn preempt(&mut self, id: u32) -> Result<(), Status> {
-        let thread = self.find_mut(id).ok_or(Status::NotFound)?;
-        if thread.state != ThreadState::Running {
+        if self.find_mut(id).ok_or(Status::NotFound)?.state != ThreadState::Running {
             return Err(Status::Invalid);
         }
+        self.enqueue(id)?;
+        let thread = self.find_mut(id).ok_or(Status::NotFound)?;
         thread.state = ThreadState::Ready;
         thread.cpu = None;
-        self.enqueue(id)
+        Ok(())
     }
 
     pub fn block(&mut self, id: u32) -> Result<(), Status> {
+        let state = self.find_mut(id).ok_or(Status::NotFound)?.state;
+        if !matches!(state, ThreadState::Ready | ThreadState::Running) {
+            return Err(Status::Invalid);
+        }
+        if state == ThreadState::Ready {
+            self.remove_queued(id);
+        }
         let thread = self.find_mut(id).ok_or(Status::NotFound)?;
         thread.state = ThreadState::Blocked;
         thread.cpu = None;
@@ -99,12 +110,13 @@ impl Scheduler {
     }
 
     pub fn wake(&mut self, id: u32) -> Result<(), Status> {
-        let thread = self.find_mut(id).ok_or(Status::NotFound)?;
-        if thread.state != ThreadState::Blocked {
+        if self.find_mut(id).ok_or(Status::NotFound)?.state != ThreadState::Blocked {
             return Err(Status::Invalid);
         }
+        self.enqueue(id)?;
+        let thread = self.find_mut(id).ok_or(Status::NotFound)?;
         thread.state = ThreadState::Ready;
-        self.enqueue(id)
+        Ok(())
     }
 
     pub fn thread(&self, id: u32) -> Option<&Thread> {
@@ -134,6 +146,18 @@ impl Scheduler {
         self.head = (self.head + 1) % MAX_THREADS;
         self.len -= 1;
         Some(id)
+    }
+
+    fn remove_queued(&mut self, id: u32) {
+        let mut retained = 0;
+        for read in 0..self.len {
+            let queued = self.queue[(self.head + read) % MAX_THREADS];
+            if queued != id {
+                self.queue[(self.head + retained) % MAX_THREADS] = queued;
+                retained += 1;
+            }
+        }
+        self.len = retained;
     }
 }
 

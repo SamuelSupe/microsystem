@@ -31,6 +31,8 @@ const IOTLB_IVT: u64 = 1 << 63;
 const IOTLB_GLOBAL: u64 = 1 << 60;
 const IOTLB_DRAIN_READS: u64 = 1 << 49;
 const IOTLB_DRAIN_WRITES: u64 = 1 << 48;
+const MAX_DEVICE_DOMAINS: usize = 16;
+const MAX_PCI_BUSES: usize = 8;
 
 const PTE_READ: u64 = 1;
 const PTE_WRITE: u64 = 1 << 1;
@@ -43,6 +45,8 @@ pub enum Error {
     Timeout,
     Inactive,
     Address,
+    Busy,
+    DomainLimit,
 }
 
 pub struct Domain {
@@ -60,9 +64,8 @@ pub struct FaultEvent {
 }
 
 #[repr(C, align(4096))]
-struct Tables {
-    root: [u64; 512],
-    context: [u64; 512],
+#[derive(Clone, Copy)]
+struct DomainTables {
     pml4: [u64; 512],
     pdpt: [u64; 512],
     pd: [u64; 512],
@@ -70,17 +73,40 @@ struct Tables {
     gui: [[u64; 512]; 2],
 }
 
-struct TableCell(UnsafeCell<Tables>);
-unsafe impl Sync for TableCell {}
-
-static TABLES: TableCell = TableCell(UnsafeCell::new(Tables {
-    root: [0; 512],
-    context: [0; 512],
+const EMPTY_DOMAIN: DomainTables = DomainTables {
     pml4: [0; 512],
     pdpt: [0; 512],
     pd: [0; 512],
     low: [0; 512],
     gui: [[0; 512]; 2],
+};
+
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct ContextPage([u64; 512]);
+
+#[repr(C, align(4096))]
+struct Tables {
+    root: [u64; 512],
+    context: [ContextPage; MAX_PCI_BUSES],
+    streams: [u32; MAX_DEVICE_DOMAINS],
+    domain_count: usize,
+    primary_stream: u32,
+    has_primary: bool,
+    domains: [DomainTables; MAX_DEVICE_DOMAINS],
+}
+
+struct TableCell(UnsafeCell<Tables>);
+unsafe impl Sync for TableCell {}
+
+static TABLES: TableCell = TableCell(UnsafeCell::new(Tables {
+    root: [0; 512],
+    context: [ContextPage([0; 512]); MAX_PCI_BUSES],
+    streams: [0; MAX_DEVICE_DOMAINS],
+    domain_count: 0,
+    primary_stream: 0,
+    has_primary: false,
+    domains: [EMPTY_DOMAIN; MAX_DEVICE_DOMAINS],
 }));
 static ACTIVE_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -97,6 +123,9 @@ pub fn create_domain(
     if dma_physical & 0xfff != 0 || data_physical & 0xfff != 0 {
         return Err(Error::Address);
     }
+    if ACTIVE_BASE.load(Ordering::Acquire) != 0 {
+        return Err(Error::Busy);
+    }
     let base = crate::arch::phys_to_virt(iommu_physical as u64);
     let cap = read64(base + REG_CAP);
     let ecap = read64(base + REG_ECAP);
@@ -107,25 +136,26 @@ pub fn create_domain(
     let tables = unsafe { &mut *TABLES.0.get() };
     unsafe { core::ptr::write_bytes(tables, 0, 1) };
     let root = physical(tables.root.as_mut_ptr())?;
-    let context = physical(tables.context.as_mut_ptr())?;
-    let pml4 = physical(tables.pml4.as_mut_ptr())?;
-    let pdpt = physical(tables.pdpt.as_mut_ptr())?;
-    let pd = physical(tables.pd.as_mut_ptr())?;
-    let low = physical(tables.low.as_mut_ptr())?;
+    let domain_index = ensure_domain(tables, stream_id)?;
+    let domain = &mut tables.domains[domain_index];
+    let pml4 = physical(domain.pml4.as_mut_ptr())?;
+    let pdpt = physical(domain.pdpt.as_mut_ptr())?;
+    let pd = physical(domain.pd.as_mut_ptr())?;
+    let low = physical(domain.low.as_mut_ptr())?;
     let gui = [
-        physical(tables.gui[0].as_mut_ptr())?,
-        physical(tables.gui[1].as_mut_ptr())?,
+        physical(domain.gui[0].as_mut_ptr())?,
+        physical(domain.gui[1].as_mut_ptr())?,
     ];
-
-    tables.root[0] = context | 1;
-    tables.pml4[0] = table_descriptor(pdpt);
-    tables.pdpt[0] = table_descriptor(pd);
-    tables.pd[0] = table_descriptor(low);
-    tables.pd[1] = table_descriptor(gui[0]);
-    tables.pd[2] = table_descriptor(gui[1]);
-    tables.low[((PROBE_IOVA >> 12) & 0x1ff) as usize] = page_descriptor(dma_physical);
-    tables.low[(((PROBE_IOVA + 4096) >> 12) & 0x1ff) as usize] = page_descriptor(data_physical);
-    install_context(tables, stream_id, pml4);
+    domain.pml4[0] = table_descriptor(pdpt);
+    domain.pdpt[0] = table_descriptor(pd);
+    domain.pd[0] = table_descriptor(low);
+    domain.pd[1] = table_descriptor(gui[0]);
+    domain.pd[2] = table_descriptor(gui[1]);
+    domain.low[((PROBE_IOVA >> 12) & 0x1ff) as usize] = page_descriptor(dma_physical);
+    domain.low[(((PROBE_IOVA + 4096) >> 12) & 0x1ff) as usize] = page_descriptor(data_physical);
+    tables.primary_stream = stream_id;
+    tables.has_primary = true;
+    install_context(tables, stream_id, pml4, domain_index)?;
     crate::arch::dma_write_barrier();
 
     write32(base + REG_GCMD, 0);
@@ -148,20 +178,30 @@ pub fn create_domain(
     })
 }
 
-pub fn map_gui_pages(physical_base: u64, pages: usize, queue_physical: u64) -> Result<(), Error> {
+pub fn map_gui_pages(
+    stream_id: u32,
+    physical_base: u64,
+    pages: usize,
+    queue_physical: u64,
+) -> Result<(), Error> {
     if physical_base & 0xfff != 0 || queue_physical & 0xfff != 0 || pages == 0 || pages > 768 {
         return Err(Error::Address);
     }
-    let tables = unsafe { &mut *TABLES.0.get() };
-    for page in 0..pages {
-        tables.gui[page / 512][page % 512] = page_descriptor(physical_base + page as u64 * 4096);
+    if ACTIVE_BASE.load(Ordering::Acquire) == 0 {
+        return Err(Error::Inactive);
     }
-    tables.gui[1][256] = page_descriptor(queue_physical);
+    let tables = unsafe { &mut *TABLES.0.get() };
+    let domain_index = ensure_domain(tables, stream_id)?;
+    let domain = &mut tables.domains[domain_index];
+    for page in 0..pages {
+        domain.gui[page / 512][page % 512] = page_descriptor(physical_base + page as u64 * 4096);
+    }
+    domain.gui[1][256] = page_descriptor(queue_physical);
     crate::arch::dma_write_barrier();
     invalidate_active()
 }
 
-pub fn map_gui_aux_page(iova: u64, physical_address: u64) -> Result<(), Error> {
+pub fn map_gui_aux_page(stream_id: u32, iova: u64, physical_address: u64) -> Result<(), Error> {
     if !matches!(
         iova,
         KEYBOARD_QUEUE_IOVA
@@ -173,12 +213,17 @@ pub fn map_gui_aux_page(iova: u64, physical_address: u64) -> Result<(), Error> {
     {
         return Err(Error::Address);
     }
+    if ACTIVE_BASE.load(Ordering::Acquire) == 0 {
+        return Err(Error::Inactive);
+    }
     let table = ((iova - GUI_IOVA) / (512 * 4096)) as usize;
     let index = ((iova >> 12) & 0x1ff) as usize;
     if table >= 2 {
         return Err(Error::Address);
     }
-    unsafe { &mut *TABLES.0.get() }.gui[table][index] = page_descriptor(physical_address);
+    let tables = unsafe { &mut *TABLES.0.get() };
+    let domain_index = ensure_domain(tables, stream_id)?;
+    tables.domains[domain_index].gui[table][index] = page_descriptor(physical_address);
     crate::arch::dma_write_barrier();
     invalidate_active()
 }
@@ -190,8 +235,9 @@ pub fn attach_stream(stream_id: u32) -> Result<(), Error> {
         return Err(Error::Inactive);
     }
     let tables = unsafe { &mut *TABLES.0.get() };
-    let pml4 = physical(tables.pml4.as_mut_ptr())?;
-    install_context(tables, stream_id, pml4);
+    let domain_index = ensure_domain(tables, stream_id)?;
+    let pml4 = physical(tables.domains[domain_index].pml4.as_mut_ptr())?;
+    install_context(tables, stream_id, pml4, domain_index)?;
     crate::arch::dma_write_barrier();
     invalidate_context(base)?;
     invalidate_active()
@@ -248,18 +294,62 @@ pub fn unmap_runtime_page(iova: u64) -> Result<(), Error> {
     update_runtime(iova, 0)
 }
 
-fn install_context(tables: &mut Tables, stream_id: u32, pml4: u64) {
+fn install_context(tables: &mut Tables, stream_id: u32, pml4: u64, domain_index: usize) -> Result<(), Error> {
+    validate_stream(stream_id)?;
+    let bus = (stream_id >> 8) as usize;
+    let context = &mut tables.context[bus].0;
+    tables.root[bus * 2] = physical(context.as_mut_ptr())? | 1;
     let index = (stream_id & 0xff) as usize * 2;
-    tables.context[index + 1] = 2 | (1 << 8);
+    let domain_id = domain_index as u64 + 2;
+    context[index + 1] = 2 | (domain_id << 8);
     crate::arch::dma_write_barrier();
-    tables.context[index] = pml4 | 1;
+    context[index] = pml4 | 1;
+    Ok(())
+}
+
+fn find_domain(tables: &Tables, stream_id: u32) -> Option<usize> {
+    tables.streams[..tables.domain_count]
+        .iter()
+        .position(|&registered| registered == stream_id)
+}
+
+fn ensure_domain(tables: &mut Tables, stream_id: u32) -> Result<usize, Error> {
+    validate_stream(stream_id)?;
+    if let Some(index) = find_domain(tables, stream_id) {
+        return Ok(index);
+    }
+    if tables.domain_count == MAX_DEVICE_DOMAINS {
+        return Err(Error::DomainLimit);
+    }
+    let index = tables.domain_count;
+    let domain = &mut tables.domains[index];
+    let pdpt = physical(domain.pdpt.as_mut_ptr())?;
+    let pd = physical(domain.pd.as_mut_ptr())?;
+    let low = physical(domain.low.as_mut_ptr())?;
+    let gui = [
+        physical(domain.gui[0].as_mut_ptr())?,
+        physical(domain.gui[1].as_mut_ptr())?,
+    ];
+    domain.pml4[0] = table_descriptor(pdpt);
+    domain.pdpt[0] = table_descriptor(pd);
+    domain.pd[0] = table_descriptor(low);
+    domain.pd[1] = table_descriptor(gui[0]);
+    domain.pd[2] = table_descriptor(gui[1]);
+    tables.streams[index] = stream_id;
+    tables.domain_count += 1;
+    Ok(index)
 }
 
 fn update_runtime(iova: u64, descriptor: u64) -> Result<(), Error> {
     if ACTIVE_BASE.load(Ordering::Acquire) == 0 {
         return Err(Error::Inactive);
     }
-    unsafe { &mut *TABLES.0.get() }.low[((iova >> 12) & 0x1ff) as usize] = descriptor;
+    let tables = unsafe { &mut *TABLES.0.get() };
+    if !tables.has_primary {
+        return Err(Error::Inactive);
+    }
+    let domain_index = find_domain(tables, tables.primary_stream).ok_or(Error::Inactive)?;
+    tables.domains[domain_index].low[((iova >> 12) & 0x1ff) as usize] = descriptor;
     crate::arch::dma_write_barrier();
     invalidate_active()
 }
@@ -307,7 +397,7 @@ fn wait64_clear(address: usize, mask: u64) -> Result<(), Error> {
 }
 
 fn validate_stream(stream_id: u32) -> Result<(), Error> {
-    if stream_id >> 8 == 0 {
+    if stream_id >> 8 < MAX_PCI_BUSES as u32 {
         Ok(())
     } else {
         Err(Error::StreamId)

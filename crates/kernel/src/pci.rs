@@ -43,11 +43,41 @@ impl Device {
 pub struct VirtioTransport {
     pub common: usize,
     pub notify: usize,
+    pub notify_bytes: u32,
     pub isr: usize,
     pub device_config: usize,
+    pub device_config_bytes: u32,
     pub notify_multiplier: u32,
     pub queues: u16,
     pub capacity_sectors: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BarRange {
+    base: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BarCache {
+    ecam: usize,
+    requester: u32,
+    id: u32,
+    raw: [u32; 6],
+    bars: [Option<BarRange>; 6],
+}
+static mut BAR_CACHE: [Option<BarCache>; 64] = [None; 64];
+
+pub fn forget_device(ecam: usize, device: Device) {
+    for index in 0..64 {
+        unsafe {
+            if BAR_CACHE[index].is_some_and(|cached| {
+                cached.ecam == ecam && cached.requester == device.requester_id()
+            }) {
+                BAR_CACHE[index] = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +110,7 @@ pub enum VirtioError {
     },
     CapabilityList,
     CapabilityBar,
+    CapabilityLength,
     CommonConfig,
     NotifyConfig,
     IsrConfig,
@@ -125,17 +156,35 @@ pub fn virtio_device_at(
     function: u8,
     expected_device: u16,
 ) -> Option<Device> {
+    virtio_device_on_bus(ecam_physical, 0, slot, function, expected_device)
+}
+
+pub fn virtio_device_on_bus(
+    ecam_physical: usize,
+    bus: u8,
+    slot: u8,
+    function: u8,
+    expected_device: u16,
+) -> Option<Device> {
     if ecam_physical == 0 || slot >= 32 || function >= 8 {
         return None;
     }
-    let id = read32(ecam_physical, slot, function, 0);
+    let id = read32(ecam_physical + ((bus as usize) << 20), slot, function, 0);
     let vendor = id as u16;
     let device = (id >> 16) as u16;
     (vendor == VIRTIO_VENDOR && device == expected_device).then_some(Device {
-        bus: 0,
+        bus,
         slot,
         function,
     })
+}
+
+pub fn virtio_devices(ecam: usize, expected: u16) -> impl Iterator<Item = Device> {
+    (0..crate::pci_bridges::MAX_BUSES as u8)
+        .filter(|bus| crate::pci_bridges::active(*bus))
+        .flat_map(move |bus| {
+            (0..32).filter_map(move |slot| virtio_device_on_bus(ecam, bus, slot, 0, expected))
+        })
 }
 
 pub fn inspect_configured_virtio(
@@ -148,12 +197,142 @@ pub fn inspect_configured_virtio(
         return Err(VirtioError::MissingWindow);
     }
     transport_from_bars(
-        ecam_physical,
+        ecam_physical + ((device.bus as usize) << 20),
         device,
-        configured_bars(ecam_physical, device),
+        configured_bars(ecam_physical, device)?,
         mmio_base,
         mmio_bytes,
     )
+}
+
+pub fn reserve_hotplug_window(ecam: usize, base: usize, bytes: usize) -> Result<(), VirtioError> {
+    let end = (base as u64)
+        .checked_add(bytes as u64)
+        .ok_or(VirtioError::MissingWindow)?;
+    let mut next = base as u64;
+    for slot in 0..32 {
+        let id = read32(ecam, slot, 0, 0);
+        if id as u16 == 0xffff {
+            continue;
+        }
+        let device = Device {
+            bus: 0,
+            slot,
+            function: 0,
+        };
+        for bar in configured_bars(ecam, device)?.iter().flatten() {
+            let limit = bar
+                .base
+                .checked_add(bar.bytes)
+                .ok_or(VirtioError::MissingWindow)?;
+            if bar.base >= base as u64 && limit <= end {
+                next = next.max(limit);
+            }
+        }
+    }
+    crate::pci_bridges::reset(base as u64, end, next);
+    crate::pci_bridges::prepare(ecam)
+}
+
+pub(crate) fn bar_ranges(
+    ecam: usize,
+    device: Device,
+) -> Result<impl Iterator<Item = (u64, u64)>, VirtioError> {
+    Ok(configured_bars(ecam, device)?
+        .into_iter()
+        .flatten()
+        .map(|bar| (bar.base, bar.bytes)))
+}
+
+/// Assigns BARs only for a newly discovered function. Existing live functions
+/// retain their addresses; the boot-discovered high-water mark reserves them.
+pub fn configure_hotplug_virtio(
+    ecam: usize,
+    device: Device,
+    base: usize,
+    bytes: usize,
+) -> Result<(), VirtioError> {
+    let _ = (base, bytes);
+    let (mut next, end) = crate::pci_bridges::allocation(device.bus)?;
+    let ecam = ecam + ((device.bus as usize) << 20);
+    let command = read16(ecam, device.slot, device.function, 4);
+    write16(ecam, device.slot, device.function, 4, command & !7);
+    let mut index = 0;
+    while index < 6 {
+        let offset = 0x10 + index * 4;
+        let original = read32(ecam, device.slot, device.function, offset);
+        if original & 1 != 0 {
+            index += 1;
+            continue;
+        }
+        let is_64 = original & 6 == 4 && index < 5;
+        let upper = if is_64 {
+            read32(ecam, device.slot, device.function, offset + 4)
+        } else {
+            0
+        };
+        write32(ecam, device.slot, device.function, offset, u32::MAX);
+        if is_64 {
+            write32(ecam, device.slot, device.function, offset + 4, u32::MAX);
+        }
+        let low_mask = read32(ecam, device.slot, device.function, offset);
+        let high_mask = if is_64 {
+            read32(ecam, device.slot, device.function, offset + 4)
+        } else {
+            0
+        };
+        write32(ecam, device.slot, device.function, offset, original);
+        if is_64 {
+            write32(ecam, device.slot, device.function, offset + 4, upper);
+        }
+        let mask = if is_64 {
+            ((high_mask as u64) << 32) | (low_mask as u64 & !15)
+        } else {
+            low_mask as u64 & !15
+        };
+        let size = if is_64 {
+            (!mask).wrapping_add(1)
+        } else {
+            (!(mask as u32)).wrapping_add(1) as u64
+        };
+        if size != 0 {
+            if !size.is_power_of_two() {
+                return Err(VirtioError::MissingWindow);
+            }
+            let address = next
+                .checked_add(size - 1)
+                .map(|value| value & !(size - 1))
+                .ok_or(VirtioError::MissingWindow)?;
+            let limit = address
+                .checked_add(size)
+                .ok_or(VirtioError::MissingWindow)?;
+            if limit > end || (!is_64 && limit > 0x1_0000_0000) {
+                return Err(VirtioError::MissingWindow);
+            }
+            write32(
+                ecam,
+                device.slot,
+                device.function,
+                offset,
+                address as u32 | (original & 15),
+            );
+            if is_64 {
+                write32(
+                    ecam,
+                    device.slot,
+                    device.function,
+                    offset + 4,
+                    (address >> 32) as u32,
+                );
+            }
+            next = limit;
+            crate::pci_bridges::advance(device.bus, next);
+        }
+        index += if is_64 { 2 } else { 1 };
+    }
+    crate::pci_bridges::advance(device.bus, next);
+    write16(ecam, device.slot, device.function, 4, command | 6);
+    Ok(())
 }
 
 pub fn interrupt_pin(ecam_physical: usize, device: Device) -> u8 {
@@ -175,19 +354,23 @@ pub fn inspect_configured_virtio_block(
     if mmio_base == 0 || mmio_bytes == 0 {
         return Err(VirtioError::MissingWindow);
     }
-    transport_from_bars(
+    let transport = transport_from_bars(
         ecam_physical,
         device,
-        configured_bars(ecam_physical, device),
+        configured_bars(ecam_physical, device)?,
         mmio_base,
         mmio_bytes,
-    )
+    )?;
+    if transport.device_config == 0 || transport.device_config_bytes < 8 {
+        return Err(VirtioError::DeviceConfig);
+    }
+    Ok(transport)
 }
 
 fn transport_from_bars(
     ecam_physical: usize,
     device: Device,
-    bars: [u64; 6],
+    bars: [Option<BarRange>; 6],
     mmio_base: usize,
     mmio_bytes: usize,
 ) -> Result<VirtioTransport, VirtioError> {
@@ -196,8 +379,10 @@ fn transport_from_bars(
         .ok_or(VirtioError::MissingWindow)?;
     let mut common = 0usize;
     let mut notify = 0usize;
+    let mut notify_bytes = 0u32;
     let mut isr = 0usize;
     let mut device_config = 0usize;
+    let mut device_config_bytes = 0u32;
     let mut notify_multiplier = 0u32;
     let status = read16(ecam_physical, device.slot, device.function, 0x06);
     if status & (1 << 4) == 0 {
@@ -221,27 +406,55 @@ fn transport_from_bars(
             capability as usize + 1,
         ) & !3;
         if id == 0x09 {
-            let length = read8(
-                ecam_physical,
-                device.slot,
-                device.function,
-                capability as usize + 2,
-            );
             let kind = read8(
                 ecam_physical,
                 device.slot,
                 device.function,
                 capability as usize + 3,
             );
-            let bar = read8(
-                ecam_physical,
-                device.slot,
-                device.function,
-                capability as usize + 4,
-            ) as usize;
             if matches!(kind, 1..=4) {
-                if bar >= bars.len() || bars[bar] == 0 {
+                if capability as usize + 5 > 256 {
+                    return Err(VirtioError::CapabilityLength);
+                }
+                let bar = read8(
+                    ecam_physical,
+                    device.slot,
+                    device.function,
+                    capability as usize + 4,
+                ) as usize;
+                if bar >= 6 {
                     return Err(VirtioError::CapabilityBar);
+                }
+                let Some(bar_range) = bars.get(bar).copied().flatten() else {
+                    // Virtio requires drivers to ignore capabilities on reserved BARs.
+                    if next == 0 || next == capability {
+                        break;
+                    }
+                    capability = next;
+                    continue;
+                };
+                let cap_len = read8(
+                    ecam_physical,
+                    device.slot,
+                    device.function,
+                    capability as usize + 2,
+                );
+                if cap_len < 16 || capability as usize + cap_len as usize > 256 {
+                    return Err(VirtioError::CapabilityLength);
+                }
+                if (kind == 1 && common != 0)
+                    || (kind == 2 && notify != 0)
+                    || (kind == 3 && isr != 0)
+                    || (kind == 4 && device_config != 0)
+                {
+                    if next == 0 || next == capability {
+                        break;
+                    }
+                    capability = next;
+                    continue;
+                }
+                if kind == 2 && cap_len < 20 {
+                    return Err(VirtioError::CapabilityLength);
                 }
                 let offset = read32(
                     ecam_physical,
@@ -249,26 +462,57 @@ fn transport_from_bars(
                     device.function,
                     capability as usize + 8,
                 ) as usize;
-                let physical = bars[bar]
-                    .checked_add(offset as u64)
-                    .filter(|address| *address >= mmio_base as u64 && *address < window_end)
+                let region_bytes = read32(
+                    ecam_physical,
+                    device.slot,
+                    device.function,
+                    capability as usize + 12,
+                );
+                let minimum_region_bytes = match kind {
+                    1 => 56,
+                    2 => 2,
+                    3 => 1,
+                    4 => 0,
+                    _ => unreachable!(),
+                };
+                if region_bytes < minimum_region_bytes {
+                    return Err(VirtioError::CapabilityLength);
+                }
+                let end_offset = (offset as u64)
+                    .checked_add(region_bytes as u64)
                     .ok_or(VirtioError::CapabilityBar)?;
+                if end_offset > bar_range.bytes {
+                    return Err(VirtioError::CapabilityBar);
+                }
+                let physical = bar_range
+                    .base
+                    .checked_add(offset as u64)
+                    .filter(|address| *address >= mmio_base as u64)
+                    .ok_or(VirtioError::CapabilityBar)?;
+                let region_end = physical
+                    .checked_add(region_bytes as u64)
+                    .ok_or(VirtioError::CapabilityBar)?;
+                if region_end > window_end {
+                    return Err(VirtioError::CapabilityBar);
+                }
                 let address = crate::arch::phys_to_virt(physical);
                 match kind {
                     1 => common = address,
                     2 => {
                         notify = address;
-                        if length >= 20 {
-                            notify_multiplier = read32(
-                                ecam_physical,
-                                device.slot,
-                                device.function,
-                                capability as usize + 16,
-                            );
-                        }
+                        notify_bytes = region_bytes;
+                        notify_multiplier = read32(
+                            ecam_physical,
+                            device.slot,
+                            device.function,
+                            capability as usize + 16,
+                        );
                     }
                     3 => isr = address,
-                    4 => device_config = address,
+                    4 => {
+                        device_config = address;
+                        device_config_bytes = region_bytes;
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -287,22 +531,32 @@ fn transport_from_bars(
     if isr == 0 {
         return Err(VirtioError::IsrConfig);
     }
-    if device_config == 0 {
-        return Err(VirtioError::DeviceConfig);
-    }
-
     Ok(VirtioTransport {
         common,
         notify,
+        notify_bytes,
         isr,
         device_config,
+        device_config_bytes,
         notify_multiplier,
         queues: read_mmio16(common + 18),
-        capacity_sectors: read_mmio64(device_config),
+        capacity_sectors: if device_config_bytes >= 8 {
+            read_mmio64(device_config)
+        } else {
+            0
+        },
     })
 }
 
 impl VirtioTransport {
+    pub fn queue_notify_offset(&self) -> Option<usize> {
+        let offset = (read_mmio16(self.common + 30) as usize)
+            .checked_mul(self.notify_multiplier as usize)?;
+        let end = offset.checked_add(2)?;
+        (end <= self.notify_bytes as usize && self.notify.checked_add(end).is_some())
+            .then_some(offset)
+    }
+
     pub fn negotiate_features(&self) -> Result<(), VirtioError> {
         write_mmio8(self.common + 20, 0);
         write_mmio8(self.common + 20, 1);
@@ -348,8 +602,19 @@ impl VirtioTransport {
         crate::arch::virt_to_phys(BLOCK_DATA.0.get() as usize as u64).unwrap_or(0)
     }
 
-    pub fn reset_for_user(&self, ecam_physical: usize, device: Device) {
+    pub fn reset_for_user(&self, ecam_physical: usize, device: Device) -> Result<(), BlockIoError> {
         write_mmio8(self.common + 20, 0);
+        let mut acknowledged = false;
+        for _ in 0..100_000 {
+            if read_mmio8(self.common + 20) == 0 {
+                acknowledged = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !acknowledged {
+            return Err(BlockIoError::TimedOut);
+        }
         let command = read16(ecam_physical, device.slot, device.function, 0x04);
         write16(
             ecam_physical,
@@ -359,6 +624,7 @@ impl VirtioTransport {
             command & !((1 << 1) | (1 << 2)),
         );
         crate::arch::dma_barrier();
+        Ok(())
     }
 
     pub fn prepare_fault_probe(&self, dma_base: u64) -> Result<(), BlockIoError> {
@@ -485,11 +751,10 @@ impl VirtioTransport {
             );
             dma_write_barrier();
 
-            write_mmio16(
-                self.notify
-                    + read_mmio16(self.common + 30) as usize * self.notify_multiplier as usize,
-                0,
-            );
+            let notify_offset = self
+                .queue_notify_offset()
+                .ok_or(BlockIoError::QueueUnavailable)?;
+            write_mmio16(self.notify + notify_offset, 0);
 
             for _ in 0..spin_limit {
                 if core::ptr::read_volatile(queue.add(USED_OFFSET + 2) as *const u16) != used_index
@@ -513,24 +778,124 @@ fn physical_page(high_address: usize) -> u64 {
     crate::arch::virt_to_phys(high_address as u64).unwrap_or(0) & !0xfff
 }
 
-fn configured_bars(ecam: usize, device: Device) -> [u64; 6] {
-    let mut bars = [0u64; 6];
+fn configured_bars(ecam: usize, device: Device) -> Result<[Option<BarRange>; 6], VirtioError> {
+    let origin = ecam;
+    let ecam = ecam + ((device.bus as usize) << 20);
+    let id = read32(ecam, device.slot, device.function, 0);
+    let count = if read8(ecam, device.slot, device.function, 0x0e) & 0x7f == 1 {
+        2
+    } else {
+        6
+    };
+    let raw = core::array::from_fn(|index| {
+        if index < count {
+            read32(ecam, device.slot, device.function, 0x10 + index * 4)
+        } else {
+            0
+        }
+    });
+    // Probing BAR sizes changes QEMU's address-space topology. Reuse validated
+    // sizes while addresses/identity are unchanged, especially after DMA starts.
+    for index in 0..64 {
+        unsafe {
+            if let Some(cached) = BAR_CACHE[index] {
+                if cached.ecam == origin
+                    && cached.requester == device.requester_id()
+                    && cached.id == id
+                    && cached.raw == raw
+                {
+                    return Ok(cached.bars);
+                }
+            }
+        }
+    }
+    let mut bars = [None; 6];
+    let command = read16(ecam, device.slot, device.function, 0x04);
+    write16(ecam, device.slot, device.function, 0x04, command & !0x7);
     let mut index = 0usize;
-    while index < bars.len() {
+    while index < count {
         let low = read32(ecam, device.slot, device.function, 0x10 + index * 4);
-        if low & 1 != 0 {
+        if low == 0 || low == u32::MAX || low & 1 != 0 {
             index += 1;
             continue;
         }
-        let is_64 = low & 0x6 == 0x4 && index + 1 < bars.len();
-        let mut address = (low & !0xf) as u64;
-        if is_64 {
-            address |= (read32(ecam, device.slot, device.function, 0x14 + index * 4) as u64) << 32;
+        let bar_type = low & 0x6;
+        let is_64 = bar_type == 0x4;
+        if bar_type == 0x6 || (is_64 && index + 1 == bars.len()) {
+            index += 1;
+            continue;
         }
-        bars[index] = address;
+        let high = if is_64 {
+            read32(ecam, device.slot, device.function, 0x14 + index * 4)
+        } else {
+            0
+        };
+        write32(
+            ecam,
+            device.slot,
+            device.function,
+            0x10 + index * 4,
+            u32::MAX,
+        );
+        if is_64 {
+            write32(
+                ecam,
+                device.slot,
+                device.function,
+                0x14 + index * 4,
+                u32::MAX,
+            );
+        }
+        let mask_low = read32(ecam, device.slot, device.function, 0x10 + index * 4);
+        let mask_high = if is_64 {
+            read32(ecam, device.slot, device.function, 0x14 + index * 4)
+        } else {
+            0
+        };
+        write32(ecam, device.slot, device.function, 0x10 + index * 4, low);
+        if is_64 {
+            write32(ecam, device.slot, device.function, 0x14 + index * 4, high);
+        }
+
+        let base = ((high as u64) << 32) | (low & !0xf) as u64;
+        let size = if is_64 {
+            let mask = ((mask_high as u64) << 32) | (mask_low & !0xf) as u64;
+            (!mask).wrapping_add(1)
+        } else {
+            (!(mask_low & !0xf)).wrapping_add(1) as u64
+        };
+        if base != 0 && size >= 16 && size.is_power_of_two() && base & (size - 1) == 0 {
+            bars[index] = Some(BarRange { base, bytes: size });
+        }
         index += if is_64 { 2 } else { 1 };
     }
-    bars
+    write16(ecam, device.slot, device.function, 0x04, command);
+    let mut slot = None;
+    for index in 0..64 {
+        unsafe {
+            if BAR_CACHE[index].is_some_and(|cached| {
+                cached.ecam == origin && cached.requester == device.requester_id()
+            }) {
+                slot = Some(index);
+                break;
+            }
+            if BAR_CACHE[index].is_none() && slot.is_none() {
+                slot = Some(index);
+            }
+        }
+    }
+    if let Some(index) = slot {
+        unsafe {
+            BAR_CACHE[index] = Some(BarCache {
+                ecam: origin,
+                requester: device.requester_id(),
+                id,
+                raw,
+                bars,
+            });
+        }
+    }
+    Ok(bars)
 }
 
 fn config_address(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> usize {
@@ -539,25 +904,34 @@ fn config_address(ecam_physical: usize, slot: u8, function: u8, offset: usize) -
     )
 }
 
-fn read8(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u8 {
+pub(crate) fn read8(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u8 {
     unsafe {
         core::ptr::read_volatile(config_address(ecam_physical, slot, function, offset) as *const u8)
     }
 }
 
-fn read16(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u16 {
+pub(crate) fn read16(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u16 {
     unsafe {
         core::ptr::read_volatile(config_address(ecam_physical, slot, function, offset) as *const u16)
     }
 }
 
-fn read32(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u32 {
+pub(crate) fn write32(ecam_physical: usize, slot: u8, function: u8, offset: usize, value: u32) {
+    unsafe {
+        core::ptr::write_volatile(
+            config_address(ecam_physical, slot, function, offset) as *mut u32,
+            value,
+        )
+    }
+}
+
+pub(crate) fn read32(ecam_physical: usize, slot: u8, function: u8, offset: usize) -> u32 {
     unsafe {
         core::ptr::read_volatile(config_address(ecam_physical, slot, function, offset) as *const u32)
     }
 }
 
-fn write16(ecam_physical: usize, slot: u8, function: u8, offset: usize, value: u16) {
+pub(crate) fn write16(ecam_physical: usize, slot: u8, function: u8, offset: usize, value: u16) {
     unsafe {
         core::ptr::write_volatile(
             config_address(ecam_physical, slot, function, offset) as *mut u16,

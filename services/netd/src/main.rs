@@ -3,73 +3,29 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use alloc::vec;
-use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use microsystem_abi::{CapHandle, Message, Rights, Status, boot_cap, network, protocol, script};
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use microsystem_netd::config::Configuration;
 use smoltcp::socket::{tcp, udp};
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{IpAddress, Ipv4Address};
+use stack::{NetworkStack, SocketRef};
+
+mod administration;
+use microsystem_netd::dns::{dns_name_hash, encode_dns_query, parse_dns_response};
+mod config_runtime;
+mod stack;
 
 const SHARED_VA: u64 = 0x0058_0000;
 const FRAME_BYTES: usize = 4096;
-const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const SSH_PORT: u16 = 22;
-const SSH_CONNECTIONS: usize = 2;
+const SSH_CONNECTIONS: usize = 8;
 const NETWORK_SESSION_VA: u64 = 0x0059_0000;
 const NETWORK_SESSION_LIMIT: usize = 8;
 const CONNECTIONS_PER_SESSION: usize = 8;
-const OUTBOUND_CONNECTIONS: usize = 64;
-const UDP_CONNECTIONS: usize = 8;
-const SOCKET_BYTES: usize = 2048;
-const GUEST_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
-const GATEWAY_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const OUTBOUND_CONNECTIONS: usize = network::MAX_INTERFACES * stack::TCP_PER_INTERFACE;
+const UDP_CONNECTIONS: usize = network::MAX_INTERFACES * stack::UDP_PER_INTERFACE;
 const DNS_PORT: u16 = 53;
-const DNS_LOCAL_PORT: u16 = 53053;
-const DNS_SERVER: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 const DNS_PACKET_BYTES: usize = 512;
-
-struct Bytes<const N: usize>(UnsafeCell<[u8; N]>);
-unsafe impl<const N: usize> Sync for Bytes<N> {}
-
-static SSH_RX: [Bytes<16384>; SSH_CONNECTIONS] =
-    [const { Bytes(UnsafeCell::new([0; 16384])) }; SSH_CONNECTIONS];
-static SSH_TX: [Bytes<16384>; SSH_CONNECTIONS] =
-    [const { Bytes(UnsafeCell::new([0; 16384])) }; SSH_CONNECTIONS];
-struct SocketBuffers(UnsafeCell<[[u8; SOCKET_BYTES]; OUTBOUND_CONNECTIONS]>);
-unsafe impl Sync for SocketBuffers {}
-static OUTBOUND_RX: SocketBuffers =
-    SocketBuffers(UnsafeCell::new([[0; SOCKET_BYTES]; OUTBOUND_CONNECTIONS]));
-static OUTBOUND_TX: SocketBuffers =
-    SocketBuffers(UnsafeCell::new([[0; SOCKET_BYTES]; OUTBOUND_CONNECTIONS]));
-struct UdpMetadata(UnsafeCell<[[udp::PacketMetadata; 8]; UDP_CONNECTIONS]>);
-unsafe impl Sync for UdpMetadata {}
-static UDP_RX_META: UdpMetadata = UdpMetadata(UnsafeCell::new(
-    [[udp::PacketMetadata::EMPTY; 8]; UDP_CONNECTIONS],
-));
-static UDP_TX_META: UdpMetadata = UdpMetadata(UnsafeCell::new(
-    [[udp::PacketMetadata::EMPTY; 8]; UDP_CONNECTIONS],
-));
-struct DnsMetadata(UnsafeCell<[udp::PacketMetadata; NETWORK_SESSION_LIMIT]>);
-unsafe impl Sync for DnsMetadata {}
-static DNS_RX_META: DnsMetadata = DnsMetadata(UnsafeCell::new(
-    [udp::PacketMetadata::EMPTY; NETWORK_SESSION_LIMIT],
-));
-static DNS_TX_META: DnsMetadata = DnsMetadata(UnsafeCell::new(
-    [udp::PacketMetadata::EMPTY; NETWORK_SESSION_LIMIT],
-));
-struct SocketStore(
-    UnsafeCell<
-        [SocketStorage<'static>; OUTBOUND_CONNECTIONS + UDP_CONNECTIONS + SSH_CONNECTIONS + 1],
-    >,
-);
-unsafe impl Sync for SocketStore {}
-static SOCKET_STORAGE: SocketStore = SocketStore(UnsafeCell::new(
-    [SocketStorage::EMPTY; OUTBOUND_CONNECTIONS + UDP_CONNECTIONS + SSH_CONNECTIONS + 1],
-));
 
 #[derive(Clone, Copy)]
 enum Connection {
@@ -83,10 +39,13 @@ struct NetworkSession {
     token: u64,
     region: CapHandle,
     connections: [Connection; CONNECTIONS_PER_SESSION],
+    generations: [u32; CONNECTIONS_PER_SESSION],
     query_id: u16,
     query_hash: u64,
-    query_address: u32,
+    query_address: Option<IpAddress>,
+    query_type: u16,
     query_failed: bool,
+    query_port: usize,
     next_query_id: u16,
 }
 
@@ -95,10 +54,13 @@ impl NetworkSession {
         token: 0,
         region: CapHandle::INVALID,
         connections: [Connection::Empty; CONNECTIONS_PER_SESSION],
+        generations: [0; CONNECTIONS_PER_SESSION],
         query_id: 0,
         query_hash: 0,
-        query_address: 0,
+        query_address: None,
+        query_type: 1,
         query_failed: false,
+        query_port: 0,
         next_query_id: 1,
     };
 }
@@ -114,100 +76,87 @@ pub extern "C" fn _start() -> ! {
     microsystem_user_rt::frame_map(frame, SHARED_VA, Rights(Rights::READ.0 | Rights::WRITE.0))
         .unwrap_or_else(|_| microsystem_user_rt::exit(3));
 
-    let mut device = DirectNetwork::new();
     let mut seed = [0u8; 8];
     microsystem_user_rt::random_fill(boot_cap::RANDOM_SOURCE, &mut seed)
         .unwrap_or_else(|_| microsystem_user_rt::exit(4));
-    let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(MAC)));
-    config.random_seed = u64::from_le_bytes(seed);
-    let mut interface = Interface::new(config, &mut device, now());
-    interface.update_ip_addrs(|addresses| {
-        addresses
-            .push(IpCidr::new(IpAddress::Ipv4(GUEST_IPV4), 24))
-            .unwrap();
-    });
-    interface
-        .routes_mut()
-        .add_default_ipv4_route(GATEWAY_IPV4)
-        .unwrap();
-
-    let socket_storage = unsafe { &mut *SOCKET_STORAGE.0.get() };
-    let mut sockets = SocketSet::new(&mut socket_storage[..]);
-    let first_ssh = sockets.add(ssh_socket(0));
-    let mut ssh = [first_ssh; SSH_CONNECTIONS];
-    for index in 0..SSH_CONNECTIONS {
-        if index != 0 {
-            ssh[index] = sockets.add(ssh_socket(index));
+    let configuration_deadline = microsystem_user_rt::clock_now()
+        .unwrap_or(0)
+        .saturating_add(110_000_000_000);
+    let configuration = loop {
+        match config_runtime::load() {
+            Ok(configuration) => break configuration,
+            Err(Status::NotFound) => break Configuration::default(),
+            Err(status)
+                if matches!(status, Status::TimedOut | Status::Busy | Status::Io)
+                    && microsystem_user_rt::clock_now().unwrap_or(configuration_deadline)
+                        < configuration_deadline =>
+            {
+                let _ = microsystem_user_rt::yield_now();
+            }
+            Err(_) => {
+                let _ = microsystem_user_rt::debug_write(
+                    b"[net] persisted configuration unavailable; using DHCP/SLAAC\n",
+                );
+                break Configuration::default();
+            }
         }
-        sockets
-            .get_mut::<tcp::Socket>(ssh[index])
-            .listen(SSH_PORT)
-            .unwrap_or_else(|_| microsystem_user_rt::exit(5));
-    }
-    let mut outbound = [first_ssh; OUTBOUND_CONNECTIONS];
-    for index in 0..OUTBOUND_CONNECTIONS {
-        let rx = unsafe { &mut *core::ptr::addr_of_mut!((*OUTBOUND_RX.0.get())[index]) };
-        let tx = unsafe { &mut *core::ptr::addr_of_mut!((*OUTBOUND_TX.0.get())[index]) };
-        let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(&mut rx[..]),
-            tcp::SocketBuffer::new(&mut tx[..]),
-        );
-        outbound[index] = sockets.add(socket);
-    }
-    let mut datagrams = [first_ssh; UDP_CONNECTIONS];
-    for index in 0..UDP_CONNECTIONS {
-        let rx_meta = unsafe { &mut *core::ptr::addr_of_mut!((*UDP_RX_META.0.get())[index]) };
-        let tx_meta = unsafe { &mut *core::ptr::addr_of_mut!((*UDP_TX_META.0.get())[index]) };
-        let rx = Box::leak(vec![0; network::MAX_TRANSFER_BYTES].into_boxed_slice());
-        let tx = Box::leak(vec![0; network::MAX_TRANSFER_BYTES].into_boxed_slice());
-        let socket = udp::Socket::new(
-            udp::PacketBuffer::new(&mut rx_meta[..], &mut rx[..]),
-            udp::PacketBuffer::new(&mut tx_meta[..], &mut tx[..]),
-        );
-        datagrams[index] = sockets.add(socket);
-    }
-    let dns_rx_meta = unsafe { &mut *DNS_RX_META.0.get() };
-    let dns_tx_meta = unsafe { &mut *DNS_TX_META.0.get() };
-    let dns_rx = Box::leak(vec![0; DNS_PACKET_BYTES * NETWORK_SESSION_LIMIT].into_boxed_slice());
-    let dns_tx = Box::leak(vec![0; DNS_PACKET_BYTES * NETWORK_SESSION_LIMIT].into_boxed_slice());
-    let mut dns_socket = udp::Socket::new(
-        udp::PacketBuffer::new(&mut dns_rx_meta[..], dns_rx),
-        udp::PacketBuffer::new(&mut dns_tx_meta[..], dns_tx),
-    );
-    dns_socket
-        .bind(DNS_LOCAL_PORT)
+    };
+    let mut sockets = NetworkStack::new(configuration, u64::from_le_bytes(seed))
         .unwrap_or_else(|_| microsystem_user_rt::exit(5));
-    let dns = sockets.add(dns_socket);
+    let outbound: [SocketRef; OUTBOUND_CONNECTIONS] = sockets
+        .ports
+        .iter()
+        .flat_map(|port| port.outbound.iter().copied())
+        .collect::<alloc::vec::Vec<_>>()
+        .try_into()
+        .unwrap();
+    let datagrams: [SocketRef; UDP_CONNECTIONS] = sockets
+        .ports
+        .iter()
+        .flat_map(|port| port.datagrams.iter().copied())
+        .collect::<alloc::vec::Vec<_>>()
+        .try_into()
+        .unwrap();
+    let ssh: [SocketRef; SSH_CONNECTIONS] = sockets
+        .ports
+        .iter()
+        .flat_map(|port| port.ssh.iter().copied())
+        .collect::<alloc::vec::Vec<_>>()
+        .try_into()
+        .unwrap();
     let mut sessions = [NetworkSession::EMPTY; NETWORK_SESSION_LIMIT];
     let mut pending_ssh = None;
     let mut pending_network = None;
-
     let _ = microsystem_user_rt::debug_write(
-        b"[net] netd ready ipv4=10.0.2.15 outbound=true raw-device-isolated=true tcp-owner=true dns=true tcp=64 udp=8\n",
+        b"[net] interfaces initialized; DHCP/SLAAC acquisition asynchronous=true\n",
     );
     let _ = microsystem_user_rt::service_online();
-
     loop {
-        interface.poll(now(), &mut device, &mut sockets);
-        if service_ssh(
-            &mut interface,
-            &mut device,
-            &mut sockets,
-            &ssh,
-            frame,
-            &mut pending_ssh,
-        )
-        .is_err()
-        {
+        let reset = sockets.poll();
+        if reset != 0 {
+            for session in &mut sessions {
+                for connection in &mut session.connections {
+                    let port = match *connection {
+                        Connection::Tcp(index) => Some(outbound[index as usize].port),
+                        Connection::Udp(index) => Some(datagrams[index as usize].port),
+                        Connection::Empty => None,
+                    };
+                    if port.is_some_and(|port| reset & (1 << port) != 0) {
+                        *connection = Connection::Empty;
+                    }
+                }
+                if session.query_id != 0 && reset & (1 << session.query_port) != 0 {
+                    session.query_failed = true;
+                }
+            }
+        }
+        if service_ssh(&mut sockets, &ssh, frame, &mut pending_ssh).is_err() {
             microsystem_user_rt::exit(6);
         }
         if service_network(
-            &mut interface,
-            &mut device,
             &mut sockets,
             &outbound,
             &datagrams,
-            dns,
             &mut sessions,
             &mut pending_network,
         )
@@ -219,20 +168,9 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn ssh_socket(index: usize) -> tcp::Socket<'static> {
-    let rx = unsafe { &mut *SSH_RX[index].0.get() };
-    let tx = unsafe { &mut *SSH_TX[index].0.get() };
-    tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut rx[..]),
-        tcp::SocketBuffer::new(&mut tx[..]),
-    )
-}
-
 fn service_ssh(
-    interface: &mut Interface,
-    device: &mut DirectNetwork,
-    sockets: &mut SocketSet<'static>,
-    ssh: &[SocketHandle; SSH_CONNECTIONS],
+    sockets: &mut NetworkStack,
+    ssh: &[SocketRef; SSH_CONNECTIONS],
     frame: microsystem_abi::CapHandle,
     pending: &mut Option<Message>,
 ) -> Result<(), Status> {
@@ -250,7 +188,6 @@ fn service_ssh(
     };
     let mut reply = Message::new(protocol::NETWORK, request.opcode);
     reply.words[5] = handle_ssh(&request, &mut reply, sockets, ssh, frame) as i64 as u64;
-    interface.poll(now(), device, sockets);
     let deadline = microsystem_user_rt::clock_now()?;
     match microsystem_user_rt::ipc_reply_recv(
         boot_cap::SSH_NETWORK_ENDPOINT,
@@ -268,8 +205,8 @@ fn service_ssh(
 fn handle_ssh(
     request: &Message,
     reply: &mut Message,
-    sockets: &mut SocketSet<'static>,
-    ssh: &[SocketHandle; SSH_CONNECTIONS],
+    sockets: &mut NetworkStack,
+    ssh: &[SocketRef; SSH_CONNECTIONS],
     frame: microsystem_abi::CapHandle,
 ) -> Status {
     if request.protocol != protocol::NETWORK {
@@ -346,11 +283,18 @@ fn handle_ssh(
             };
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             if request.words[1] == 0 {
-                socket.abort();
-                return socket
-                    .listen(SSH_PORT)
-                    .map(|()| Status::Ok)
-                    .unwrap_or(Status::Io);
+                return match socket.state() {
+                    tcp::State::Listen => Status::Ok,
+                    tcp::State::Closed if socket.remote_endpoint().is_none() => socket
+                        .listen(SSH_PORT)
+                        .map(|()| Status::Ok)
+                        .unwrap_or(Status::Io),
+                    tcp::State::Closed => Status::Busy,
+                    _ => {
+                        socket.abort();
+                        Status::Busy
+                    }
+                };
             }
             match socket.state() {
                 tcp::State::Listen => Status::Ok,
@@ -380,7 +324,7 @@ fn handle_ssh(
     }
 }
 
-fn ssh_connection(ssh: &[SocketHandle; SSH_CONNECTIONS], connection: u64) -> Option<SocketHandle> {
+fn ssh_connection(ssh: &[SocketRef; SSH_CONNECTIONS], connection: u64) -> Option<SocketRef> {
     connection
         .checked_sub(1)
         .and_then(|index| ssh.get(index as usize))
@@ -388,12 +332,9 @@ fn ssh_connection(ssh: &[SocketHandle; SSH_CONNECTIONS], connection: u64) -> Opt
 }
 
 fn service_network(
-    interface: &mut Interface,
-    device: &mut DirectNetwork,
-    sockets: &mut SocketSet<'static>,
-    outbound: &[SocketHandle; OUTBOUND_CONNECTIONS],
-    datagrams: &[SocketHandle; UDP_CONNECTIONS],
-    dns_handle: SocketHandle,
+    sockets: &mut NetworkStack,
+    outbound: &[SocketRef; OUTBOUND_CONNECTIONS],
+    datagrams: &[SocketRef; UDP_CONNECTIONS],
     sessions: &mut [NetworkSession; NETWORK_SESSION_LIMIT],
     pending: &mut Option<Message>,
 ) -> Result<(), Status> {
@@ -409,10 +350,8 @@ fn service_network(
         }
     };
     let mut reply = Message::new(protocol::NETWORK, request.opcode);
-    reply.words[5] = handle_network(
-        &request, &mut reply, interface, sockets, outbound, datagrams, dns_handle, sessions,
-    ) as i64 as u64;
-    interface.poll(now(), device, sockets);
+    reply.words[5] =
+        handle_network(&request, &mut reply, sockets, outbound, datagrams, sessions) as i64 as u64;
     let deadline = microsystem_user_rt::clock_now()?;
     match microsystem_user_rt::ipc_reply_recv(
         boot_cap::NETWORK_ENDPOINT,
@@ -430,20 +369,41 @@ fn service_network(
 fn handle_network(
     request: &Message,
     reply: &mut Message,
-    interface: &mut Interface,
-    sockets: &mut SocketSet<'static>,
-    outbound: &[SocketHandle; OUTBOUND_CONNECTIONS],
-    datagrams: &[SocketHandle; UDP_CONNECTIONS],
-    dns_handle: SocketHandle,
+    sockets: &mut NetworkStack,
+    outbound: &[SocketRef; OUTBOUND_CONNECTIONS],
+    datagrams: &[SocketRef; UDP_CONNECTIONS],
     sessions: &mut [NetworkSession; NETWORK_SESSION_LIMIT],
 ) -> Status {
     if request.protocol != protocol::NETWORK {
         return Status::Invalid;
     }
+    if request.opcode == network::Operation::Configure as u16 {
+        return administration::handle(request, reply, sockets);
+    }
     if request.opcode == network::Operation::Stats as u16 {
-        reply.words[0] = u32::from_be_bytes(GUEST_IPV4.octets()) as u64;
-        reply.words[1] = u32::from_be_bytes(GATEWAY_IPV4.octets()) as u64;
-        reply.words[2] = u32::from_be_bytes(DNS_SERVER.octets()) as u64;
+        if let Some(index) = sockets.default_port() {
+            let port = &mut sockets.ports[index];
+            reply.words[0] = port
+                .interface
+                .ipv4_addr()
+                .map(|address| u32::from_be_bytes(address.octets()) as u64)
+                .unwrap_or(0);
+            port.interface.routes_mut().update(|routes| {
+                reply.words[1] = routes
+                    .iter()
+                    .find_map(|route| match route.via_router {
+                        IpAddress::Ipv4(address) if route.cidr.prefix_len() == 0 => {
+                            Some(u32::from_be_bytes(address.octets()) as u64)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+            });
+            reply.words[2] = match port.dns_server {
+                Some(IpAddress::Ipv4(address)) => u32::from_be_bytes(address.octets()) as u64,
+                _ => 0,
+            };
+        }
         reply.words[3] = sessions.iter().filter(|session| session.token != 0).count() as u64;
         let active_connections = active_connection_count(sessions) as u64;
         reply.words[4] = (network::MAX_CONNECTIONS as u64) << 32 | active_connections;
@@ -453,14 +413,7 @@ fn handle_network(
         return register_network_session(request, sessions);
     }
     if request.opcode == network::Operation::CloseSession as u16 {
-        return close_network_session(
-            request.words[0],
-            sockets,
-            outbound,
-            datagrams,
-            dns_handle,
-            sessions,
-        );
+        return close_network_session(request.words[0], sockets, outbound, datagrams, sessions);
     }
     let token = request.words[0];
     let Some(session_index) = sessions
@@ -482,11 +435,9 @@ fn handle_network(
     let status = handle_mapped_network(
         request,
         reply,
-        interface,
         sockets,
         outbound,
         datagrams,
-        dns_handle,
         sessions,
         session_index,
     );
@@ -537,10 +488,9 @@ fn register_network_session(
 
 fn close_network_session(
     token: u64,
-    sockets: &mut SocketSet<'static>,
-    outbound: &[SocketHandle; OUTBOUND_CONNECTIONS],
-    datagrams: &[SocketHandle; UDP_CONNECTIONS],
-    dns_handle: SocketHandle,
+    sockets: &mut NetworkStack,
+    outbound: &[SocketRef; OUTBOUND_CONNECTIONS],
+    datagrams: &[SocketRef; UDP_CONNECTIONS],
     sessions: &mut [NetworkSession; NETWORK_SESSION_LIMIT],
 ) -> Status {
     let Some(index) = sessions
@@ -560,7 +510,6 @@ fn close_network_session(
             Connection::Empty => {}
         }
     }
-    let _ = dns_handle;
     let region = sessions[index].region;
     sessions[index] = NetworkSession::EMPTY;
     microsystem_user_rt::cap_delete(region)
@@ -571,11 +520,9 @@ fn close_network_session(
 fn handle_mapped_network(
     request: &Message,
     reply: &mut Message,
-    interface: &mut Interface,
-    sockets: &mut SocketSet<'static>,
-    outbound: &[SocketHandle; OUTBOUND_CONNECTIONS],
-    datagrams: &[SocketHandle; UDP_CONNECTIONS],
-    dns_handle: SocketHandle,
+    sockets: &mut NetworkStack,
+    outbound: &[SocketRef; OUTBOUND_CONNECTIONS],
+    datagrams: &[SocketRef; UDP_CONNECTIONS],
     sessions: &mut [NetworkSession; NETWORK_SESSION_LIMIT],
     session_index: usize,
 ) -> Status {
@@ -637,22 +584,36 @@ fn handle_mapped_network(
             if !network_host_allowed(source, policy, host, None, browse) {
                 return Status::AccessDenied;
             }
-            drain_dns_replies(sockets, dns_handle, sessions);
+            drain_dns_replies(sockets, sessions);
             let query_id = request.words[1] as u16;
             if query_id == 0 {
                 if sessions[session_index].query_id != 0 {
                     reply.words[0] = sessions[session_index].query_id as u64;
                     return Status::Busy;
                 }
+                let Some(port) = sockets.default_port() else {
+                    return Status::Busy;
+                };
+                let Some(server) = sockets.ports[port].dns_server else {
+                    return Status::Busy;
+                };
+                let dns_handle = sockets.ports[port].dns;
                 let sequence = sessions[session_index].next_query_id.max(1) & 0x0fff;
                 let id = (((session_index + 1) as u16) << 12) | sequence;
                 let mut packet = [0u8; DNS_PACKET_BYTES];
-                let Some(bytes) = encode_dns_query(id, host, &mut packet) else {
+                let query_type = if request.words[2] == 6 {
+                    28
+                } else if request.words[2] == 0 || request.words[2] == 4 {
+                    1
+                } else {
+                    return Status::Invalid;
+                };
+                let Some(bytes) = encode_dns_query(id, host, query_type, &mut packet) else {
                     return Status::Invalid;
                 };
                 match sockets
                     .get_mut::<udp::Socket>(dns_handle)
-                    .send_slice(&packet[..bytes], (IpAddress::Ipv4(DNS_SERVER), DNS_PORT))
+                    .send_slice(&packet[..bytes], (server, DNS_PORT))
                 {
                     Ok(()) => {}
                     Err(udp::SendError::BufferFull) => return Status::Busy,
@@ -660,8 +621,10 @@ fn handle_mapped_network(
                 }
                 sessions[session_index].next_query_id = id.wrapping_add(1).max(1);
                 sessions[session_index].query_id = id;
+                sessions[session_index].query_port = port;
                 sessions[session_index].query_hash = dns_name_hash(host.as_bytes());
-                sessions[session_index].query_address = 0;
+                sessions[session_index].query_type = query_type;
+                sessions[session_index].query_address = None;
                 sessions[session_index].query_failed = false;
                 reply.words[0] = id as u64;
                 return Status::Busy;
@@ -674,13 +637,24 @@ fn handle_mapped_network(
                 sessions[session_index].query_failed = false;
                 return Status::NotFound;
             }
-            if sessions[session_index].query_address == 0 {
+            if sessions[session_index].query_address.is_none() {
                 reply.words[0] = query_id as u64;
                 return Status::Busy;
             }
-            reply.words[0] = sessions[session_index].query_address as u64;
+            match sessions[session_index].query_address.unwrap() {
+                IpAddress::Ipv4(address) => {
+                    reply.words[0] = u32::from_be_bytes(address.octets()) as u64;
+                    reply.words[2] = 4;
+                }
+                IpAddress::Ipv6(address) => {
+                    let bytes = address.octets();
+                    reply.words[0] = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                    reply.words[1] = u64::from_be_bytes(bytes[8..].try_into().unwrap());
+                    reply.words[2] = 6;
+                }
+            }
             sessions[session_index].query_id = 0;
-            sessions[session_index].query_address = 0;
+            sessions[session_index].query_address = None;
             Status::Ok
         }
         value if value == network::Operation::TcpConnect as u16 => {
@@ -698,6 +672,9 @@ fn handle_mapped_network(
                 return Status::AccessDenied;
             }
             if local_handle == 0 {
+                if active_connection_count(sessions) >= network::MAX_CONNECTIONS {
+                    return Status::NoMemory;
+                }
                 let Some(connection_slot) = sessions[session_index]
                     .connections
                     .iter()
@@ -705,16 +682,23 @@ fn handle_mapped_network(
                 else {
                     return Status::NoMemory;
                 };
-                let Some(global) = free_outbound_connection(sessions) else {
+                let address = match request_address(host, request.words[2], &payload[host_bytes..])
+                {
+                    Some(address) => address,
+                    None => return Status::Invalid,
+                };
+                let Some(port) = sockets.route(address) else {
+                    return Status::Busy;
+                };
+                let Some(global) = free_outbound_connection(sessions, port) else {
                     return Status::NoMemory;
                 };
-                let address = Ipv4Address::from_octets(u32::to_be_bytes(request.words[2] as u32));
-                let local_port = 49152 + global as u16;
+                let local_port = sockets.allocate_tcp_port(port);
                 if sockets
-                    .get_mut::<tcp::Socket>(outbound[global])
                     .connect(
-                        interface.context(),
-                        (IpAddress::Ipv4(address), port),
+                        outbound[global],
+                        address,
+                        request.words[3] as u16,
                         local_port,
                     )
                     .is_err()
@@ -723,7 +707,8 @@ fn handle_mapped_network(
                 }
                 sessions[session_index].connections[connection_slot] =
                     Connection::Tcp(global as u8);
-                reply.words[0] = connection_slot as u64 + 1;
+                reply.words[0] =
+                    new_connection_handle(&mut sessions[session_index], connection_slot);
                 return Status::Busy;
             }
             let Some(global) = tcp_session_connection(&sessions[session_index], local_handle)
@@ -796,11 +781,21 @@ fn handle_mapped_network(
                 return Status::NotFound;
             };
             sockets.get_mut::<tcp::Socket>(outbound[global]).abort();
-            sessions[session_index].connections[local - 1] = Connection::Empty;
+            let slot = connection_slot(&sessions[session_index], local).unwrap();
+            sessions[session_index].connections[slot] = Connection::Empty;
             Status::Ok
         }
         value if value == network::Operation::UdpOpen as u16 => {
             if active_connection_count(sessions) >= network::MAX_CONNECTIONS {
+                return Status::NoMemory;
+            }
+            if sessions
+                .iter()
+                .flat_map(|session| session.connections.iter())
+                .filter(|connection| matches!(connection, Connection::Udp(_)))
+                .count()
+                >= 8
+            {
                 return Status::NoMemory;
             }
             let Some(local_slot) = sessions[session_index]
@@ -810,7 +805,21 @@ fn handle_mapped_network(
             else {
                 return Status::NoMemory;
             };
-            let Some(global) = free_udp_connection(sessions) else {
+            let port = if request.words[2] == 0 {
+                sockets.default_port()
+            } else {
+                request.words[2].checked_sub(1).and_then(|index| {
+                    sockets
+                        .ports
+                        .get(index as usize)
+                        .filter(|port| port.available())
+                        .map(|_| index as usize)
+                })
+            };
+            let Some(port) = port else {
+                return Status::Busy;
+            };
+            let Some(global) = free_udp_connection(sessions, port) else {
                 return Status::NoMemory;
             };
             let requested_port = request.words[1] as u16;
@@ -827,13 +836,12 @@ fn handle_mapped_network(
                 return Status::Io;
             }
             sessions[session_index].connections[local_slot] = Connection::Udp(global as u8);
-            reply.words[0] = local_slot as u64 + 1;
+            reply.words[0] = new_connection_handle(&mut sessions[session_index], local_slot);
             reply.words[1] = port as u64;
             Status::Ok
         }
         value if value == network::Operation::UdpSendTo as u16 => {
             let local = request.words[1] as usize;
-            let address = Ipv4Address::from_octets(u32::to_be_bytes(request.words[2] as u32));
             let port = request.words[3] as u16;
             let host_bytes = request.words[4] as usize;
             let data_bytes = request.words[5] as usize;
@@ -853,11 +861,31 @@ fn handle_mapped_network(
             if !network_host_allowed(source, policy, host, Some(port), false) {
                 return Status::AccessDenied;
             }
+            let address = match request_address(host, request.words[2], &payload[host_bytes..]) {
+                Some(address) => address,
+                None => return Status::Invalid,
+            };
+            let data_offset = host_bytes
+                + if request.words[2] == network::IPV6_ADDRESS {
+                    16
+                } else {
+                    0
+                };
+            if data_offset.saturating_add(data_bytes) > payload.len() {
+                return Status::Invalid;
+            }
+            let maximum = match address {
+                IpAddress::Ipv4(_) => 1472,
+                IpAddress::Ipv6(_) => 1452,
+            };
+            if data_bytes > maximum {
+                return Status::Invalid;
+            }
             match sockets
                 .get_mut::<udp::Socket>(datagrams[global])
                 .send_slice(
-                    &payload[host_bytes..host_bytes + data_bytes],
-                    (IpAddress::Ipv4(address), port),
+                    &payload[data_offset..data_offset + data_bytes],
+                    (address, port),
                 ) {
                 Ok(()) => {
                     reply.words[0] = data_bytes as u64;
@@ -881,9 +909,18 @@ fn handle_mapped_network(
                 .recv_slice(&mut payload[..maximum])
             {
                 Ok((bytes, endpoint)) => {
-                    let IpAddress::Ipv4(address) = endpoint.endpoint.addr;
+                    match endpoint.endpoint.addr {
+                        IpAddress::Ipv4(address) => {
+                            reply.words[1] = u32::from_be_bytes(address.octets()) as u64
+                        }
+                        IpAddress::Ipv6(address) => {
+                            let bytes = address.octets();
+                            reply.words[1] = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                            reply.words[3] = u64::from_be_bytes(bytes[8..].try_into().unwrap());
+                            reply.words[4] = 6;
+                        }
+                    }
                     reply.words[0] = bytes as u64;
-                    reply.words[1] = u32::from_be_bytes(address.octets()) as u64;
                     reply.words[2] = endpoint.endpoint.port as u64;
                     Status::Ok
                 }
@@ -897,13 +934,14 @@ fn handle_mapped_network(
                 return Status::NotFound;
             };
             sockets.get_mut::<udp::Socket>(datagrams[global]).close();
-            sessions[session_index].connections[local - 1] = Connection::Empty;
+            let slot = connection_slot(&sessions[session_index], local).unwrap();
+            sessions[session_index].connections[slot] = Connection::Empty;
             Status::Ok
         }
         value if value == network::Operation::Cancel as u16 => {
             sessions[session_index].query_id = 0;
             sessions[session_index].query_hash = 0;
-            sessions[session_index].query_address = 0;
+            sessions[session_index].query_address = None;
             sessions[session_index].query_failed = false;
             Status::Ok
         }
@@ -912,163 +950,60 @@ fn handle_mapped_network(
     }
 }
 
-fn encode_dns_query(id: u16, host: &str, output: &mut [u8; DNS_PACKET_BYTES]) -> Option<usize> {
-    if host.is_empty() || host.len() > 253 {
-        return None;
-    }
-    output[..12].fill(0);
-    output[..2].copy_from_slice(&id.to_be_bytes());
-    output[2] = 0x01;
-    output[5] = 1;
-    let mut cursor = 12usize;
-    for label in host.split('.') {
-        if label.is_empty() || label.len() > 63 || cursor + 1 + label.len() + 5 > output.len() {
-            return None;
-        }
-        output[cursor] = label.len() as u8;
-        cursor += 1;
-        output[cursor..cursor + label.len()].copy_from_slice(label.as_bytes());
-        cursor += label.len();
-    }
-    output[cursor] = 0;
-    cursor += 1;
-    output[cursor..cursor + 2].copy_from_slice(&1u16.to_be_bytes());
-    output[cursor + 2..cursor + 4].copy_from_slice(&1u16.to_be_bytes());
-    Some(cursor + 4)
-}
-
 fn drain_dns_replies(
-    sockets: &mut SocketSet<'static>,
-    dns_handle: SocketHandle,
+    sockets: &mut NetworkStack,
     sessions: &mut [NetworkSession; NETWORK_SESSION_LIMIT],
 ) {
     let mut packet = [0u8; DNS_PACKET_BYTES];
-    loop {
-        let received = sockets
-            .get_mut::<udp::Socket>(dns_handle)
-            .recv_slice(&mut packet);
-        let Ok((bytes, endpoint)) = received else {
-            break;
-        };
-        if endpoint.endpoint.addr != IpAddress::Ipv4(DNS_SERVER)
-            || endpoint.endpoint.port != DNS_PORT
-            || bytes < 12
-        {
-            continue;
-        }
-        let id = u16::from_be_bytes([packet[0], packet[1]]);
-        let Some(session) = sessions
-            .iter_mut()
-            .find(|session| session.query_id == id && id != 0)
-        else {
-            continue;
-        };
-        match parse_dns_response(&packet[..bytes], id, session.query_hash) {
-            Some(address) => session.query_address = address,
-            None => session.query_failed = true,
-        }
-    }
-}
-
-fn parse_dns_response(packet: &[u8], id: u16, expected_name: u64) -> Option<u32> {
-    if packet.len() < 12
-        || u16::from_be_bytes([packet[0], packet[1]]) != id
-        || packet[2] & 0x80 == 0
-        || packet[3] & 0x0f != 0
-        || u16::from_be_bytes([packet[4], packet[5]]) != 1
-    {
-        return None;
-    }
-    let answers = u16::from_be_bytes([packet[6], packet[7]]) as usize;
-    let mut cursor = 12usize;
-    let question_start = cursor;
-    cursor = skip_dns_name(packet, cursor)?;
-    if dns_wire_name_hash(&packet[question_start..cursor])? != expected_name
-        || cursor.checked_add(4)? > packet.len()
-        || u16::from_be_bytes([packet[cursor], packet[cursor + 1]]) != 1
-        || u16::from_be_bytes([packet[cursor + 2], packet[cursor + 3]]) != 1
-    {
-        return None;
-    }
-    cursor += 4;
-    for _ in 0..answers {
-        cursor = skip_dns_name(packet, cursor)?;
-        if cursor.checked_add(10)? > packet.len() {
-            return None;
-        }
-        let kind = u16::from_be_bytes([packet[cursor], packet[cursor + 1]]);
-        let class = u16::from_be_bytes([packet[cursor + 2], packet[cursor + 3]]);
-        let bytes = u16::from_be_bytes([packet[cursor + 8], packet[cursor + 9]]) as usize;
-        cursor += 10;
-        let end = cursor.checked_add(bytes)?;
-        if end > packet.len() {
-            return None;
-        }
-        if kind == 1 && class == 1 && bytes == 4 {
-            return Some(u32::from_be_bytes(packet[cursor..end].try_into().ok()?));
-        }
-        cursor = end;
-    }
-    None
-}
-
-fn skip_dns_name(packet: &[u8], mut cursor: usize) -> Option<usize> {
-    loop {
-        let length = *packet.get(cursor)?;
-        if length & 0xc0 == 0xc0 {
-            return cursor.checked_add(2).filter(|end| *end <= packet.len());
-        }
-        cursor += 1;
-        if length == 0 {
-            return Some(cursor);
-        }
-        if length > 63 {
-            return None;
-        }
-        cursor = cursor.checked_add(length as usize)?;
-        if cursor > packet.len() {
-            return None;
+    for port in 0..sockets.ports.len() {
+        let dns_handle = sockets.ports[port].dns;
+        let server = sockets.ports[port].dns_server;
+        loop {
+            let received = sockets
+                .get_mut::<udp::Socket>(dns_handle)
+                .recv_slice(&mut packet);
+            let Ok((bytes, endpoint)) = received else {
+                break;
+            };
+            if Some(endpoint.endpoint.addr) != server
+                || endpoint.endpoint.port != DNS_PORT
+                || bytes < 12
+            {
+                continue;
+            }
+            let id = u16::from_be_bytes([packet[0], packet[1]]);
+            let Some(session) = sessions
+                .iter_mut()
+                .find(|session| session.query_id == id && id != 0 && session.query_port == port)
+            else {
+                continue;
+            };
+            match parse_dns_response(&packet[..bytes], id, session.query_hash, session.query_type) {
+                Some(address) => session.query_address = Some(address),
+                None => session.query_failed = true,
+            }
         }
     }
 }
 
-fn dns_wire_name_hash(name: &[u8]) -> Option<u64> {
-    let mut cursor = 0usize;
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut separator = false;
-    loop {
-        let length = *name.get(cursor)? as usize;
-        cursor += 1;
-        if length == 0 {
-            return (cursor == name.len()).then_some(hash);
-        }
-        if length > 63 || cursor.checked_add(length)? > name.len() {
-            return None;
-        }
-        if separator {
-            hash ^= b'.' as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-        for byte in &name[cursor..cursor + length] {
-            hash ^= byte.to_ascii_lowercase() as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-        separator = true;
-        cursor += length;
+fn request_address(host: &str, word: u64, extra: &[u8]) -> Option<IpAddress> {
+    if word == network::IPV6_ADDRESS {
+        return Some(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(
+            extra.get(..16)?.try_into().ok()?,
+        )));
     }
+    host.parse::<IpAddress>().ok().or_else(|| {
+        Some(IpAddress::Ipv4(Ipv4Address::from_octets(
+            (word as u32).to_be_bytes(),
+        )))
+    })
 }
 
-fn dns_name_hash(name: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name {
-        hash ^= byte.to_ascii_lowercase() as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
-}
-
-fn free_outbound_connection(sessions: &[NetworkSession; NETWORK_SESSION_LIMIT]) -> Option<usize> {
-    (0..OUTBOUND_CONNECTIONS).find(|candidate| {
+fn free_outbound_connection(
+    sessions: &[NetworkSession; NETWORK_SESSION_LIMIT],
+    port: usize,
+) -> Option<usize> {
+    (port * stack::TCP_PER_INTERFACE..(port + 1) * stack::TCP_PER_INTERFACE).find(|candidate| {
         sessions.iter().all(|session| {
             !session
                 .connections
@@ -1079,7 +1014,7 @@ fn free_outbound_connection(sessions: &[NetworkSession; NETWORK_SESSION_LIMIT]) 
 }
 
 fn tcp_session_connection(session: &NetworkSession, local: usize) -> Option<usize> {
-    let index = local.checked_sub(1)?;
+    let index = connection_slot(session, local)?;
     match *session.connections.get(index)? {
         Connection::Tcp(global) => Some(global as usize),
         _ => None,
@@ -1087,15 +1022,35 @@ fn tcp_session_connection(session: &NetworkSession, local: usize) -> Option<usiz
 }
 
 fn udp_session_connection(session: &NetworkSession, local: usize) -> Option<usize> {
-    let index = local.checked_sub(1)?;
+    let index = connection_slot(session, local)?;
     match *session.connections.get(index)? {
         Connection::Udp(global) => Some(global as usize),
         _ => None,
     }
 }
 
-fn free_udp_connection(sessions: &[NetworkSession; NETWORK_SESSION_LIMIT]) -> Option<usize> {
-    (0..UDP_CONNECTIONS).find(|candidate| sessions.iter().all(|session| !session.connections.iter().any(|connection| matches!(connection, Connection::Udp(index) if *index as usize == *candidate))))
+fn new_connection_handle(session: &mut NetworkSession, slot: usize) -> u64 {
+    session.generations[slot] = session.generations[slot].wrapping_add(1).max(1) & 0x7fff_ffff;
+    session.generations[slot] = session.generations[slot].max(1);
+    (u64::from(session.generations[slot]) << 32) | slot as u64 + 1
+}
+
+fn connection_slot(session: &NetworkSession, handle: usize) -> Option<usize> {
+    let slot = (handle as u32).checked_sub(1)? as usize;
+    let generation = (handle as u64 >> 32) as u32;
+    (generation != 0
+        && session
+            .generations
+            .get(slot)
+            .is_some_and(|stored| *stored == generation))
+    .then_some(slot)
+}
+
+fn free_udp_connection(
+    sessions: &[NetworkSession; NETWORK_SESSION_LIMIT],
+    port: usize,
+) -> Option<usize> {
+    (port * stack::UDP_PER_INTERFACE..(port + 1) * stack::UDP_PER_INTERFACE).find(|candidate| sessions.iter().all(|session| !session.connections.iter().any(|connection| matches!(connection, Connection::Udp(index) if *index as usize == *candidate))))
 }
 
 fn active_connection_count(sessions: &[NetworkSession; NETWORK_SESSION_LIMIT]) -> usize {
@@ -1158,83 +1113,6 @@ fn network_rules_allow(
         }
     }
     false
-}
-
-struct DirectNetwork {
-    rx: [u8; 1536],
-    tx: [u8; 1536],
-    received: usize,
-}
-
-impl DirectNetwork {
-    const fn new() -> Self {
-        Self {
-            rx: [0; 1536],
-            tx: [0; 1536],
-            received: 0,
-        }
-    }
-}
-
-struct DirectRx<'a>(&'a [u8]);
-struct DirectTx<'a>(&'a mut [u8]);
-
-impl Device for DirectNetwork {
-    type RxToken<'a>
-        = DirectRx<'a>
-    where
-        Self: 'a;
-    type TxToken<'a>
-        = DirectTx<'a>
-    where
-        Self: 'a;
-
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.received =
-            match microsystem_user_rt::net_receive(boot_cap::NETWORK_DEVICE, &mut self.rx) {
-                Ok(bytes) => bytes,
-                Err(Status::Busy) => return None,
-                Err(_) => return None,
-            };
-        (self.received > 0).then(|| (DirectRx(&self.rx[..self.received]), DirectTx(&mut self.tx)))
-    }
-
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(DirectTx(&mut self.tx))
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = 1500;
-        capabilities.medium = Medium::Ethernet;
-        capabilities
-    }
-}
-
-impl RxToken for DirectRx<'_> {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, operation: F) -> R {
-        operation(self.0)
-    }
-}
-
-impl TxToken for DirectTx<'_> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, length: usize, operation: F) -> R {
-        let result = operation(&mut self.0[..length]);
-        loop {
-            match microsystem_user_rt::net_send(boot_cap::NETWORK_DEVICE, &self.0[..length]) {
-                Ok(()) => break,
-                Err(Status::Busy) => {
-                    let _ = microsystem_user_rt::yield_now();
-                }
-                Err(_) => break,
-            }
-        }
-        result
-    }
-}
-
-fn now() -> Instant {
-    Instant::from_micros((microsystem_user_rt::clock_now().unwrap_or(0) / 1000) as i64)
 }
 
 #[panic_handler]

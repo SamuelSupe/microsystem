@@ -24,6 +24,7 @@ impl Slot {
     };
 }
 
+#[derive(Clone)]
 pub struct CapabilityTable {
     slots: [Slot; MAX_CAPABILITIES],
     next_node: u32,
@@ -41,6 +42,18 @@ impl CapabilityTable {
             slots: [Slot::EMPTY; MAX_CAPABILITIES],
             next_node: 1,
         }
+    }
+
+    /// Keeps selected capabilities at their original handles. Kernel restart
+    /// templates use this to retain boot grants without reviving runtime objects.
+    pub fn snapshot_matching(&self, keep: impl Fn(Capability) -> bool) -> Self {
+        let mut copy = self.clone();
+        for index in 1..MAX_CAPABILITIES {
+            if copy.slots[index].value.is_some_and(|capability| !keep(capability)) {
+                copy.clear_slot(index);
+            }
+        }
+        copy
     }
 
     pub fn insert_root(

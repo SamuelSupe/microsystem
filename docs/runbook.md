@@ -1,11 +1,125 @@
 # Runbook and acceptance model
 
+## Software/QEMU maturity phase, 2026-10-06
+
+The current implementation ledger is `.workflow/os-maturity/plan.md`. Physical
+machine acceptance is deferred by the user; remaining functionality stays open.
+
+### Published snapshot status
+
+These are recorded implementation-phase results; publishing the snapshot does
+not rerun or complete the matrices. `target/` logs stay local and are ignored by Git.
+
+| Check | Latest recorded result | Local evidence |
+| --- | --- | --- |
+| Storage host regressions | PASS: 25 MFS and four filesystem tests | `target/maturity-remediation-storage-host.log` |
+| GUI, identity, init, kernel, Mica, network and shell host suites | PASS | `target/maturity-current-host.log` |
+| AArch64 dual-interface IPv6/DNS/failover and three hotplug cycles | PASS on kernel `0eb4c9cf4ea86155ee3ec7a95675f148d57d423fbf1a58ef61a18288853d3912` | `target/maturity-final-network-runtime.log` |
+| RISC-V corresponding network gate | PASS on kernel `f9dd22bf9a1bbd099725a7465348f0c39fa3aaf9343584bb65da9130967b78d9` | `target/maturity-riscv64-network-current-runtime.log` |
+| AArch64 full matrix | Host suites and two-boot serial smoke PASS; power-cut stage FAIL; later stages not reached | `target/maturity-matrix-aarch64.log` |
+| Mounted MFS recovery after block restart | FAIL: readiness timed out | `target/maturity-pressure-diag-runtime.log` |
+| Twelve write/fsync/native/network lifecycle rounds | PASS, no page drift after warmup; 0.716–1.343 s per round | `target/maturity-soak-fixed-runtime.log` |
+
+The lifecycle run is a short baseline. Long soak, current SSH 36-login/key/listener
+qualification and all three complete architecture matrices remain unfinished.
+Mounted cold startup is intermittent and has exceeded 120 s. The earlier focused
+results below apply to their recorded kernels and do not supersede these failures.
+
+Desktop qualification now includes `make test-desktop`: two complete application
+lifecycles cover independent windows, quota/reuse, widget isolation, cross-window
+clipboard, Pinyin candidate/preedit/cancel and UTF-8 deletion. The images in
+`target/desktop-{composition,two-windows,one-window}.png` were inspected; the
+Chinese glyphs and inactive-window focus display correctly. The gate reports
+PASS in `target/maturity-desktop-runtime.log`, kernel SHA-256
+`b76275e0a72da25160c0cb8373ca7c4f5c81cb459624238690d53132812bada2`.
+
+Storage host suites report 25/25 PASS in `target/maturity-storage-host.log`,
+including the existing 10,024-case crash campaign, range write cost and power
+cuts, and metadata/GC/renamed-child fsync. `target/maturity-storage-runtime.log`
+reports the full recovery gate PASS with chmod/chown retained after mfs restart,
+kernel SHA-256 `d0d7d712ad2cbf736203946a0a8f9e39d8c41a79b49d588a3f3601f496e5bdaa`.
+`target/maturity-vfs-runtime.log` also passes two mounted 3 MiB volumes,
+longest-prefix isolation, backing-image protection, readonly/attribute persistence
+over two MFS restarts and per-volume df (768 blocks), kernel SHA-256
+`cbf5797eadbcc4328a0d6a7eb0fad88db1de3123647f6e914357a8d31882448d`.
+`target/maturity-storage-current-host.log` reruns all 25 MFS tests after batched
+image writes; the 10,024-case power-cut campaign passes. This is AArch64 runtime
+evidence; later identity checks are recorded in the maturity ledger.
+Other-architecture desktop/storage and full soak work remains open.
+
+`make test-network` adds two QEMU user networks and a local HTTP fixture. Its
+current implementation gate covers DHCP, SLAAC/IPv6 TCP, longest-prefix routing,
+preferred-interface failover, persisted static configuration and invalid routes.
+The maturity ledger records the completed gate when runtime acceptance succeeds.
+
+The AArch64 `make test-recovery` gate uses an isolated disk copy and covers
+native install/update/corruption rejection/rollback, 16 process slots, physical
+memory exhaustion with zero partial commit, reclamation and reuse, asynchronous
+Terminal cancellation, client reconnection, database hold/resume, network restart,
+and MFS/block/devmgr dependency recovery. It also cancels a command after the
+complete GUI has restarted. `target/native-pressure-64m-runtime.log` exited 0;
+its kernel SHA-256 is `339300f3137c32b0f300008347d5d9679a47e7b8bfa06219a4a1a3fec06db96d`.
+`target/maturity-native-host.log` records 31 passing host tests.
+
+The kernel heap reservation is now 64 MiB. User heaps are demand-backed, and
+fallible allocations commit storage before returning it. The scheduler's former
+57 KiB persistent initializer stack frame was replaced by in-place initialization;
+AArch64 disassembly shows about 12 KiB. This resolves the reproduced stack
+corruption during service teardown. Frame-region lookup borrows its entry.
+
+RISC-V's earlier two-boot smoke completed guest commands but the acceptance
+script failed on a fragmented resource lifecycle record. Console output now
+shares the kernel UART lock, and structured shell output is emitted in one call;
+the refreshed RISC-V serial smoke passed in `target/maturity-riscv64-smoke-check.log`.
+x86-64 ELF compilation passed, but native OrbStack
+has no grub-mkrescue; the existing Docker image produced its ISO instead, and the
+serial smoke passed in `target/maturity-x86_64-smoke-check.log`. Current desktop,
+storage and full soak/performance qualification on those profiles remain pending.
+
 This runbook describes the current AArch64, RV64GC, and x86_64 OrbStack/QEMU
 paths. The recorded evidence includes AArch64 build and serial shutdown, a
 RISC-V QEMU `virt` run through serial shutdown and the IOMMU/device gates below,
 and a focused x86_64 QEMU acceptance through resident services, VirtIO-blk,
-MFS, and serial-shell shutdown. This documentation pass does not rerun the
-end-to-end tests. The exact full test matrices remain `validation in progress`.
+MFS, and serial-shell shutdown. The functionality gate below records fresh
+focused checks. The complete `make test` matrices have not all passed for this
+snapshot; see the latest status above.
+
+## Functionality refinement (2026-10-05)
+
+This pass adds whole quoted file arguments, serialized `Append=17`, directory
+destinations for `mv`, and a real application list in GUI Terminal `ps`. It
+also initializes every SMMUv3 context descriptor and separates terminal prompts
+from file output without modifying file content. Existing unrelated worktree
+changes were retained.
+
+The following checks ran in OrbStack; this is focused evidence, not a complete
+`make test` matrix:
+
+| Check | Result | Evidence under `target/` |
+| --- | --- | --- |
+| ABI, kernel, MFS host tests | PASS, 44 tests | `functional-host-tests.log` |
+| Shell parser, including quoted paths and rejected malformed mutations | PASS, 11 tests | `functional-parser-tests.log` |
+| AArch64 full build | PASS | `functional-aarch64-build.log` |
+| RISC-V full build and current windowd check | PASS | `functional-riscv64-build.log`, `functional-riscv64-windowd-check.log` |
+| RISC-V/x86_64 affected service and baremetal kernel checks | PASS | `functional-{riscv64,x86_64}-check.log`, `functional-{riscv64,x86_64}-kernel-check.log`, `functional-x86_64-windowd-check.log` |
+| AArch64/RISC-V serial smoke, including restart recovery | PASS | `functional-{aarch64,riscv64}-smoke-check.log` and corresponding serial logs |
+| AArch64 GUI keyboard input, quoted append/move/fsync/read and application ps | PASS; screenshots inspected | `functional-gui-check.log`, `functional-gui.log`, `functional-gui-files.png`, `functional-gui-ps.png` |
+| GUI append+fsync read after a fresh serial boot | PASS, exact content `hello gui world` | `functional-append-recovery-check.log`, `functional-append-recovery.log` |
+| Offline filesystem audits | All clean | `functional-aarch64-fsck.log` (generation 79), `functional-riscv64-fsck.log` (69), `functional-gui-fsck.log` (90) |
+
+The serial smoke verifies the copied/moved content before and after a malformed
+append, and both transcripts retain exactly two unchanged content lines. The
+GUI screenshots show PID 14 running and PID 15 exited with status -15; they
+also confirm that a file without a trailing newline does not absorb the prompt.
+The shell parser suite is now included in xtask's host gate.
+
+One GUI startup attempt exceeded a 60-second budget without a panic or DMA
+fault. Its logs are retained as `functional-gui-startup-timeout{,-check}.log`;
+the retry completed with a 120-second budget. This does not establish a maximum
+boot time. All QEMU runs used separate `functional-*.img` disks.
+
+Not run for this pass: full powercut/fault-injection/GUI/SSH/Mica matrices,
+x86_64 QEMU, RISC-V GUI, real hardware, and performance benchmarks.
 
 ## Build and run
 
@@ -162,15 +276,17 @@ navigation, and cross-origin rejection. Evidence is retained in
 `target/unified-browser-public-internet-final.log`,
 `target/unified-browser-public-internet-fsck.log`, `target/gui-browser-fixture.log`,
 and `target/mica-dns-fixture.log`.
+That recorded fixture predates automatic redirects and the Save control; it
+does not validate redirected navigation or Reader file writes.
 
 The serial shell help surface is:
 
 ```text
 shell: help pwd cd echo clear history ps kill wait uptime sleep date free sysinfo
-files: ls cat head tail wc hexdump xxd grep find tree du df stat touch cp write
+files: ls cat head tail wc hexdump xxd grep find tree du df stat touch cp write append
        mkdir rmdir mv rm fsync sync (also available through fs <command>)
 database: sql <CREATE|DROP|INSERT|SELECT|UPDATE|DELETE statement>
-network: curl nslookup netstat
+network: curl nslookup netstat net [status|config|dhcp|static|default|reset]
 programs: run mica
 system: exit shutdown poweroff reboot
 ```
@@ -178,9 +294,25 @@ system: exit shutdown poweroff reboot
 Filesystem aliases include `ls/list`, `cat/read`, `touch/create`, `mv/rename`,
 and `rm/remove/unlink`; bounded options are `head/tail -n N`, `mkdir -p`,
 `cp -r`, and `rm -r`. The GUI Terminal accepts `ls/list [path]`, `cat/read`,
-`stat`, `touch/create`, `cp`, `write`, `mkdir`, `rmdir`, `mv/rename`,
-`rm/remove/unlink`, `fsync` and `sync` with absolute paths and no working
-directory. It uses the
+`stat`, `touch/create`, `cp`, `write`, `append`, `mkdir`, `rmdir`, `mv/rename`,
+`rm/remove/unlink`, `fsync` and `sync`. Both shells maintain `pwd`/`cd` working
+directories and resolve relative paths. File arguments support whole single-
+or double-quoted arguments without escapes, expansion or concatenation.
+For example:
+
+```text
+mkdir -p "/data/work notes"
+append "/data/daily note" "hello"
+fs append "/data/daily note" " world"
+mv "/data/daily note" "/data/work notes"
+fsync "/data/work notes/daily note"
+cat "/data/work notes/daily note"
+```
+
+`append` creates an absent file and reads the EOF inside the serialized MFS
+request. `mv` moves into an existing directory while refusing to overwrite a
+target. The existing serial smoke gate includes quoted copy/move/append/read
+and malformed-argument rejection. Terminal uses the
 dedicated `TERMINAL_FILESYSTEM_ENDPOINT` plus the `GUI_TERMINAL_COMMANDS`
 4 KiB shared frame; the MFS broker keeps this path separate from block DMA and
 other filesystem payload frames. Input commands are capped at 512 bytes and
@@ -214,8 +346,9 @@ is printed to serial; `-o` writes the body atomically to MFS with fsync. The
 request is GET only through `net.browse`, accepts HTTP or HTTPS URLs, and reads
 at most 32 KiB. HTTP is plaintext; HTTPS uses trusted TLS certificate, hostname
 and time validation. Raw TCP/UDP, POST/PUT/PATCH/DELETE, and low-level TLS are
-outside this command boundary. Process, network, Mica, and power commands
-remain serial-shell commands rather than GUI Terminal commands.
+outside this command boundary. GUI Terminal also supports application `ps`,
+`kill`/`wait`, system/time/history commands, `netstat` and power control.
+DNS, curl, SQL and Mica execution use the serial shell.
 
 The unified GUI marker sequence was `mkdir`, `touch`, `write`, `cp`, `stat`,
 `mv`, `cat`, `ls`, `fsync`, `rm`, `rm`, `rm`, `rmdir`, `sync`, each with
@@ -295,11 +428,11 @@ These marker fields are useful when diagnosing a boot or profile mismatch
 [bootfs] valid=true entries=25 static-elfs=24
 [service] ... address-spaces=13 asids=[0x20..0x2c] ... ready=8/8 online=8/8
 [service] ... address-spaces=13 asids=[0x20..0x2c] ... ready=13/13 online=13/13
-[proc] dynamic application capacity=8 first-pid=14
+[proc] dynamic application capacity=16 first-pid=14
 [ipc] resident shell->db ping=true
-[mm] kernel heap ready bytes=0x8000000
+[mm] kernel heap ready bytes=0x4000000
 [net] ... raw-device-isolated=true tcp-owner=true dns=true
-[ssh] sshd ready address=10.0.2.15 port=22 auth=publickey user=micro
+[ssh] sshd ready address=10.0.2.15 port=22 auth=publickey accounts=persistent
 [mica] session isolated=true brokers=fs,network,process time=true
 [mica] vm verified=true gc=mark-sweep pcall=true modules=true
 [gui] mica registration requested endpoint=0
@@ -429,3 +562,19 @@ The timeout parser accepts `1ms` through `24h`; non-GUI Mica is hard-capped at
 For detailed wire numbers and cap slots, use [abi.md](abi.md); for GUI input
 and rendering scope use [gui.md](gui.md); for MFS1 recovery and GC history use
 [mfs1.md](mfs1.md).
+
+## Accounts and network maturity gates
+
+Run `make test-identity` for user/role/private-file/key revocation, SSH host-key
+rotation, service recovery and cold-boot persistence; `make test-network` for
+DHCP, two routes, IPv6 TCP/UDP/DNS, saved configuration, link failover and three
+PCIe insertion/removal cycles. These gates currently use the AArch64 QMP profile.
+They overwrite only `target/service-recovery.img`, an isolated source-disk copy.
+Run them sequentially because they share their serial/QMP artifacts.
+
+Accounts are fail-closed when `/.system/accounts` is corrupt. The physical serial
+console retains root file access and can restore a saved valid file; restart
+then loads the repaired account data. Do not replace the account file with empty
+bytes or a different schema. Private host-key rotation intentionally changes the
+SSH fingerprint; inspect it on the trusted console/client before accepting it.
+See [identity.md](identity.md) for roles, bounded audit retention and limits.

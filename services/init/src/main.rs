@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use microsystem_abi::{
@@ -8,6 +10,9 @@ use microsystem_abi::{
     message_cap_move, process, protocol, script,
 };
 use microsystem_block::Operation as BlockOperation;
+mod identity;
+mod native;
+mod supervisor;
 
 static PROCESS_PROGRAMS: [AtomicU64; process::MAX_APPLICATIONS] =
     [const { AtomicU64::new(0) }; process::MAX_APPLICATIONS];
@@ -83,13 +88,14 @@ pub extern "C" fn _start() -> ! {
     verify_endpoint_capability();
     verify_memory_pool_mapping();
     verify_process_kill();
+    verify_application_capacity();
     verify_isolation_matrix();
     verify_privileged_fault();
     start_service("block", 3);
     start_service("mfs", 4);
     start_service("db", 13);
     start_service("shell", 5);
-    let gui = delegate_block_transport();
+    let gui = delegate_block_transport().unwrap_or(false);
     start_service("netd", 12);
     start_service("sshd", 11);
     if gui {
@@ -111,7 +117,18 @@ pub extern "C" fn _start() -> ! {
     let mut pending_process = None;
     let mut pending_script = None;
     let mut pending_desktop_launch = None;
+    let mut pending_service = None;
+    let mut pending_native = None;
+    let mut pending_identity = None;
+    let mut identities = identity::Registry::new();
+    let mut supervisor = supervisor::Supervisor::new();
     loop {
+        identities.poll();
+        let _ = service_endpoint(
+            boot_cap::IDENTITY_ENDPOINT,
+            &mut pending_identity,
+            |request, reply| identities.request(request, reply),
+        );
         for (name, status) in [
             (
                 b"process".as_slice(),
@@ -137,6 +154,17 @@ pub extern "C" fn _start() -> ! {
                 microsystem_user_rt::exit(4);
             }
         }
+        let _ = service_endpoint(
+            boot_cap::SERVICE_ENDPOINT,
+            &mut pending_service,
+            |request, reply| supervisor.request(request, reply),
+        );
+        supervisor.poll();
+        let _ = service_endpoint(
+            boot_cap::APPLICATION_ENDPOINT,
+            &mut pending_native,
+            native::request,
+        );
         launch_pending_desktop_application();
         reap_script_sessions();
         let _ = microsystem_user_rt::yield_now();
@@ -196,8 +224,9 @@ fn launch_pending_desktop_application() {
     // compromised GUI service cannot turn the launcher into an arbitrary script broker.
     let (source, policy, path, argv) = match application {
         gui::Application::Reader => (
-            b"--!mica 1\n--!allow gui.window\n--!allow net.browse\n".as_slice(),
-            b"gui.window\nnet.browse\n".as_slice(),
+            b"--!mica 1\n--!allow gui.window\n--!allow net.browse\n--!allow fs.write:/data\n"
+                .as_slice(),
+            b"gui.window\nnet.browse\nfs.write:/data\n".as_slice(),
             b"/.system/examples/mica/browser.mica".as_slice(),
             b"".as_slice(),
         ),
@@ -220,7 +249,12 @@ fn launch_pending_desktop_application() {
     let result = match prepare_desktop_script_region(region, source, policy, path, argv) {
         Ok(()) => {
             let mut reply = Message::new(protocol::PROCESS, process::Operation::SpawnScript as u16);
-            let status = launch_script_session(region, true, Some(application), &mut reply);
+            let status = match identity::desktop_actor() {
+                Ok(actor) if actor.role != microsystem_identity::READER => {
+                    launch_script_session(region, true, Some(application), &mut reply, actor)
+                }
+                _ => Status::AccessDenied,
+            };
             if status == Status::Ok && reply.caps[1] != CapHandle::INVALID {
                 let _ = microsystem_user_rt::cap_delete(reply.caps[1]);
             }
@@ -314,7 +348,7 @@ fn report_desktop_launch(application: gui::Application, status: Status) {
 fn service_endpoint(
     endpoint: CapHandle,
     pending: &mut Option<Message>,
-    handler: fn(&Message, &mut Message) -> Status,
+    mut handler: impl FnMut(&Message, &mut Message) -> Status,
 ) -> Result<(), Status> {
     let mut request = if let Some(request) = pending.take() {
         request
@@ -630,9 +664,30 @@ fn verify_privileged_fault() {
         b" faulted status=-8 reclaimed=true\n",
     );
     let _ = microsystem_user_rt::debug_write_u64(
-        b"[proc] dynamic application capacity=8 first-pid=",
+        b"[proc] dynamic application capacity=16 first-pid=",
         process::FIRST_APPLICATION_PID,
         b" independent-slots=true\n",
+    );
+}
+
+fn verify_application_capacity() {
+    let mut pids = [0u64; process::MAX_APPLICATIONS];
+    for pid in &mut pids {
+        *pid = microsystem_user_rt::thread_start(program_id("spinner"))
+            .unwrap_or_else(|_| microsystem_user_rt::exit(38));
+        remember_program(*pid, program_id("spinner"));
+    }
+    if microsystem_user_rt::thread_start(program_id("spinner")) != Err(Status::Busy) {
+        microsystem_user_rt::exit(39);
+    }
+    for pid in pids {
+        let _ = microsystem_user_rt::thread_kill(pid, -15);
+        if !wait_for_status(pid, -15) {
+            microsystem_user_rt::exit(40);
+        }
+    }
+    let _ = microsystem_user_rt::debug_write(
+        b"[proc] application capacity live=16 overflow=Busy all-reclaimed=true\n",
     );
 }
 
@@ -666,10 +721,28 @@ fn verify_isolation_matrix() {
     let pageprobe = program_id("pageprobe");
     let pageprobe_pid = microsystem_user_rt::thread_start(pageprobe)
         .unwrap_or_else(|_| microsystem_user_rt::exit(32));
+    let readonly_pid = microsystem_user_rt::thread_start(pageprobe)
+        .unwrap_or_else(|_| microsystem_user_rt::exit(32));
     remember_program(pageprobe_pid, pageprobe);
+    remember_program(readonly_pid, pageprobe);
     if !wait_for_status(pageprobe_pid, Status::Fault as i64) {
         microsystem_user_rt::exit(33);
     }
+    let (_, _, _, frames, _, mappings) =
+        microsystem_user_rt::thread_status_with_resources(pageprobe_pid)
+            .unwrap_or_else(|_| microsystem_user_rt::exit(36));
+    if frames < 2 || mappings < 2 {
+        microsystem_user_rt::exit(37);
+    }
+    let _ = microsystem_user_rt::debug_write(
+        b"[mm] anonymous fault cleanup resident-pages-reclaimed=true\n",
+    );
+    if !wait_for_status(readonly_pid, Status::Fault as i64) {
+        microsystem_user_rt::exit(41);
+    }
+    let _ = microsystem_user_rt::debug_write(
+        b"[mm] anonymous read-only mapping rejected writer reclaimed=true\n",
+    );
     let _ = microsystem_user_rt::debug_write_u64(
         b"[proc] page-fault probe pid=",
         pageprobe_pid,
@@ -833,7 +906,7 @@ fn verify_remote_mapping_revoke() {
     );
 }
 
-fn delegate_block_transport() -> bool {
+fn delegate_block_transport() -> Result<bool, Status> {
     let mut request = Message::new(protocol::BLOCK, BlockOperation::Configure as u16);
     request.caps = [
         boot_cap::DEVMGR_VIRTIO_MMIO,
@@ -842,16 +915,33 @@ fn delegate_block_transport() -> bool {
         boot_cap::DEVMGR_VIRTIO_IRQ,
     ];
     let mut reply = Message::new(protocol::BLOCK, 0);
-    if microsystem_user_rt::ipc_call(boot_cap::DEVMGR_ENDPOINT, &request, &mut reply, 0).is_err()
+    if microsystem_user_rt::ipc_call(
+        boot_cap::DEVMGR_ENDPOINT,
+        &request,
+        &mut reply,
+        microsystem_user_rt::clock_now()?.saturating_add(10_000_000_000),
+    )
+    .is_err()
         || reply.protocol != protocol::BLOCK
         || reply.words[5] as i64 != 0
     {
-        microsystem_user_rt::exit(16);
+        return Err(Status::Io);
     }
     let _ = microsystem_user_rt::debug_write(
         b"[devmgr] resident root delegated mmio/frame/dma/irq to devmgr via IPC\n",
     );
-    reply.words[0] != 0
+    Ok(reply.words[0] != 0)
+}
+
+fn terminate_script_sessions() {
+    for (index, region) in SCRIPT_REGIONS.iter().enumerate() {
+        if region.load(Ordering::Acquire) != 0 {
+            let _ = microsystem_user_rt::thread_kill(
+                process::FIRST_APPLICATION_PID + index as u64,
+                Status::Io as i64,
+            );
+        }
+    }
 }
 
 fn handle_script(request: &Message, reply: &mut Message) -> Status {
@@ -922,6 +1012,12 @@ fn handle_script(request: &Message, reply: &mut Message) -> Status {
                 }
                 let pid = microsystem_user_rt::thread_start(program)?;
                 remember_program(pid, program);
+                let owner = identity::snapshot()?.actor(
+                    owner_pid as u32,
+                    0,
+                    microsystem_user_rt::clock_now()?,
+                )?;
+                identity::process_owner(pid, owner);
                 let slot = (pid - process::FIRST_APPLICATION_PID) as usize;
                 SCRIPT_CHILD_OWNER[slot].store(owner_pid, Ordering::Release);
                 reply.words[0] = pid;
@@ -1085,10 +1181,46 @@ fn handle_process(request: &Message, reply: &mut Message) -> Status {
     if request.protocol != protocol::PROCESS {
         return Status::Invalid;
     }
+    let actor = match identity::actor(request.words[3]) {
+        Ok(actor) => actor,
+        Err(status) => {
+            if request.opcode == process::Operation::SpawnScript as u16
+                && request.caps[0] != CapHandle::INVALID
+            {
+                let _ = microsystem_user_rt::cap_delete(request.caps[0]);
+            }
+            return status;
+        }
+    };
+    if actor.role == microsystem_identity::READER
+        && matches!(request.opcode, value if value == process::Operation::Spawn as u16 || value == process::Operation::SpawnScript as u16 || value == process::Operation::MemoryPool as u16)
+    {
+        if request.caps[0] != CapHandle::INVALID {
+            let _ = microsystem_user_rt::cap_delete(request.caps[0]);
+        }
+        return Status::AccessDenied;
+    }
+    if request.opcode == process::Operation::Kill as u16 && !actor.administrator() {
+        let Ok(state) = identity::snapshot() else {
+            return Status::Busy;
+        };
+        if request.words[0]
+            .checked_sub(14)
+            .and_then(|i| state.process_uids.get(i as usize))
+            .copied()
+            != Some(actor.uid)
+        {
+            return Status::AccessDenied;
+        }
+    }
     match request.opcode {
         value if value == process::Operation::Spawn as u16 && request.words[0] != 0 => {
+            if application_program_name(request.words[0]).is_none() {
+                return Status::AccessDenied;
+            }
             match microsystem_user_rt::thread_start(request.words[0]) {
                 Ok(pid) => {
+                    identity::process_owner(pid, actor);
                     if let Some(program) = PROCESS_PROGRAMS
                         .get(pid.saturating_sub(process::FIRST_APPLICATION_PID) as usize)
                     {
@@ -1160,12 +1292,18 @@ fn handle_process(request: &Message, reply: &mut Message) -> Status {
                 Err(status) => status,
             }
         }
-        value if value == process::Operation::SpawnScript as u16 => spawn_script(request, reply),
+        value if value == process::Operation::SpawnScript as u16 => {
+            spawn_script_as(request, reply, actor)
+        }
         _ => Status::Invalid,
     }
 }
 
-fn spawn_script(request: &Message, reply: &mut Message) -> Status {
+fn spawn_script_as(
+    request: &Message,
+    reply: &mut Message,
+    actor: microsystem_identity::Actor,
+) -> Status {
     let source_bytes = request.words[0] as usize;
     let flags = request.words[1] as u32;
     if source_bytes > script::SOURCE_BYTES || flags & !script::FLAG_GUI_SESSION != 0 {
@@ -1178,7 +1316,13 @@ fn spawn_script(request: &Message, reply: &mut Message) -> Status {
     if region == CapHandle::INVALID {
         return Status::BadCapability;
     }
-    launch_script_session(region, flags & script::FLAG_GUI_SESSION != 0, None, reply)
+    launch_script_session(
+        region,
+        flags & script::FLAG_GUI_SESSION != 0,
+        None,
+        reply,
+        actor,
+    )
 }
 
 fn prepare_script_session(reply: &mut Message) -> Status {
@@ -1203,6 +1347,7 @@ fn launch_script_session(
     gui_requested: bool,
     desktop_application: Option<gui::Application>,
     reply: &mut Message,
+    actor: microsystem_identity::Actor,
 ) -> Status {
     let desktop_application = desktop_application.or_else(|| identify_desktop_application(region));
     let (_allow_random, allow_stats, allow_gui, token) = match inspect_script_permissions(region) {
@@ -1225,7 +1370,7 @@ fn launch_script_session(
             Status::AccessDenied
         };
     }
-    if let Err(status) = register_script_filesystem(region, token) {
+    if let Err(status) = register_script_filesystem(region, token, actor.uid) {
         let _ = microsystem_user_rt::debug_write_u64(
             b"[mica] launch rejected stage=filesystem status=",
             (status as i64).unsigned_abs(),
@@ -1427,6 +1572,7 @@ fn launch_script_session(
         SCRIPT_GUI_ENDPOINT_SLOTS[slot].store(endpoint_slot as u32 + 1, Ordering::Release);
     }
     PROCESS_PROGRAMS[slot].store(program_id("mica"), Ordering::Release);
+    identity::process_owner(pid, actor);
     SCRIPT_NOTIFICATIONS[slot].store(notification.0, Ordering::Release);
     SCRIPT_TOKENS[slot].store(token, Ordering::Release);
     SCRIPT_REGIONS[slot].store(region.0, Ordering::Release);
@@ -1546,7 +1692,15 @@ fn unregister_script_gui(endpoint_slot: usize, token: u64) {
     request.words[0] = endpoint_slot as u64;
     request.words[2] = token;
     let mut reply = Message::new(protocol::GUI, 0);
-    let _ = microsystem_user_rt::ipc_call(boot_cap::GUI_CONFIG_ENDPOINT, &request, &mut reply, 0);
+    let deadline = microsystem_user_rt::clock_now()
+        .unwrap_or(1)
+        .saturating_add(100_000_000);
+    let _ = microsystem_user_rt::ipc_call(
+        boot_cap::GUI_CONFIG_ENDPOINT,
+        &request,
+        &mut reply,
+        deadline,
+    );
 }
 
 fn reap_script_sessions() {
@@ -1581,6 +1735,7 @@ fn reap_script_sessions() {
                 },
             );
         if !close_requested {
+            SCRIPT_GUI_CLOSE_DEADLINES[slot].store(0, Ordering::Release);
             continue;
         }
         let deadline = SCRIPT_GUI_CLOSE_DEADLINES[slot].load(Ordering::Acquire);
@@ -1651,9 +1806,10 @@ fn inspect_script_permissions(region: CapHandle) -> Result<(bool, bool, bool, u6
     result
 }
 
-fn register_script_filesystem(region: CapHandle, token: u64) -> Result<(), Status> {
+fn register_script_filesystem(region: CapHandle, token: u64, uid: u32) -> Result<(), Status> {
     let mut request = Message::new(protocol::FILESYSTEM, filesystem::SCRIPT_REGISTER);
     request.words[3] = token;
+    request.words[0] = uid as u64;
     request.caps[0] = region;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
     microsystem_user_rt::ipc_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0)?;
@@ -1667,7 +1823,15 @@ fn unregister_script_filesystem(token: u64) {
     let mut request = Message::new(protocol::FILESYSTEM, filesystem::SCRIPT_UNREGISTER);
     request.words[3] = token;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
-    let _ = microsystem_user_rt::ipc_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0);
+    let deadline = microsystem_user_rt::clock_now()
+        .unwrap_or(1)
+        .saturating_add(100_000_000);
+    let _ = microsystem_user_rt::ipc_call(
+        boot_cap::FILESYSTEM_ENDPOINT,
+        &request,
+        &mut reply,
+        deadline,
+    );
 }
 
 fn register_script_network(region: CapHandle, token: u64) -> Result<(), Status> {
@@ -1692,7 +1856,11 @@ fn unregister_script_network(token: u64) {
     );
     request.words[0] = token;
     let mut reply = Message::new(protocol::NETWORK, 0);
-    let _ = microsystem_user_rt::ipc_call(boot_cap::NETWORK_ENDPOINT, &request, &mut reply, 0);
+    let deadline = microsystem_user_rt::clock_now()
+        .unwrap_or(1)
+        .saturating_add(100_000_000);
+    let _ =
+        microsystem_user_rt::ipc_call(boot_cap::NETWORK_ENDPOINT, &request, &mut reply, deadline);
 }
 
 fn status_word(value: u64) -> Result<(), Status> {

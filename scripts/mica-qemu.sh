@@ -5,6 +5,10 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/qemu-arch.sh"
 
+image_path="${MICROSYSTEM_DISK_PATH:-$repo_root/build/microsystem.img}"
+case "$image_path" in /*) ;; *) image_path="$repo_root/$image_path" ;; esac
+mfsctl="${MICROSYSTEM_MFSCTL:-$repo_root/target/release/mfsctl}"
+
 timeout_seconds="${MICROSYSTEM_MICA_QEMU_TIMEOUT:-180}"
 input_settle="${MICROSYSTEM_MICA_INPUT_SETTLE:-0.15}"
 stage_timeout="${MICROSYSTEM_MICA_STAGE_TIMEOUT:-60}"
@@ -66,7 +70,7 @@ if [[ "$tls_fixture" == 1 ]]; then
   done
 fi
 if [[ ! -f "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" ||
-      ! -f build/microsystem.img || ! -x target/release/mfsctl ]]; then
+      ! -f "$image_path" || ! -x "$mfsctl" ]]; then
   echo "mica-qemu: build artifacts are missing; run make build first" >&2
   exit 2
 fi
@@ -81,7 +85,6 @@ image_backup="$repo_root/target/mica-image-backup.$$"
 test_image="$repo_root/target/mica-test-image.$$"
 resolv_backup="$repo_root/target/mica-resolv-backup.$$"
 artifact_backup_dir="$repo_root/target/mica-artifacts-backup.$$"
-mfsctl="$repo_root/target/release/mfsctl"
 fixture_pid=""
 image_backed_up=0
 resolv_configured=0
@@ -104,8 +107,8 @@ cleanup() {
   rm -f "$resolv_backup"
   rm -f "$test_image"
   if [[ "$image_backed_up" == 1 && -f "$image_backup" ]]; then
-    cp "$image_backup" build/microsystem.img || true
-    if ! cmp -s "$image_backup" build/microsystem.img; then
+    cp "$image_backup" "$image_path" || true
+    if ! cmp -s "$image_backup" "$image_path"; then
       echo "mica-qemu: restored disk differs from backup" >&2
       restore_verify_failed=1
     fi
@@ -115,7 +118,7 @@ cleanup() {
     for artifact in \
       "target/$MICROSYSTEM_TARGET/release/microsystem-mica-service" \
       "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
-      build/bootfs.cpio \
+      "$repo_root/build/bootfs-$MICROSYSTEM_ARCH.cpio" \
       build/ca-bundle.derpack; do
       backup="$artifact_backup_dir/$(basename -- "$artifact")"
       if [[ -f "$backup" ]]; then
@@ -143,7 +146,7 @@ if ! printf '%s\n' 'nameserver 127.0.0.1' >/etc/resolv.conf; then
   exit 1
 fi
 resolv_configured=1
-cp build/microsystem.img "$image_backup"
+cp "$image_path" "$image_backup"
 image_backed_up=1
 
 if [[ "$tls_fixture" == 1 ]]; then
@@ -156,7 +159,7 @@ if [[ "$tls_fixture" == 1 ]]; then
   for artifact in \
     "target/$MICROSYSTEM_TARGET/release/microsystem-mica-service" \
     "target/$MICROSYSTEM_TARGET/release/microsystem-kernel" \
-    build/bootfs.cpio \
+    "$repo_root/build/bootfs-$MICROSYSTEM_ARCH.cpio" \
     build/ca-bundle.derpack; do
     cp "$artifact" "$artifact_backup_dir/$(basename -- "$artifact")"
   done
@@ -305,7 +308,7 @@ PY
     cat "$fixture_dir/test-bundle-put.log" >&2 || true
     exit 1
   fi
-  cp "$test_image" build/microsystem.img
+  cp "$test_image" "$image_path"
 fi
 
 tls_policy_lines=""
@@ -476,9 +479,9 @@ $tls_probe
 print("mica-combo args=alpha,beta module-cache=true fs-permission-denied=true fs-atomic=true dns=true tcp=true udp=true http=true browse=true browse-resolve-denied=true browse-raw-denied=true browse-udp-denied=true browse-post-denied=true$tls_combo_marker")
 MICA
 
-"$mfsctl" mkdir build/microsystem.img /mica >"$fixture_dir/mkdir.log" 2>&1
-"$mfsctl" put build/microsystem.img "$fixture_dir/helper.mica" /mica/helper.mica >"$fixture_dir/helper-put.log" 2>&1
-"$mfsctl" put build/microsystem.img "$fixture_dir/main.mica" /mica/main.mica >"$fixture_dir/main-put.log" 2>&1
+"$mfsctl" mkdir "$image_path" /mica >"$fixture_dir/mkdir.log" 2>&1
+"$mfsctl" put "$image_path" "$fixture_dir/helper.mica" /mica/helper.mica >"$fixture_dir/helper-put.log" 2>&1
+"$mfsctl" put "$image_path" "$fixture_dir/main.mica" /mica/main.mica >"$fixture_dir/main-put.log" 2>&1
 
 python3 -u - "$fixture_http_port" "$fixture_tcp_port" "$fixture_udp_port" "$fixture_dns_port" \
   "$tls_fixture" "$fixture_dir" "$fixture_tls_port" "$fixture_tls_unknown_port" \
@@ -719,7 +722,7 @@ fi
 required_markers=(
   "\\[bootfs\\][[:space:]]+valid=true[[:space:]]+entries=25[[:space:]]+static-elfs=24"
   "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+address-spaces=13[[:space:]]+asids=\\[0x20\\.\\.0x2c\\]"
-  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=8[[:space:]]+first-pid=14[[:space:]]+independent-slots=true"
+  "\\[proc\\][[:space:]]+dynamic[[:space:]]+application[[:space:]]+capacity=16[[:space:]]+first-pid=14[[:space:]]+independent-slots=true"
   "\\[mm\\][[:space:]]+TaskMemory/page[[:space:]]+tables[[:space:]]+allocated[[:space:]]+from[[:space:]]+kernel[[:space:]]+heap[[:space:]]+slot-bytes=0x[[:xdigit:]]+[[:space:]]+allocated=0x[[:xdigit:]]+"
   "\\[service\\][[:space:]]+resident[[:space:]]+EL0[[:space:]]+ready=8/8[[:space:]]+online=8/8[[:space:]]+switches=[0-9]+"
   "\\[service\\][[:space:]]+shell[[:space:]]+ready"

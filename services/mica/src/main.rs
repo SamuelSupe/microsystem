@@ -42,6 +42,8 @@ impl SessionOutput {
     }
 }
 
+struct PendingHttp { id: u64, connection: u64, body: Vec<u8> }
+
 struct KernelHost {
     output: SessionOutput,
     random: CapHandle,
@@ -54,7 +56,8 @@ struct KernelHost {
     script_directory: String,
     modules: Vec<(String, Option<Value>)>,
     module_source_bytes: usize,
-    http_pending: [Option<Vec<u8>>; network::MAX_CONNECTIONS_PER_SESSION],
+    http_pending: [Option<PendingHttp>; network::MAX_CONNECTIONS_PER_SESSION],
+    next_http_id: u64,
     http_browse_connect: bool,
     gui: Option<gui::GuiHost>,
 }
@@ -344,7 +347,6 @@ impl KernelHost {
             let connection = table_integer(response, "connection")? as u64;
             let content_length = table_integer_optional(response, "content_length")?;
             let chunked = table_bool(Some(response), "chunked");
-            let complete = table_bool(Some(response), "complete");
             let maximum = arguments
                 .get(1)
                 .map(|_| positive_argument(arguments, 1))
@@ -353,13 +355,13 @@ impl KernelHost {
             if maximum > 4 * 1024 * 1024 {
                 return Err(ErrorValue::new("limit", "HTTP body limit exceeds 4 MiB"));
             }
-            let slot = connection
-                .checked_sub(1)
-                .filter(|slot| *slot < self.http_pending.len() as u64)
-                .ok_or_else(|| ErrorValue::new("argument", "invalid HTTP response"))?
-                as usize;
-            let mut body = self.http_pending[slot].take().unwrap_or_default();
-            if !complete {
+            let slot = self.http_pending.iter().position(|pending| pending.as_ref().is_some_and(|pending| pending.id == connection))
+                .ok_or_else(|| ErrorValue::new("argument", "HTTP response already consumed or invalid"))?;
+            let pending = self.http_pending[slot].take().unwrap();
+            let mut body = pending.body;
+            let connection = pending.connection;
+            if connection != 0 {
+                let read_result = (|| {
                 loop {
                     if content_length.is_some_and(|length| body.len() >= length as usize) {
                         break;
@@ -376,7 +378,10 @@ impl KernelHost {
                     }
                     body.extend_from_slice(&chunk);
                 }
+                Ok::<(), ErrorValue>(())
+                })();
                 let _ = self.tcp_close_value(connection);
+                read_result?;
             }
             if body.len() > maximum {
                 return Err(ErrorValue::new("limit", "HTTP body exceeds read limit"));
@@ -568,21 +573,14 @@ impl KernelHost {
                 }
             }
         }
-        let connection = if complete {
-            self.http_pending
-                .iter()
-                .position(Option::is_none)
-                .map(|slot| slot as u64 + 1)
-                .ok_or_else(|| ErrorValue::new("limit", "too many pending HTTP responses"))?
-        } else {
-            network_connection
+        let Some(slot) = self.http_pending.iter().position(Option::is_none) else {
+            if !complete { let _ = self.tcp_close_value(network_connection); }
+            return Err(ErrorValue::new("limit", "too many pending HTTP responses"));
         };
-        let slot = connection
-            .checked_sub(1)
-            .filter(|slot| *slot < self.http_pending.len() as u64)
-            .ok_or_else(|| ErrorValue::new("fault", "invalid HTTP connection identifier"))?
-            as usize;
-        self.http_pending[slot] = Some(received[header_end..].to_vec());
+        let connection = self.next_http_id;
+        self.next_http_id = self.next_http_id.wrapping_add(1).max(1) & i64::MAX as u64;
+        self.next_http_id = self.next_http_id.max(1);
+        self.http_pending[slot] = Some(PendingHttp { id: connection, connection: if complete { 0 } else { network_connection }, body: received[header_end..].to_vec() });
         Ok(alloc::vec![
             Value::Table(alloc::vec![
                 (Value::String("status".into()), Value::Integer(status)),
@@ -666,8 +664,10 @@ impl KernelHost {
                 if !self.permissions.allows_host_any_port(host) {
                     return Err(ErrorValue::new("access", "network host permission denied"));
                 }
-                let address = self.resolve_host(host)?;
-                Ok(alloc::vec![Value::String(ipv4_text(address)), Value::Nil])
+                if let Ok(address) = host.parse::<core::net::IpAddr>() { return Ok(alloc::vec![Value::String(address.to_string()), Value::Nil]); }
+                let family = match arguments.get(1) { None => 0, Some(Value::String(value)) if value == "ipv4" => 4, Some(Value::String(value)) if value == "ipv6" => 6, _ => return Err(ErrorValue::new("argument", "address family must be ipv4 or ipv6")) };
+                let address = self.resolve_address(host, family)?;
+                Ok(alloc::vec![Value::String(address.to_string()), Value::Nil])
             }
             "net.tcp_connect" => {
                 let host = string_argument(arguments, 0)?;
@@ -678,7 +678,7 @@ impl KernelHost {
                 if port > u16::MAX as i64 || !allowed {
                     return Err(ErrorValue::new("access", "network destination denied"));
                 }
-                let address = self.resolve_host(host)?;
+                let address = self.resolve_address(host, 0)?;
                 let deadline = microsystem_user_rt::clock_now()
                     .unwrap_or(0)
                     .saturating_add(10_000_000_000);
@@ -686,7 +686,8 @@ impl KernelHost {
                 loop {
                     let mut words = [0u64; 5];
                     words[0] = connection;
-                    words[1] = address as u64;
+                    let (address_word, payload) = address_payload(host, address, &[]);
+                    words[1] = address_word;
                     words[2] = port as u64;
                     words[3] = host.len() as u64;
                     words[4] = if self.http_browse_connect {
@@ -697,7 +698,7 @@ impl KernelHost {
                     let (reply, status, _) = self.network_request(
                         network::Operation::TcpConnect,
                         words,
-                        host.as_bytes(),
+                        &payload,
                     )?;
                     connection = reply.words[0].max(connection);
                     if status == Status::Ok {
@@ -812,9 +813,11 @@ impl KernelHost {
                 if !(0..=u16::MAX as i64).contains(&local_port) {
                     return Err(ErrorValue::new("argument", "invalid UDP local port"));
                 }
+                let interface = arguments.get(1).map(|_| integer_argument(arguments, 1)).transpose()?;
+                if interface.is_some_and(|index| !(0..network::MAX_INTERFACES as i64).contains(&index)) { return Err(ErrorValue::new("argument", "invalid network interface")); }
                 let (reply, status, _) = self.network_request(
                     network::Operation::UdpOpen,
-                    [local_port as u64, 0, 0, 0, 0],
+                    [local_port as u64, interface.map(|index| index as u64 + 1).unwrap_or(0), 0, 0, 0],
                     &[],
                 )?;
                 if status != Status::Ok {
@@ -839,15 +842,13 @@ impl KernelHost {
                         "UDP datagram exceeds transfer limit",
                     ));
                 }
-                let address = self.resolve_host(host)?;
-                let mut payload = Vec::with_capacity(host.len() + data.len());
-                payload.extend_from_slice(host.as_bytes());
-                payload.extend_from_slice(data);
+                let address = self.resolve_address(host, 0)?;
+                let (address_word, payload) = address_payload(host, address, data);
                 let (reply, status, _) = self.network_request(
                     network::Operation::UdpSendTo,
                     [
                         socket,
-                        address as u64,
+                        address_word,
                         port as u64,
                         host.len() as u64,
                         data.len() as u64,
@@ -886,7 +887,10 @@ impl KernelHost {
                                 (Value::String("data".into()), Value::Bytes(payload)),
                                 (
                                     Value::String("address".into()),
-                                    Value::String(ipv4_text(reply.words[1] as u32))
+                                    Value::String(if reply.words[4] == 6 {
+                                        let mut bytes = [0; 16]; bytes[..8].copy_from_slice(&reply.words[1].to_be_bytes()); bytes[8..].copy_from_slice(&reply.words[3].to_be_bytes());
+                                        core::net::Ipv6Addr::from(bytes).to_string()
+                                    } else { ipv4_text(reply.words[1] as u32) })
                                 ),
                                 (
                                     Value::String("port".into()),
@@ -918,37 +922,27 @@ impl KernelHost {
         }
     }
 
-    fn resolve_host(&mut self, host: &str) -> Result<u32, ErrorValue> {
-        if let Some(address) = parse_ipv4(host) {
+    fn resolve_address(&mut self, host: &str, family: u64) -> Result<core::net::IpAddr, ErrorValue> {
+        if let Ok(address) = host.parse::<core::net::IpAddr>() {
+            if (family == 4 && address.is_ipv6()) || (family == 6 && address.is_ipv4()) { return Err(ErrorValue::new("argument", "literal does not match address family")); }
             return Ok(address);
         }
-        let deadline = microsystem_user_rt::clock_now()
-            .unwrap_or(0)
-            .saturating_add(10_000_000_000);
+        let deadline = microsystem_user_rt::clock_now().unwrap_or(0).saturating_add(10_000_000_000);
         let mut query = 0u64;
+        let mut selected = if family == 6 { 6 } else { 4 };
         loop {
-            let (reply, status, _) = self.network_request(
-                network::Operation::Resolve,
-                [
-                    query,
-                    0,
-                    host.len() as u64,
-                    0,
-                    if self.http_browse_connect {
-                        network::BROWSE_REQUEST_MAGIC
-                    } else {
-                        0
-                    },
-                ],
-                host.as_bytes(),
-            )?;
+            let (reply, status, _) = self.network_request(network::Operation::Resolve,
+                [query, selected, host.len() as u64, 0, if self.http_browse_connect { network::BROWSE_REQUEST_MAGIC } else { 0 }], host.as_bytes())?;
             if status == Status::Ok {
-                return Ok(reply.words[0] as u32);
+                if reply.words[2] == 6 {
+                    let mut bytes = [0; 16]; bytes[..8].copy_from_slice(&reply.words[0].to_be_bytes()); bytes[8..].copy_from_slice(&reply.words[1].to_be_bytes());
+                    return Ok(core::net::IpAddr::V6(core::net::Ipv6Addr::from(bytes)));
+                }
+                return Ok(core::net::IpAddr::V4(core::net::Ipv4Addr::from(reply.words[0] as u32)));
             }
+            if status == Status::NotFound && selected == 4 && family == 0 { selected = 6; query = 0; continue; }
             query = reply.words[0].max(query);
-            if status != Status::Busy {
-                return Err(host_status("net.resolve", status));
-            }
+            if status != Status::Busy { return Err(host_status("net.resolve", status)); }
             if microsystem_user_rt::clock_now().unwrap_or(deadline) >= deadline {
                 let _ = self.network_request(network::Operation::Cancel, [0; 5], &[]);
                 return Err(ErrorValue::new("timeout", "DNS resolution timed out"));
@@ -1181,6 +1175,22 @@ impl KernelHost {
                 Ok(alloc::vec![
                     Value::Table(alloc::vec![
                         (Value::String("type".into()), Value::String(kind.into())),
+                        (
+                            Value::String("mode".into()),
+                            Value::Integer(reply.words[2] as i64)
+                        ),
+                        (
+                            Value::String("uid".into()),
+                            Value::Integer(reply.words[3] as u32 as i64)
+                        ),
+                        (
+                            Value::String("gid".into()),
+                            Value::Integer((reply.words[3] >> 32) as i64)
+                        ),
+                        (
+                            Value::String("modified".into()),
+                            Value::Integer(reply.words[4] as i64)
+                        ),
                         (
                             Value::String("size".into()),
                             Value::Integer(reply.words[1] as i64)
@@ -1598,6 +1608,7 @@ pub extern "C" fn _start(
         modules: Vec::new(),
         module_source_bytes: 0,
         http_pending: core::array::from_fn(|_| None),
+        next_http_id: 1,
         http_browse_connect: false,
         gui: None,
     };
@@ -2039,17 +2050,14 @@ fn status_from_word(value: u64) -> Status {
     }
 }
 
-fn parse_ipv4(input: &str) -> Option<u32> {
-    let mut octets = [0u8; 4];
-    let mut count = 0usize;
-    for component in input.split('.') {
-        if count == octets.len() || component.is_empty() {
-            return None;
-        }
-        octets[count] = component.parse().ok()?;
-        count += 1;
-    }
-    (count == 4).then_some(u32::from_be_bytes(octets))
+fn address_payload(host: &str, address: core::net::IpAddr, data: &[u8]) -> (u64, Vec<u8>) {
+    let mut payload = Vec::with_capacity(host.len() + data.len() + 16);
+    payload.extend_from_slice(host.as_bytes());
+    let word = match address {
+        core::net::IpAddr::V4(address) => u32::from(address) as u64,
+        core::net::IpAddr::V6(address) => { payload.extend_from_slice(&address.octets()); network::IPV6_ADDRESS },
+    };
+    payload.extend_from_slice(data); (word, payload)
 }
 
 fn ipv4_text(address: u32) -> String {

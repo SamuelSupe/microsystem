@@ -47,7 +47,7 @@ pub fn activate(platform: PlatformInfo) -> Result<(), ()> {
     .map_err(|_| ())?;
     let stream_id = platform.stream_id(device.requester_id()).ok_or(())?;
     let physical = crate::arch::virt_to_phys(QUEUE.0.get() as usize as u64).ok_or(())?;
-    smmu::map_gui_aux_page(smmu::RNG_QUEUE_IOVA, physical).map_err(|_| ())?;
+    smmu::map_gui_aux_page(stream_id, smmu::RNG_QUEUE_IOVA, physical).map_err(|_| ())?;
     smmu::attach_stream(stream_id).map_err(|_| ())?;
     negotiate(transport)?;
     let queue = unsafe { &mut (*QUEUE.0.get()).0 };
@@ -76,7 +76,7 @@ pub fn activate(platform: PlatformInfo) -> Result<(), ()> {
     );
     put32(queue, DESC_OFFSET + 8, 256);
     put16(queue, DESC_OFFSET + 12, VRING_DESC_F_WRITE);
-    let notify = read16(transport.common + 30) as usize * transport.notify_multiplier as usize;
+    let notify = transport.queue_notify_offset().ok_or(())?;
     write16(transport.common + 28, 1);
     write8(
         transport.common + 20,

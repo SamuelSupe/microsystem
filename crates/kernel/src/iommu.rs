@@ -33,6 +33,10 @@ impl DmaDomain {
         }
         let length = mapping.pages as u64 * DMA_PAGE_SIZE;
         let end = mapping.iova.checked_add(length).ok_or(Status::Invalid)?;
+        mapping
+            .physical
+            .checked_add(length)
+            .ok_or(Status::Invalid)?;
         for current in self.mappings.iter().flatten() {
             let current_end = current.iova + current.pages as u64 * DMA_PAGE_SIZE;
             if mapping.iova < current_end && current.iova < end {
@@ -64,7 +68,10 @@ impl DmaDomain {
                 if write && !mapping.writable {
                     return Err(Status::AccessDenied);
                 }
-                return Ok(mapping.physical + (iova - mapping.iova));
+                return mapping
+                    .physical
+                    .checked_add(iova - mapping.iova)
+                    .ok_or(Status::Invalid);
             }
         }
         Err(Status::Fault)

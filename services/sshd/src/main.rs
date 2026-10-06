@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::panic::PanicInfo;
@@ -19,11 +18,9 @@ use microsystem_abi::{
 use microsystem_mica::PermissionSet;
 use microsystem_shell::{Command as ShellCommand, parse};
 use rand::{CryptoRng, RngCore};
-use zssh::ed25519_dalek::{SigningKey, VerifyingKey};
+use zssh::ed25519_dalek::SigningKey;
 use zssh::{AuthMethod, Behavior, PublicKey, Request, SecretKey, Transport};
 
-const HOST_SECRET: &[u8; 32] = include_bytes!("../../../build/ssh-host-key.bin");
-const AUTHORIZED_KEY: &[u8; 32] = include_bytes!("../../../build/ssh-authorized-key.bin");
 const NETWORK_SHARED_VA: u64 = 0x0058_0000;
 const SCRIPT_SESSION_VA: u64 = 0x0059_0000;
 const FILESYSTEM_SHARED_VA: u64 = 0x005e_0000;
@@ -33,6 +30,10 @@ static mut SSH_PACKET: [u8; 16384] = [0; 16384];
 static SSH_FIRST_READ: AtomicBool = AtomicBool::new(false);
 static SSH_FIRST_WRITE: AtomicBool = AtomicBool::new(false);
 static SSH_FIRST_RANDOM: AtomicBool = AtomicBool::new(false);
+static SSH_CREDENTIAL: AtomicU64 = AtomicU64::new(0);
+static SSH_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
+static SSH_CHANNEL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SSH_IO_DEADLINE: AtomicU64 = AtomicU64::new(0);
 static SSH_CONNECTION: AtomicU64 = AtomicU64::new(0);
 static SSH_POLICY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static mut SSH_POLICY: [u8; script::POLICY_BYTES] = [0; script::POLICY_BYTES];
@@ -41,13 +42,36 @@ static mut SSH_POLICY: [u8; script::POLICY_BYTES] = [0; script::POLICY_BYTES];
 pub extern "C" fn _start() -> ! {
     let _ = microsystem_user_rt::debug_write(b"[user] sshd service ELF entered EL0\n");
     let _shared = NetdStream::initialize().unwrap_or_else(|_| microsystem_user_rt::exit(3));
+    let public = SigningKey::from_bytes(&host_secret())
+        .verifying_key()
+        .to_bytes();
+    let mut hex = [0; 64];
+    for (index, byte) in public.iter().enumerate() {
+        hex[index * 2] = b"0123456789abcdef"[(byte >> 4) as usize];
+        hex[index * 2 + 1] = b"0123456789abcdef"[(byte & 15) as usize];
+    }
+    let prefix = b"[ssh] host public key ed25519=";
+    let mut line = [0; 128];
+    line[..prefix.len()].copy_from_slice(prefix);
+    line[prefix.len()..prefix.len() + 64].copy_from_slice(&hex);
+    line[prefix.len() + 64] = b'\n';
+    let _ = microsystem_user_rt::debug_write(&line[..prefix.len() + 65]);
     let _ = microsystem_user_rt::debug_write(
-        b"[ssh] sshd ready address=10.0.2.15 port=22 auth=publickey user=micro\n",
+        b"[ssh] sshd ready address=10.0.2.15 port=22 auth=publickey accounts=persistent\n",
     );
     let _ = microsystem_user_rt::service_online();
 
     loop {
+        SSH_CREDENTIAL.store(0, Ordering::Release);
+        SSH_AUTHENTICATED.store(false, Ordering::Release);
+        SSH_CHANNEL_ACTIVE.store(false, Ordering::Release);
         let stream = NetdStream::wait_accept();
+        SSH_IO_DEADLINE.store(
+            microsystem_user_rt::clock_now()
+                .unwrap_or(0)
+                .saturating_add(30_000_000_000),
+            Ordering::Release,
+        );
         {
             let behavior = ServerBehavior::new(stream);
             let packet = unsafe { &mut *core::ptr::addr_of_mut!(SSH_PACKET) };
@@ -56,12 +80,55 @@ pub extern "C" fn _start() -> ! {
             let graceful = block_on(serve(&mut transport)).is_ok();
             stream.close(graceful);
         }
+        let cookie = SSH_CREDENTIAL.swap(0, Ordering::AcqRel);
+        let mut request = Message::new(
+            protocol::IDENTITY,
+            microsystem_abi::identity::Operation::DropCredential as u16,
+        );
+        request.words[0] = cookie;
+        let mut reply = Message::new(protocol::IDENTITY, 0);
+        let deadline = microsystem_user_rt::clock_now()
+            .unwrap_or(0)
+            .saturating_add(1_000_000_000);
+        let _ = microsystem_user_rt::ipc_call(
+            boot_cap::IDENTITY_ENDPOINT,
+            &request,
+            &mut reply,
+            deadline,
+        );
+        SSH_AUTHENTICATED.store(false, Ordering::Release);
         SSH_CONNECTION.store(0, Ordering::Release);
     }
 }
 
 async fn serve(transport: &mut Transport<'_, ServerBehavior>) -> Result<(), ()> {
     let mut channel = transport.accept().await.map_err(|_| ())?;
+    SSH_CHANNEL_ACTIVE.store(true, Ordering::Release);
+    SSH_IO_DEADLINE.store(
+        microsystem_user_rt::clock_now()
+            .map_err(|_| ())?
+            .saturating_add(300_000_000_000),
+        Ordering::Release,
+    );
+    let mut accepted = Message::new(
+        protocol::IDENTITY,
+        microsystem_abi::identity::Operation::SessionAccepted as u16,
+    );
+    accepted.words[0] = SSH_CREDENTIAL.load(Ordering::Acquire);
+    let mut audited = Message::new(protocol::IDENTITY, 0);
+    let deadline = microsystem_user_rt::clock_now()
+        .map_err(|_| ())?
+        .saturating_add(5_000_000_000);
+    microsystem_user_rt::ipc_call(
+        boot_cap::IDENTITY_ENDPOINT,
+        &accepted,
+        &mut audited,
+        deadline,
+    )
+    .map_err(|_| ())?;
+    if audited.words[5] != 0 {
+        return Err(());
+    }
     match channel.request() {
         Request::Exec(command) => {
             let status = write_command(&mut channel, command).await?;
@@ -122,9 +189,12 @@ async fn write_command(
     channel: &mut zssh::Channel<'_, '_, ServerBehavior>,
     command: SshCommand,
 ) -> Result<u32, ()> {
+    if !session_valid() {
+        return Err(());
+    }
     match command {
         SshCommand::Help => channel
-            .write_all_stdout(b"help uptime ps clear echo mica exit\r\n")
+            .write_all_stdout(b"help uptime ps clear echo whoami user mica exit\r\n")
             .await
             .map_err(|_| ())?,
         SshCommand::Uptime => {
@@ -174,6 +244,42 @@ async fn write_command(
         SshCommand::MicaEval { source, bytes } => {
             return run_mica_eval(channel, &source[..bytes as usize], &[]).await;
         }
+        SshCommand::User { arguments, bytes } => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    arguments.as_ptr(),
+                    FILESYSTEM_SHARED_VA as *mut u8,
+                    bytes as usize,
+                );
+            }
+            let mut request = Message::new(
+                protocol::IDENTITY,
+                microsystem_abi::identity::Operation::Command as u16,
+            );
+            request.words[0] = bytes as u64;
+            request.words[3] = SSH_CREDENTIAL.load(Ordering::Acquire);
+            request.caps[0] = boot_cap::SSH_FILESYSTEM_FRAME;
+            let mut reply = Message::new(protocol::IDENTITY, 0);
+            let deadline = microsystem_user_rt::clock_now()
+                .map_err(|_| ())?
+                .saturating_add(30_000_000_000);
+            microsystem_user_rt::ipc_call(
+                boot_cap::IDENTITY_ENDPOINT,
+                &request,
+                &mut reply,
+                deadline,
+            )
+            .map_err(|_| ())?;
+            let length = reply.words[0] as usize;
+            if length > 4096 {
+                return Err(());
+            }
+            let output =
+                unsafe { core::slice::from_raw_parts(FILESYSTEM_SHARED_VA as *const u8, length) }
+                    .to_vec();
+            channel.write_all_stdout(&output).await.map_err(|_| ())?;
+            return Ok(u32::from(reply.words[5] != 0));
+        }
         SshCommand::MicaArgs { arguments, bytes } => {
             return run_mica_arguments(channel, &arguments[..bytes as usize]).await;
         }
@@ -207,6 +313,7 @@ enum SshCommand {
     Echo,
     MicaEval { source: [u8; 256], bytes: u16 },
     MicaArgs { arguments: [u8; 256], bytes: u16 },
+    User { arguments: [u8; 256], bytes: u16 },
     MicaRepl,
     Exit,
     Invalid,
@@ -223,6 +330,14 @@ fn parse_command(command: &str) -> SshCommand {
         Ok(ShellCommand::Ps) => SshCommand::Ps,
         Ok(ShellCommand::Echo(_)) => SshCommand::Echo,
         Ok(ShellCommand::Clear) => SshCommand::Clear,
+        Ok(ShellCommand::User(value)) if value.len() <= 256 => {
+            let mut arguments = [0; 256];
+            arguments[..value.len()].copy_from_slice(value.as_bytes());
+            SshCommand::User {
+                arguments,
+                bytes: value.len() as u16,
+            }
+        }
         Ok(ShellCommand::MicaEval(source)) if source.len() <= 256 => {
             let mut bytes = [0u8; 256];
             bytes[..source.len()].copy_from_slice(source.as_bytes());
@@ -492,7 +607,7 @@ fn filesystem_request(
     request.words[2] = offset;
     request.caps[0] = boot_cap::SSH_FILESYSTEM_FRAME;
     let mut reply = Message::new(protocol::FILESYSTEM, 0);
-    microsystem_user_rt::ipc_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0)?;
+    authorized_call(boot_cap::FILESYSTEM_ENDPOINT, &request, &mut reply, 0)?;
     let status = status_from_word(reply.words[5]);
     if status != Status::Ok {
         return Err(status);
@@ -538,8 +653,7 @@ fn manifest_prefix_bytes(source: &str) -> Option<usize> {
 async fn run_ssh_mica_repl(channel: &mut zssh::Channel<'_, '_, ServerBehavior>) -> Result<u32, ()> {
     let prepare = Message::new(protocol::PROCESS, process::Operation::SpawnScript as u16);
     let mut prepared = Message::new(protocol::PROCESS, 0);
-    if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &prepare, &mut prepared, 0)
-        .is_err()
+    if authorized_call(boot_cap::PROCESS_ENDPOINT, &prepare, &mut prepared, 0).is_err()
         || prepared.words[5] as i64 != Status::Ok as i64
         || prepared.caps[0] == microsystem_abi::CapHandle::INVALID
     {
@@ -573,7 +687,7 @@ async fn run_ssh_mica_repl(channel: &mut zssh::Channel<'_, '_, ServerBehavior>) 
     request.caps[0] = region;
     request.flags |= message_cap_move(0);
     let mut reply = Message::new(protocol::PROCESS, 0);
-    if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0).is_err()
+    if authorized_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0).is_err()
         || reply.words[5] as i64 != Status::Ok as i64
         || reply.caps[0] == microsystem_abi::CapHandle::INVALID
         || reply.caps[1] == microsystem_abi::CapHandle::INVALID
@@ -762,7 +876,7 @@ fn wait_script_status(pid: u64) -> Option<i64> {
         let mut request = Message::new(protocol::PROCESS, process::Operation::Wait as u16);
         request.words[0] = pid;
         let mut reply = Message::new(protocol::PROCESS, 0);
-        microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0).ok()?;
+        authorized_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0).ok()?;
         match reply.words[5] as i64 {
             value if value == Status::Ok as i64 => return Some(reply.words[0] as i64),
             value if value == Status::Busy as i64 => {
@@ -824,8 +938,7 @@ async fn run_mica_session(
     }
     let prepare = Message::new(protocol::PROCESS, process::Operation::SpawnScript as u16);
     let mut prepared = Message::new(protocol::PROCESS, 0);
-    if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &prepare, &mut prepared, 0)
-        .is_err()
+    if authorized_call(boot_cap::PROCESS_ENDPOINT, &prepare, &mut prepared, 0).is_err()
         || prepared.words[5] as i64 != Status::Ok as i64
         || prepared.caps[0] == microsystem_abi::CapHandle::INVALID
     {
@@ -894,8 +1007,7 @@ async fn run_mica_session(
     request.caps[0] = session;
     request.flags |= message_cap_move(0);
     let mut launched = Message::new(protocol::PROCESS, 0);
-    if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &request, &mut launched, 0)
-        .is_err()
+    if authorized_call(boot_cap::PROCESS_ENDPOINT, &request, &mut launched, 0).is_err()
         || launched.words[5] as i64 != Status::Ok as i64
         || launched.caps[0] == microsystem_abi::CapHandle::INVALID
         || launched.caps[1] == microsystem_abi::CapHandle::INVALID
@@ -925,8 +1037,7 @@ async fn run_mica_session(
         let mut wait = Message::new(protocol::PROCESS, process::Operation::Wait as u16);
         wait.words[0] = pid;
         let mut reply = Message::new(protocol::PROCESS, 0);
-        if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &wait, &mut reply, 0).is_err()
-        {
+        if authorized_call(boot_cap::PROCESS_ENDPOINT, &wait, &mut reply, 0).is_err() {
             break 1;
         }
         match reply.words[5] as i64 {
@@ -979,8 +1090,7 @@ fn wait_for_script_completion(
         let mut request = Message::new(protocol::PROCESS, process::Operation::Wait as u16);
         request.words[0] = pid;
         let mut reply = Message::new(protocol::PROCESS, 0);
-        if microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0)
-            .is_ok()
+        if authorized_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0).is_ok()
             && reply.words[5] as i64 == Status::Ok as i64
         {
             return true;
@@ -993,7 +1103,7 @@ fn kill_script(pid: u64) -> Result<(), Status> {
     request.words[0] = pid;
     request.words[1] = -15i64 as u64;
     let mut reply = Message::new(protocol::PROCESS, 0);
-    microsystem_user_rt::ipc_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0)?;
+    authorized_call(boot_cap::PROCESS_ENDPOINT, &request, &mut reply, 0)?;
     if reply.words[5] as i64 == Status::Ok as i64 {
         Ok(())
     } else {
@@ -1001,11 +1111,75 @@ fn kill_script(pid: u64) -> Result<(), Status> {
     }
 }
 
+fn session_valid() -> bool {
+    let deadline = SSH_IO_DEADLINE.load(Ordering::Acquire);
+    if deadline != 0 && microsystem_user_rt::clock_now().unwrap_or(u64::MAX) >= deadline {
+        return false;
+    }
+    if !SSH_AUTHENTICATED.load(Ordering::Acquire) {
+        return true;
+    }
+    let cookie = SSH_CREDENTIAL.load(Ordering::Acquire);
+    unsafe { microsystem_identity::read_shared(microsystem_abi::identity::SNAPSHOT_VA) }.is_ok_and(
+        |state| {
+            state
+                .actor(
+                    11,
+                    cookie,
+                    microsystem_user_rt::clock_now().unwrap_or(u64::MAX),
+                )
+                .is_ok()
+        },
+    )
+}
+fn authorized_call(
+    endpoint: microsystem_abi::CapHandle,
+    request: &Message,
+    reply: &mut Message,
+    deadline: u64,
+) -> Result<(), Status> {
+    let mut request = *request;
+    if matches!(request.protocol, protocol::FILESYSTEM | protocol::PROCESS) {
+        request.words[3] = SSH_CREDENTIAL.load(Ordering::Acquire);
+    }
+    microsystem_user_rt::ipc_call(endpoint, &request, reply, deadline)
+}
+fn host_secret() -> [u8; 32] {
+    let deadline = microsystem_user_rt::clock_now()
+        .unwrap_or(0)
+        .saturating_add(30_000_000_000);
+    loop {
+        match filesystem_request(filesystem::Operation::ReadRange, "/.system/ssh/host.key", 0) {
+            Ok(reply) if reply.words[0] == 32 => {
+                let mut key = [0; 32];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        FILESYSTEM_SHARED_VA as *const u8,
+                        key.as_mut_ptr(),
+                        32,
+                    );
+                }
+                return key;
+            }
+            Err(Status::NotFound | Status::Busy)
+                if microsystem_user_rt::clock_now().unwrap_or(deadline) < deadline =>
+            {
+                let _ = microsystem_user_rt::yield_now();
+            }
+            _ => {
+                let _ = microsystem_user_rt::debug_write(
+                    b"[ssh] persisted host key unavailable; fail-closed=true\n",
+                );
+                microsystem_user_rt::exit(4)
+            }
+        }
+    }
+}
+
 struct ServerBehavior {
     stream: NetdStream,
     random: KernelRandom,
     host: SecretKey,
-    authorized: PublicKey,
 }
 
 impl ServerBehavior {
@@ -1014,10 +1188,7 @@ impl ServerBehavior {
             stream,
             random: KernelRandom,
             host: SecretKey::Ed25519 {
-                secret_key: SigningKey::from_bytes(HOST_SECRET),
-            },
-            authorized: PublicKey::Ed25519 {
-                public_key: VerifyingKey::from_bytes(AUTHORIZED_KEY).unwrap(),
+                secret_key: SigningKey::from_bytes(&host_secret()),
             },
         }
     }
@@ -1037,8 +1208,41 @@ impl Behavior for ServerBehavior {
     }
     type User = ();
     fn allow_user(&mut self, username: &str, method: &AuthMethod) -> Option<()> {
-        matches!((username, method), ("micro", AuthMethod::PublicKey(key)) if *key == self.authorized)
-            .then_some(())
+        let AuthMethod::PublicKey(PublicKey::Ed25519 { public_key }) = method else {
+            return None;
+        };
+        if !microsystem_identity::valid_name(username) {
+            return None;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                public_key.as_bytes().as_ptr(),
+                FILESYSTEM_SHARED_VA as *mut u8,
+                32,
+            );
+        }
+        let mut request = Message::new(
+            protocol::IDENTITY,
+            microsystem_abi::identity::Operation::AuthorizeSsh as u16,
+        );
+        let mut name = [0; 32];
+        name[..username.len()].copy_from_slice(username.as_bytes());
+        for i in 0..4 {
+            request.words[i] = u64::from_le_bytes(name[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        request.caps[0] = boot_cap::SSH_FILESYSTEM_FRAME;
+        let mut reply = Message::new(protocol::IDENTITY, 0);
+        let deadline = microsystem_user_rt::clock_now()
+            .ok()?
+            .saturating_add(30_000_000_000);
+        microsystem_user_rt::ipc_call(boot_cap::IDENTITY_ENDPOINT, &request, &mut reply, deadline)
+            .ok()?;
+        if reply.words[5] != 0 || reply.words[0] == 0 {
+            return None;
+        }
+        SSH_CREDENTIAL.store(reply.words[0], Ordering::Release);
+        SSH_AUTHENTICATED.store(true, Ordering::Release);
+        Some(())
     }
     fn allow_shell(&self) -> bool {
         true
@@ -1088,7 +1292,7 @@ impl NetdStream {
     fn initialize() -> Result<microsystem_abi::CapHandle, Status> {
         let request = Message::new(protocol::NETWORK, network::Operation::SshSharedFrame as u16);
         let mut reply = Message::new(protocol::NETWORK, 0);
-        microsystem_user_rt::ipc_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0)?;
+        authorized_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0)?;
         if reply.words[5] as i64 != Status::Ok as i64
             || reply.caps[0] == microsystem_abi::CapHandle::INVALID
         {
@@ -1099,6 +1303,9 @@ impl NetdStream {
             NETWORK_SHARED_VA,
             Rights(Rights::READ.0 | Rights::WRITE.0),
         )?;
+        for connection in 1..=network::MAX_INTERFACES as u64 * 2 {
+            Self { connection }.close(false);
+        }
         Ok(reply.caps[0])
     }
 
@@ -1106,12 +1313,7 @@ impl NetdStream {
         loop {
             let request = Message::new(protocol::NETWORK, network::Operation::SshAccept as u16);
             let mut reply = Message::new(protocol::NETWORK, 0);
-            match microsystem_user_rt::ipc_call(
-                boot_cap::SSH_NETWORK_ENDPOINT,
-                &request,
-                &mut reply,
-                0,
-            ) {
+            match authorized_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0) {
                 Ok(()) if reply.words[5] as i64 == Status::Ok as i64 && reply.words[0] != 0 => {
                     SSH_CONNECTION.store(reply.words[0], Ordering::Release);
                     return Self {
@@ -1137,16 +1339,10 @@ impl NetdStream {
             request.words[0] = self.connection;
             request.words[1] = graceful as u64;
             let mut reply = Message::new(protocol::NETWORK, 0);
-            match microsystem_user_rt::ipc_call(
-                boot_cap::SSH_NETWORK_ENDPOINT,
-                &request,
-                &mut reply,
-                0,
-            ) {
+            match authorized_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0) {
                 Ok(()) if reply.words[5] as i64 == Status::Ok as i64 => return,
                 Ok(())
-                    if graceful
-                        && reply.words[5] as i64 == Status::Busy as i64
+                    if reply.words[5] as i64 == Status::Busy as i64
                         && microsystem_user_rt::clock_now().unwrap_or(deadline) < deadline =>
                 {
                     let _ = microsystem_user_rt::yield_now();
@@ -1158,6 +1354,9 @@ impl NetdStream {
     }
 
     fn connected() -> bool {
+        if !session_valid() {
+            return false;
+        }
         let connection = SSH_CONNECTION.load(Ordering::Acquire);
         if connection == 0 {
             return false;
@@ -1165,8 +1364,7 @@ impl NetdStream {
         let mut request = Message::new(protocol::NETWORK, network::Operation::SshStatus as u16);
         request.words[0] = connection;
         let mut reply = Message::new(protocol::NETWORK, 0);
-        microsystem_user_rt::ipc_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0)
-            .is_ok()
+        authorized_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0).is_ok()
             && reply.words[5] as i64 == Status::Ok as i64
             && reply.words[0] != 0
     }
@@ -1185,17 +1383,15 @@ impl ErrorType for NetdStream {
 impl Read for NetdStream {
     async fn read(&mut self, output: &mut [u8]) -> Result<usize, Self::Error> {
         loop {
+            if !session_valid() {
+                return Err(StreamError);
+            }
             let mut request =
                 Message::new(protocol::NETWORK, network::Operation::SshReceive as u16);
             request.words[0] = self.connection;
             request.words[1] = output.len().min(4096) as u64;
             let mut reply = Message::new(protocol::NETWORK, 0);
-            match microsystem_user_rt::ipc_call(
-                boot_cap::SSH_NETWORK_ENDPOINT,
-                &request,
-                &mut reply,
-                0,
-            ) {
+            match authorized_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0) {
                 Ok(()) if reply.words[5] as i64 == Status::Ok as i64 => {
                     let bytes = reply.words[0] as usize;
                     if bytes > output.len().min(4096) {
@@ -1212,6 +1408,14 @@ impl Read for NetdStream {
                     if !SSH_FIRST_READ.swap(true, Ordering::AcqRel) {
                         let _ =
                             microsystem_user_rt::debug_write(b"[ssh] transport first-read=true\n");
+                    }
+                    if bytes != 0 && SSH_CHANNEL_ACTIVE.load(Ordering::Acquire) {
+                        SSH_IO_DEADLINE.store(
+                            microsystem_user_rt::clock_now()
+                                .unwrap_or(0)
+                                .saturating_add(300_000_000_000),
+                            Ordering::Release,
+                        );
                     }
                     return Ok(bytes);
                 }
@@ -1233,16 +1437,14 @@ impl Write for NetdStream {
             microsystem_user_rt::fence();
         }
         loop {
+            if !session_valid() {
+                return Err(StreamError);
+            }
             let mut request = Message::new(protocol::NETWORK, network::Operation::SshSend as u16);
             request.words[0] = self.connection;
             request.words[1] = bytes as u64;
             let mut reply = Message::new(protocol::NETWORK, 0);
-            match microsystem_user_rt::ipc_call(
-                boot_cap::SSH_NETWORK_ENDPOINT,
-                &request,
-                &mut reply,
-                0,
-            ) {
+            match authorized_call(boot_cap::SSH_NETWORK_ENDPOINT, &request, &mut reply, 0) {
                 Ok(()) if reply.words[5] as i64 == Status::Ok as i64 => {
                     return Ok(reply.words[0] as usize);
                 }

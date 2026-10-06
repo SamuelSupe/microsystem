@@ -125,6 +125,20 @@ pub fn print(args: fmt::Arguments<'_>) {
     PRINT_SERVING.store(ticket.wrapping_add(1), Ordering::Release);
 }
 
+pub fn write_bytes(bytes: &[u8]) {
+    let ticket = PRINT_NEXT.fetch_add(1, Ordering::Relaxed);
+    while PRINT_SERVING.load(Ordering::Acquire) != ticket {
+        core::hint::spin_loop();
+    }
+    for byte in bytes {
+        if *byte == b'\n' {
+            Uart::put(b'\r');
+        }
+        Uart::put(*byte);
+    }
+    PRINT_SERVING.store(ticket.wrapping_add(1), Ordering::Release);
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn emergency_write(bytes: &[u8]) {
     let port = UART_BASE.load(Ordering::Relaxed) as u16;

@@ -8,7 +8,7 @@ endif
 
 RUN = $(DOCKER) run --rm -e ARCH=$(ARCH) -e MICROSYSTEM_DISK_PATH -e MICROSYSTEM_CONTAINER=1 -e RUSTUP_TOOLCHAIN=1.97.1 -v $(CURDIR):/workspace -w /workspace $(IMAGE)
 
-.PHONY: image build run gui ssh test fsck clean
+.PHONY: image build run gui ssh test test-recovery test-desktop test-vfs test-network test-identity fsck clean
 
 image:
 	DOCKER=$(DOCKER) IMAGE=$(IMAGE) scripts/build-image.sh
@@ -27,6 +27,21 @@ ssh:
 
 test: build
 	$(RUN) cargo run -p xtask -- test
+
+test-recovery: build
+	$(RUN) python3 scripts/service-recovery-qemu.py
+
+test-desktop: build
+	$(RUN) env MICROSYSTEM_RECOVERY_DESKTOP_ONLY=1 python3 scripts/service-recovery-qemu.py
+
+test-vfs: build
+	$(RUN) env MICROSYSTEM_RECOVERY_VFS_ONLY=1 python3 scripts/service-recovery-qemu.py
+
+test-network: build
+	$(RUN) env MICROSYSTEM_RECOVERY_NETWORK_ONLY=1 python3 scripts/service-recovery-qemu.py
+
+test-identity: build
+	$(RUN) env MICROSYSTEM_RECOVERY_IDENTITY_ONLY=1 python3 scripts/service-recovery-qemu.py
 
 fsck: build
 	$(RUN) cargo run -p xtask -- fsck
